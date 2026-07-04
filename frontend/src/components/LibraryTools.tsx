@@ -168,8 +168,34 @@ export function RenameModal({
   );
 }
 
+/** Two inputs to map a whole-volume archive to a chapter range. */
+function RangeMapper({ onMap }: { onMap: (from: number, to: number) => void }) {
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const valid = from !== "" && to !== "";
+  return (
+    <div className="range-mapper">
+      <input
+        type="number"
+        placeholder="ch"
+        value={from}
+        onChange={(e) => setFrom(e.target.value)}
+      />
+      <span>–</span>
+      <input type="number" placeholder="ch" value={to} onChange={(e) => setTo(e.target.value)} />
+      <button
+        className="btn sm"
+        disabled={!valid}
+        onClick={() => valid && onMap(Number(from), Number(to))}
+      >
+        Map range
+      </button>
+    </div>
+  );
+}
+
 /** Lists media files found in the series folder; unmatched ones can be
- *  mapped to a chapter manually. */
+ *  mapped to a chapter (or a chapter range for whole-volume archives). */
 export function FilesModal({
   seriesId,
   chapters,
@@ -190,6 +216,15 @@ export function FilesModal({
   const map = useMutation({
     mutationFn: (args: { file_path: string; chapter_id: number }) =>
       api.post(`/series/${seriesId}/files/map`, args),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["series-files", seriesId] });
+      onChanged();
+    },
+  });
+
+  const mapRange = useMutation({
+    mutationFn: (args: { file_path: string; from_number: number; to_number: number }) =>
+      api.post(`/series/${seriesId}/files/map-range`, args),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["series-files", seriesId] });
       onChanged();
@@ -219,8 +254,13 @@ export function FilesModal({
                 <tbody>
                   {unmatched.map((f) => (
                     <tr key={f.path}>
-                      <td>{f.name}</td>
-                      <td style={{ width: 200 }}>
+                      <td>
+                        {f.name}
+                        {f.volume_number != null && (
+                          <span className="tag">vol {f.volume_number}</span>
+                        )}
+                      </td>
+                      <td style={{ width: 180 }}>
                         <select
                           defaultValue=""
                           onChange={(e) =>
@@ -235,6 +275,13 @@ export function FilesModal({
                             </option>
                           ))}
                         </select>
+                      </td>
+                      <td style={{ width: 210 }}>
+                        <RangeMapper
+                          onMap={(from_number, to_number) =>
+                            mapRange.mutate({ file_path: f.path, from_number, to_number })
+                          }
+                        />
                       </td>
                     </tr>
                   ))}

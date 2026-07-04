@@ -809,3 +809,14 @@ table.data-table {
 .folders-panel .folder-line {
   margin-top: 0;
 }
+
+.range-mapper {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.range-mapper input {
+  width: 52px;
+  padding: 2px 6px;
+}

@@ -22,6 +22,8 @@ from ..library.scanner import (
 from ..models import RootFolder, Series, SeriesFolder
 from ..schemas import (
     FileMapIn,
+    FileMapRangeIn,
+    FileMapRangeOut,
     FilesystemEntryOut,
     FilesystemListOut,
     RenameApplyIn,
@@ -185,6 +187,34 @@ async def map_file(
     chapter.downloaded = True
     chapter.file_path = body.file_path
     await session.commit()
+
+
+@router.post("/series/{series_id}/files/map-range", response_model=FileMapRangeOut)
+async def map_file_range(
+    series_id: int, body: FileMapRangeIn, session: AsyncSession = Depends(get_session)
+):
+    """Map a whole-volume archive to a chapter range — the escape hatch for
+    series whose metadata source lacks volume→chapter data. Also stamps the
+    parsed volume onto those chapters so future scans/renames keep working."""
+    from ..util import parse_volume_number
+
+    series = await _load(session, series_id)
+    if not Path(body.file_path).exists():
+        raise HTTPException(400, "File not found on disk")
+    lo, hi = sorted((body.from_number, body.to_number))
+    volume = parse_volume_number(Path(body.file_path).stem)
+    mapped = 0
+    for ch in series.chapters:
+        if lo <= ch.number <= hi:
+            ch.downloaded = True
+            ch.file_path = body.file_path
+            if volume is not None:
+                ch.volume = volume
+            mapped += 1
+    if mapped == 0:
+        raise HTTPException(400, "No tracked chapters in that range")
+    await session.commit()
+    return FileMapRangeOut(mapped=mapped, volume=volume)
 
 
 # --------------------------------------------------------------- folders

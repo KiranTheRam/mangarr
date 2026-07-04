@@ -305,7 +305,13 @@ async def enqueue_torrent(
         values["qbittorrent_url"], values["qbittorrent_username"], values["qbittorrent_password"]
     )
     try:
-        await client.add_magnet(magnet, category=values["qbittorrent_category"])
+        category = values["qbittorrent_category"]
+        # put grabs in a category subfolder so they stay organized and separate
+        # from other qBittorrent downloads, regardless of its auto-management
+        base = await client.default_save_path()
+        save_path = f"{base.rstrip('/')}/{category}" if base else None
+        await client.ensure_category(category, save_path)
+        await client.add_magnet(magnet, category=category, save_path=save_path)
     finally:
         await client.close()
     dl = Download(
