@@ -13,8 +13,13 @@ from .. import settings_service
 from ..db import get_session
 from ..library.matcher import find_media_files, match_files
 from ..library.rename import apply_renames, plan_renames
-from ..library.scanner import find_existing_folder, scan_series, series_dir
-from ..models import RootFolder, Series
+from ..library.scanner import (
+    find_existing_folder,
+    resolve_folders,
+    scan_series,
+    series_dir,
+)
+from ..models import RootFolder, Series, SeriesFolder
 from ..schemas import (
     FileMapIn,
     FilesystemEntryOut,
@@ -24,6 +29,8 @@ from ..schemas import (
     RenameOutcomeOut,
     ScanResultOut,
     SeriesFileOut,
+    SeriesFolderIn,
+    SeriesFolderOut,
 )
 
 router = APIRouter(tags=["library"])
@@ -32,7 +39,11 @@ router = APIRouter(tags=["library"])
 async def _load(session: AsyncSession, series_id: int) -> Series:
     result = await session.execute(
         select(Series)
-        .options(selectinload(Series.chapters), selectinload(Series.root_folder))
+        .options(
+            selectinload(Series.chapters),
+            selectinload(Series.root_folder),
+            selectinload(Series.extra_folders),
+        )
         .where(Series.id == series_id)
     )
     series = result.scalar_one_or_none()
@@ -41,10 +52,15 @@ async def _load(session: AsyncSession, series_id: int) -> Series:
     return series
 
 
-def _folder_of(series: Series) -> Path:
+def _root_of(series: Series) -> Path:
     if series.root_folder is None:
         raise HTTPException(400, "Series has no root folder configured")
-    return series_dir(Path(series.root_folder.path), series)
+    return Path(series.root_folder.path)
+
+
+def _folders_of(series: Series) -> list[Path]:
+    """Primary folder plus any extra folders configured for the series."""
+    return resolve_folders(_root_of(series), series, [f.path for f in series.extra_folders])
 
 
 def _within(p: Path, root: Path) -> bool:
@@ -60,20 +76,19 @@ def _within(p: Path, root: Path) -> bool:
 @router.post("/series/{series_id}/scan", response_model=ScanResultOut)
 async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
     series = await _load(session, series_id)
-    root = Path(series.root_folder.path) if series.root_folder else None
-    if root is None:
-        raise HTTPException(400, "Series has no root folder configured")
-    folder = _folder_of(series)
-    if not folder.exists():
+    root = _root_of(series)
+    folders = _folders_of(series)
+    # adopt a matching folder if the primary one doesn't exist yet
+    if not folders[0].exists() and not series.extra_folders:
         found = find_existing_folder(root, series)
         if found:
             series.folder_name = found
-            folder = root / found
-    result = scan_series(series, list(series.chapters), folder)
+            folders = _folders_of(series)
+    result = scan_series(series, list(series.chapters), folders)
     await session.commit()
     return ScanResultOut(
-        folder=str(folder),
-        folder_exists=folder.exists(),
+        folder=", ".join(str(f) for f in folders),
+        folder_exists=any(f.exists() for f in folders),
         matched_chapters=result.matched_chapters,
         volume_files=result.volume_files,
         cleared=result.cleared,
@@ -94,7 +109,7 @@ async def scan_all():
 async def _plan(session: AsyncSession, series: Series):
     values = await settings_service.get_all(session)
     return plan_renames(
-        series, list(series.chapters), _folder_of(series),
+        series, list(series.chapters),
         values["naming_template"], values["naming_template_no_volume"],
     )
 
@@ -136,10 +151,11 @@ async def rename_apply(
 @router.get("/series/{series_id}/files", response_model=list[SeriesFileOut])
 async def series_files(series_id: int, session: AsyncSession = Depends(get_session)):
     series = await _load(session, series_id)
-    folder = _folder_of(series)
-    if not folder.exists():
-        return []
-    result = match_files(find_media_files(folder), list(series.chapters))
+    media = []
+    for folder in _folders_of(series):
+        if folder.exists():
+            media.extend(find_media_files(folder))
+    result = match_files(media, list(series.chapters))
     out: list[SeriesFileOut] = []
     for mf in result.matched:
         out.append(SeriesFileOut(
@@ -168,6 +184,66 @@ async def map_file(
         raise HTTPException(400, "File not found on disk")
     chapter.downloaded = True
     chapter.file_path = body.file_path
+    await session.commit()
+
+
+# --------------------------------------------------------------- folders
+
+def _relative_to_root(root: Path, raw: str) -> str:
+    """Store a path relative to the root when it's under it, else as given."""
+    raw = raw.strip()
+    if raw.startswith("/"):
+        try:
+            return str(Path(raw).relative_to(root))
+        except ValueError:
+            return raw
+    return raw.strip("/")
+
+
+@router.get("/series/{series_id}/folders", response_model=list[SeriesFolderOut])
+async def list_folders(series_id: int, session: AsyncSession = Depends(get_session)):
+    series = await _load(session, series_id)
+    root = _root_of(series)
+    out = [SeriesFolderOut(
+        id=None, path=series.folder_name, resolved=str(series_dir(root, series)),
+        primary=True, exists=series_dir(root, series).exists(),
+    )]
+    for f in series.extra_folders:
+        p = root / f.path
+        out.append(SeriesFolderOut(
+            id=f.id, path=f.path, resolved=str(p), primary=False, exists=p.exists(),
+        ))
+    return out
+
+
+@router.post("/series/{series_id}/folders", response_model=SeriesFolderOut, status_code=201)
+async def add_folder(
+    series_id: int, body: SeriesFolderIn, session: AsyncSession = Depends(get_session)
+):
+    series = await _load(session, series_id)
+    root = _root_of(series)
+    path = _relative_to_root(root, body.path)
+    if not path or path == series.folder_name or any(f.path == path for f in series.extra_folders):
+        raise HTTPException(400, "Folder already configured for this series")
+    folder = SeriesFolder(series_id=series.id, path=path)
+    session.add(folder)
+    await session.commit()
+    await session.refresh(folder)
+    resolved = root / path
+    return SeriesFolderOut(
+        id=folder.id, path=folder.path, resolved=str(resolved),
+        primary=False, exists=resolved.exists(),
+    )
+
+
+@router.delete("/series/{series_id}/folders/{folder_id}", status_code=204)
+async def remove_folder(
+    series_id: int, folder_id: int, session: AsyncSession = Depends(get_session)
+):
+    folder = await session.get(SeriesFolder, folder_id)
+    if folder is None or folder.series_id != series_id:
+        raise HTTPException(404, "Folder not found")
+    await session.delete(folder)
     await session.commit()
 
 

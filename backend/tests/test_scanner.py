@@ -31,7 +31,7 @@ class TestScanSeries:
         chapters = chs((1, 1), (2, 1), (3, 1))
         series, _ = series_with(chapters)
 
-        result = scan_series(series, chapters, folder)
+        result = scan_series(series, chapters, [folder])
 
         assert result.matched_chapters == 2
         assert chapters[0].downloaded and chapters[0].file_path.endswith("ch. 1.cbz")
@@ -48,7 +48,7 @@ class TestScanSeries:
         chapters = chs((1, 1), (2, 1), (3, 1), (10, 2))
         series = Series(id=1, title="Series", folder_name="Series", alt_titles="")
 
-        result = scan_series(series, chapters, folder)
+        result = scan_series(series, chapters, [folder])
 
         assert result.volume_files == 1
         assert all(c.downloaded for c in chapters[:3])
@@ -62,7 +62,7 @@ class TestScanSeries:
         chapters[0].file_path = str(folder / "gone.cbz")  # file doesn't exist
         series = Series(id=1, title="Series", folder_name="Series", alt_titles="")
 
-        result = scan_series(series, chapters, folder)
+        result = scan_series(series, chapters, [folder])
 
         assert result.cleared == 1
         assert not chapters[0].downloaded and chapters[0].file_path == ""
@@ -74,8 +74,44 @@ class TestScanSeries:
         chapters = chs((1, 1))
         series = Series(id=1, title="Series", folder_name="Series", alt_titles="")
 
-        result = scan_series(series, chapters, folder)
+        result = scan_series(series, chapters, [folder])
         assert [m.path.name for m in result.unmatched] == ["Bonus Artbook.cbz"]
+
+
+class TestScanMultipleFolders:
+    def test_scans_across_volumes_and_chapters_dirs(self, tmp_path):
+        vols = tmp_path / "Series Volumes"
+        chaps = tmp_path / "Series Chapters"
+        vols.mkdir()
+        chaps.mkdir()
+        make_cbz(vols / "Series v01.cbz")  # covers ch 1,2,3 (volume 1)
+        make_cbz(chaps / "Series ch. 10.cbz")  # exact chapter 10
+        chapters = chs((1, 1), (2, 1), (3, 1), (10, 2))
+        series = Series(id=1, title="Series", folder_name="Series Volumes", alt_titles="")
+
+        result = scan_series(series, chapters, [vols, chaps])
+
+        assert all(c.downloaded for c in chapters[:3])  # from the volume archive
+        assert chapters[3].downloaded  # ch 10 from the chapters dir
+        assert chapters[3].file_path.endswith("Series ch. 10.cbz")
+        assert result.matched_chapters == 4
+
+    def test_exact_chapter_file_wins_over_volume_archive(self, tmp_path):
+        vols = tmp_path / "vols"
+        chaps = tmp_path / "chaps"
+        vols.mkdir()
+        chaps.mkdir()
+        make_cbz(vols / "Series v01.cbz")  # volume 1 covers ch 1,2,3
+        make_cbz(chaps / "Series ch. 2.cbz")  # exact ch 2
+        chapters = chs((1, 1), (2, 1), (3, 1))
+        series = Series(id=1, title="Series", folder_name="vols", alt_titles="")
+
+        scan_series(series, chapters, [vols, chaps])
+
+        # ch 2 points at the precise chapter file, not the volume archive
+        assert chapters[1].file_path.endswith("Series ch. 2.cbz")
+        assert chapters[0].file_path.endswith("Series v01.cbz")
+        assert chapters[2].file_path.endswith("Series v01.cbz")
 
 
 class TestFindExistingFolder:

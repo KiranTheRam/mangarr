@@ -13,8 +13,8 @@ def make(path):
         zf.writestr("001.png", PNG)
 
 
-def plan(series, chapters, folder):
-    return plan_renames(series, chapters, folder, DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME)
+def plan(series, chapters, folder=None):
+    return plan_renames(series, chapters, DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME)
 
 
 class TestPlanRenames:
@@ -60,6 +60,29 @@ class TestApplyRenames:
         assert not src.exists()
         assert (tmp_path / "Dandadan - Ch. 0148.cbr").exists()
         assert ch.file_path.endswith("Dandadan - Ch. 0148.cbr")
+
+    def test_renames_in_place_across_directories(self, tmp_path):
+        vols = tmp_path / "vols"
+        chaps = tmp_path / "chaps"
+        vols.mkdir()
+        chaps.mkdir()
+        vfile = vols / "Series Volume 01.cbz"
+        cfile = chaps / "Series ch. 10.cbz"
+        make(vfile)
+        make(cfile)
+        series = Series(id=1, title="Series", folder_name="vols")
+        vchs = [Chapter(id=i, series_id=1, number=float(i), volume=1, downloaded=True,
+                        file_path=str(vfile)) for i in (1, 2, 3)]
+        cch = Chapter(id=10, series_id=1, number=10.0, volume=2, downloaded=True,
+                      file_path=str(cfile))
+        items = plan(series, [*vchs, cch])
+        by_id = {c.id: c for c in [*vchs, cch]}
+        apply_renames(items, by_id)
+
+        # volume archive renamed inside the volumes dir; chapter file inside chapters dir
+        assert (vols / "Series - Vol. 01.cbz").exists()
+        assert (chaps / "Series - Vol. 02 Ch. 0010.cbz").exists()
+        assert not (chaps / "Series - Vol. 01.cbz").exists()  # not moved across dirs
 
     def test_collision_is_skipped_not_overwritten(self, tmp_path):
         src = tmp_path / "Dandadan ch. 148.cbr"

@@ -16,8 +16,7 @@ import {
   statusPill,
   Toolbar,
 } from "../components/common";
-import { FolderBrowser } from "../components/FolderBrowser";
-import { FilesModal, RenameModal } from "../components/LibraryTools";
+import { FilesModal, FoldersPanel, RenameModal } from "../components/LibraryTools";
 
 function InteractiveSearch({
   seriesId,
@@ -133,7 +132,6 @@ export default function SeriesDetail() {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [showRename, setShowRename] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
-  const [showFolderPicker, setShowFolderPicker] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
 
   const { data: series, isLoading } = useQuery({
@@ -165,13 +163,6 @@ export default function SeriesDetail() {
     },
   });
 
-  const setFolder = useMutation({
-    mutationFn: (folder_name: string) => api.put(`/series/${seriesId}`, { folder_name }),
-    onSuccess: () => {
-      setShowFolderPicker(false);
-      invalidate();
-    },
-  });
 
   const deleteSeries = useMutation({
     mutationFn: () => api.del(`/series/${seriesId}`),
@@ -352,12 +343,7 @@ export default function SeriesDetail() {
                 ))}
               </div>
             )}
-            <div className="folder-line">
-              📁 <code>{series.folder_name || "(unset)"}</code>
-              <button className="btn sm" onClick={() => setShowFolderPicker(true)}>
-                Change folder
-              </button>
-            </div>
+            <FoldersPanel seriesId={seriesId} onChanged={invalidate} />
           </div>
         </div>
 
@@ -424,12 +410,6 @@ export default function SeriesDetail() {
           chapters={series.chapters}
           onClose={() => setShowFiles(false)}
           onChanged={invalidate}
-        />
-      )}
-      {showFolderPicker && (
-        <FolderBrowser
-          onPick={(path) => setFolder.mutate(path)}
-          onClose={() => setShowFolderPicker(false)}
         />
       )}
     </>
