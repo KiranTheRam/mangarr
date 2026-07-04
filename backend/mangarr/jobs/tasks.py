@@ -488,6 +488,18 @@ async def monitor_all() -> None:
             if not wanted:
                 continue
 
+            # a chapter that already failed on a source shouldn't be retried
+            # there — fall through to the next source instead (handles
+            # subscription-locked MangaPlus chapters, dead links, etc.)
+            result = await session.execute(
+                select(Download.chapter_id, Download.source_name).where(
+                    Download.series_id == series_id,
+                    Download.status == DownloadStatus.FAILED,
+                    Download.chapter_id.isnot(None),
+                )
+            )
+            failed_pairs = {(cid, name) for cid, name in result.all()}
+
             # one chapter-list fetch per source, then match all wanted numbers
             links = {sl.source_name: sl for sl in series.source_links}
             remaining = {c.number: c for c in wanted}
@@ -503,6 +515,8 @@ async def monitor_all() -> None:
                     log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
                     continue
                 for sc in source_chapters:
-                    ch = remaining.pop(sc.number, None)
-                    if ch is not None:
-                        await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url)
+                    ch = remaining.get(sc.number)
+                    if ch is None or (ch.id, src.name) in failed_pairs:
+                        continue  # keep it for a lower-priority source
+                    remaining.pop(sc.number, None)
+                    await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url)
