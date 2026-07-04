@@ -71,6 +71,31 @@ class QbtClient:
         resp = await self._request("GET", "/app/version")
         return resp.text.strip()
 
+    async def default_save_path(self) -> str:
+        """qBittorrent's configured default download directory."""
+        try:
+            resp = await self._request("GET", "/app/preferences")
+            return (resp.json() or {}).get("save_path", "") or ""
+        except (httpx.HTTPError, ValueError):
+            return ""
+
+    async def ensure_category(self, name: str, save_path: str | None = None) -> None:
+        """Create the category (idempotent) so torrents land in its subfolder."""
+        data = {"category": name}
+        if save_path:
+            data["savePath"] = save_path
+        resp = await self._client.request(
+            "POST", f"{self.base_url}/api/v2/torrents/createCategory", data=data
+        )
+        if resp.status_code == 403:
+            await self._login()
+            resp = await self._client.request(
+                "POST", f"{self.base_url}/api/v2/torrents/createCategory", data=data
+            )
+        # 409/Conflict means it already exists — set its path instead
+        if resp.status_code == 409 and save_path:
+            await self._request("POST", "/torrents/editCategory", data=data)
+
     async def add_magnet(self, magnet: str, category: str, save_path: str | None = None) -> None:
         data = {"urls": magnet, "category": category}
         if save_path:

@@ -212,6 +212,17 @@ class FileMapIn(BaseModel):
     chapter_id: int
 
 
+class FileMapRangeIn(BaseModel):
+    file_path: str
+    from_number: float
+    to_number: float
+
+
+class FileMapRangeOut(BaseModel):
+    mapped: int
+    volume: int | None
+
+
 class SeriesFolderOut(BaseModel):
     id: int | None  # None for the primary folder
     path: str
