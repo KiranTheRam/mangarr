@@ -13,11 +13,22 @@ design; it is the automation half of your manga stack.
 - **Library management** — add series via AniList metadata search (covers,
   descriptions, status), poster-grid library, per-series chapter tables with
   monitor toggles, wanted/missing view.
-- **Sources**
-  - **MangaDex** (API) — works anonymously, but MangaDex limits guests to
-    10 chapters/day. Add a free account + personal API client in Settings for
-    normal use.
-  - **WeebCentral** (scraper) — no account needed.
+- **Sources** — grabbed in a configurable priority order (fast scanlation
+  sources first, archive sources as fallback):
+  - **MangaPlus** (Shueisha, official) — the true same-day source for Shonen
+    Jump titles (One Piece, Kagurabachi, Dandadan, Jujutsu Kaisen…). Only the
+    first and latest few chapters of each title are free, which is exactly the
+    new-chapter use case. **Off by default**: the API bans datacenter IPs, so
+    it only works from a residential IP (e.g. a home server). Enable it in
+    Settings once you've confirmed it reaches the API from your host.
+  - **TCB Scans** (scraper) — fastest scanlations of the big Jump titles,
+    usually within hours. Small catalog of major series only.
+  - **MangaDex** (API) — huge, well-tagged archive; supplies volume data. Works
+    anonymously but limits guests to 10 chapters/day — add a free account +
+    personal API client in Settings for normal use.
+  - **WeebCentral** (scraper) — broad catalog, no account needed.
+  - **Asura Scans** (API) — Korean/Chinese webtoons and manhwa (not Japanese
+    manga). Skips locked early-access (premium) chapters automatically.
   - **Nyaa.si** (torrents) — Literature/English-translated category, sent to
     qBittorrent; completed downloads are imported automatically (volume packs,
     chapter archives, or loose-image folders).

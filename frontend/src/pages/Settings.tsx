@@ -153,6 +153,21 @@ export default function Settings() {
             <Toggle on={form.source_weebcentral_enabled === "true"} onChange={setBool("source_weebcentral_enabled")} />
           </div>
           <div className="form-row">
+            <label>TCB Scans enabled</label>
+            <Toggle on={form.source_tcbscans_enabled === "true"} onChange={setBool("source_tcbscans_enabled")} />
+          </div>
+          <div className="form-row">
+            <label>Asura Scans enabled</label>
+            <Toggle on={form.source_asura_enabled === "true"} onChange={setBool("source_asura_enabled")} />
+          </div>
+          <div className="form-row">
+            <label>MangaPlus enabled</label>
+            <Toggle on={form.source_mangaplus_enabled === "true"} onChange={setBool("source_mangaplus_enabled")} />
+            <span style={{ color: "var(--text-faint)", fontSize: 13 }}>
+              Official same-day Shonen Jump. Needs a residential IP — bans datacenters.
+            </span>
+          </div>
+          <div className="form-row">
             <label>Nyaa (torrents) enabled</label>
             <Toggle on={form.source_nyaa_enabled === "true"} onChange={setBool("source_nyaa_enabled")} />
           </div>

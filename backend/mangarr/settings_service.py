@@ -9,8 +9,10 @@ DEFAULTS: dict[str, str] = {
     # Media management
     "naming_template": "{series} - Vol. {volume:02d} Ch. {chapter:04.1f}",
     "naming_template_no_volume": "{series} - Ch. {chapter:04.1f}",
-    # Source priority: comma-separated source names, first = preferred
-    "source_priority": "mangadex,weebcentral,nyaa",
+    # Source priority: comma-separated source names, first = preferred.
+    # Fast scanlation sources (tcbscans) ahead of archive sources so new
+    # chapters are grabbed as soon as they appear.
+    "source_priority": "mangaplus,tcbscans,mangadex,weebcentral,asura,nyaa",
     # MangaDex credentials (personal API client)
     "mangadex_client_id": "",
     "mangadex_client_secret": "",
@@ -26,6 +28,11 @@ DEFAULTS: dict[str, str] = {
     # Sources on/off
     "source_mangadex_enabled": "true",
     "source_weebcentral_enabled": "true",
+    "source_tcbscans_enabled": "true",
+    "source_asura_enabled": "true",
+    # MangaPlus needs a residential IP (bans datacenters); off until the user
+    # confirms it reaches the API from their host
+    "source_mangaplus_enabled": "false",
     "source_nyaa_enabled": "false",
     # Jobs
     "monitor_interval_minutes": "15",

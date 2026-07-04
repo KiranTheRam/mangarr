@@ -5,13 +5,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import settings_service
 from .base import DirectSource, TorrentIndexer
+from .asura import source as asura_source
 from .mangadex import source as mangadex_source
+from .mangaplus import source as mangaplus_source
 from .nyaa import indexer as nyaa_indexer
+from .tcbscans import source as tcbscans_source
 from .weebcentral import source as weebcentral_source
 
 DIRECT_SOURCES: dict[str, DirectSource] = {
+    mangaplus_source.name: mangaplus_source,
     mangadex_source.name: mangadex_source,
     weebcentral_source.name: weebcentral_source,
+    tcbscans_source.name: tcbscans_source,
+    asura_source.name: asura_source,
 }
 TORRENT_INDEXERS: dict[str, TorrentIndexer] = {
     nyaa_indexer.name: nyaa_indexer,
