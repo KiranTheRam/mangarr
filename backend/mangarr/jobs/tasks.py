@@ -63,27 +63,34 @@ async def link_sources(session: AsyncSession, series: Series, values: dict[str, 
     """Auto-match the series on every enabled direct source it isn't linked to."""
     linked = {sl.source_name for sl in series.source_links}
     titles = _titles_of(series)
-    wanted = {normalize_title(t) for t in titles}
+    # normalized titles that are empty (e.g. a title written only in CJK) must
+    # not be used for matching — an empty string is a prefix/substring of
+    # everything and would match the first result of any catalog
+    wanted = {nt for t in titles if (nt := normalize_title(t))}
     for src in registry.enabled_direct_sources(values):
         if src.name in linked:
             continue
         match = None
         # try each known title variant until the source yields a match
         for query in titles[:4]:
+            nq = normalize_title(query)
+            if not nq:
+                continue
             try:
                 candidates = await src.search_series(query)
             except Exception as exc:
                 log.warning("source %s search failed for %r: %s", src.name, query, exc)
                 break
             for cand in candidates:
-                cand_titles = {normalize_title(t) for t in [cand.title, *cand.alt_titles]}
+                cand_titles = {n for t in [cand.title, *cand.alt_titles] if (n := normalize_title(t))}
                 if wanted & cand_titles:
                     match = cand
                     break
-            if match is None and candidates:
-                # fall back to the top result only if it shares a title prefix
+            if match is None and candidates and len(nq) >= 4:
+                # fall back to the top result only if it shares a real title
+                # prefix (guard the length so short/empty queries can't match)
                 top = candidates[0]
-                if normalize_title(top.title).startswith(normalize_title(query)[:12]):
+                if normalize_title(top.title).startswith(nq[:12]):
                     match = top
             if match:
                 break

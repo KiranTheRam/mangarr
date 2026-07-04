@@ -163,6 +163,20 @@ TCB_CHAPTER = """
 """
 
 
+async def test_tcb_search_empty_query_returns_nothing():
+    # a CJK-only title normalizes to "" — must not return the whole catalog
+    # (guard short-circuits before any network call)
+    src = TCBScansSource(client=httpx.AsyncClient())
+    assert await src.search_series("ノ ノ ノ") == []
+    assert await src.search_series("   ") == []
+
+
+async def test_mangaplus_search_empty_query_returns_nothing():
+    src = MangaPlusSource(client=httpx.AsyncClient())
+    assert await src.search_series("한글") == []
+    assert await src.search_series("") == []
+
+
 @respx.mock
 async def test_tcb_search_matches_catalog():
     src = TCBScansSource(client=httpx.AsyncClient())

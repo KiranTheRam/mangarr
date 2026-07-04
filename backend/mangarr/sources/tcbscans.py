@@ -72,8 +72,10 @@ class TCBScansSource(DirectSource):
         return catalog
 
     async def search_series(self, query: str) -> list[SourceSeries]:
-        catalog = await self._load_catalog()
         nq = normalize_title(query)
+        if not nq:
+            return []
+        catalog = await self._load_catalog()
         scored: list[tuple[int, SourceSeries]] = []
         for series in catalog:
             nt = normalize_title(series.title)
