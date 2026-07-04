@@ -138,6 +138,27 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
                     ch.volume = sc.volume
                 if not ch.title and sc.title:
                     ch.title = sc.title
+
+    # backfill volume numbers for chapters that came from sources without
+    # volume data (e.g. WeebCentral, or MangaDex titles whose chapters are
+    # external and thus never appear in the feed)
+    if any(c.volume is None for c in existing.values()):
+        for src in registry.enabled_direct_sources(values):
+            link = links.get(src.name)
+            if link is None:
+                continue
+            try:
+                volume_map = await src.get_volume_map(link.external_id)
+            except Exception as exc:
+                log.warning("volume map failed on %s for %r: %s", src.name, series.title, exc)
+                continue
+            if not volume_map:
+                continue
+            for number, ch in existing.items():
+                if ch.volume is None and number in volume_map:
+                    ch.volume = volume_map[number]
+            break
+
     await session.commit()
     return added
 

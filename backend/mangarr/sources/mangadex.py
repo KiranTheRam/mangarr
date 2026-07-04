@@ -172,6 +172,29 @@ class MangaDexSource(DirectSource):
                 break
         return sorted(chapters.values(), key=lambda c: c.number)
 
+    async def get_volume_map(self, external_id: str) -> dict[float, int]:
+        """Volume assignments from the aggregate endpoint, across all
+        languages — it covers chapters the feed can't serve (e.g. titles
+        whose English chapters are external MangaPlus links)."""
+        data = await self._get(f"/manga/{external_id}/aggregate")
+        volumes = data.get("volumes")
+        if not isinstance(volumes, dict):
+            return {}
+        mapping: dict[float, int] = {}
+        for vol_key, vol in volumes.items():
+            try:
+                vol_num = int(float(vol_key))
+            except (TypeError, ValueError):
+                continue  # "none" bucket — unassigned chapters
+            chapters = vol.get("chapters")
+            if not isinstance(chapters, dict):
+                continue
+            for ch_key in chapters:
+                number = parse_chapter_number(ch_key or "")
+                if number is not None:
+                    mapping[number] = vol_num
+        return mapping
+
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         data = await self._get(f"/at-home/server/{chapter_external_id}", athome=True)
         base = data["baseUrl"]

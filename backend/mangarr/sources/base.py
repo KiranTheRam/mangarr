@@ -54,6 +54,11 @@ class DirectSource(ABC):
         resp.raise_for_status()
         return resp.content
 
+    async def get_volume_map(self, external_id: str) -> dict[float, int]:
+        """chapter number → volume number, for sources that know volume
+        assignments even for chapters they can't serve. Optional."""
+        return {}
+
 
 class TorrentIndexer(ABC):
     name: str
