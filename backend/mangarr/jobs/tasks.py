@@ -142,6 +142,22 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
     return added
 
 
+async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
+    """Clear downloaded state for chapters whose recorded media file is gone."""
+    missing = 0
+    for chapter in series.chapters:
+        if not chapter.downloaded:
+            continue
+        if not chapter.file_path or not Path(chapter.file_path).is_file():
+            chapter.downloaded = False
+            chapter.file_path = ""
+            missing += 1
+    if missing:
+        await session.commit()
+        log.info("Marked %d missing file(s) for %r", missing, series.title)
+    return missing
+
+
 async def refresh_series_full(series_id: int) -> None:
     async with session_scope() as session:
         series = await _load_series(session, series_id)
@@ -154,6 +170,7 @@ async def refresh_series_full(series_id: int) -> None:
             log.warning("metadata refresh failed for series %d: %s", series_id, exc)
         await link_sources(session, series, values)
         await update_chapters(session, series, values)
+        await reconcile_downloaded_files(session, series)
 
 
 async def _load_series(session: AsyncSession, series_id: int) -> Series | None:
