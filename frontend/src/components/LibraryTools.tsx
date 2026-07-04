@@ -1,8 +1,84 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { Chapter, RenameItem, RenameOutcome, SeriesFile } from "../api/types";
+import type {
+  Chapter,
+  RenameItem,
+  RenameOutcome,
+  SeriesFile,
+  SeriesFolder,
+} from "../api/types";
 import { Modal, Spinner, chapterLabel } from "./common";
+import { FolderBrowser } from "./FolderBrowser";
+
+/** Lists the folders a series spans (primary + extras) with add/remove and a
+ *  way to change the primary. Supports libraries where a series is split
+ *  across, e.g., a volumes folder and a chapters folder. */
+export function FoldersPanel({
+  seriesId,
+  onChanged,
+}: {
+  seriesId: number;
+  onChanged: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [picking, setPicking] = useState<null | "add" | "primary">(null);
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["folders", seriesId] });
+    onChanged();
+  };
+  const { data } = useQuery({
+    queryKey: ["folders", seriesId],
+    queryFn: () => api.get<SeriesFolder[]>(`/series/${seriesId}/folders`),
+  });
+
+  const addExtra = useMutation({
+    mutationFn: (path: string) => api.post(`/series/${seriesId}/folders`, { path }),
+    onSuccess: invalidate,
+  });
+  const removeExtra = useMutation({
+    mutationFn: (id: number) => api.del(`/series/${seriesId}/folders/${id}`),
+    onSuccess: invalidate,
+  });
+  const setPrimary = useMutation({
+    mutationFn: (path: string) => api.put(`/series/${seriesId}`, { folder_name: path }),
+    onSuccess: invalidate,
+  });
+
+  return (
+    <div className="folders-panel">
+      {data?.map((f) => (
+        <div className="folder-line" key={f.id ?? "primary"}>
+          📁 <code>{f.path || "(unset)"}</code>
+          {f.primary && <span className="tag">primary</span>}
+          {!f.exists && <span className="tag" style={{ color: "var(--danger)" }}>missing</span>}
+          {f.primary ? (
+            <button className="btn sm" onClick={() => setPicking("primary")}>
+              Change
+            </button>
+          ) : (
+            <button className="btn sm" title="Remove" onClick={() => removeExtra.mutate(f.id!)}>
+              ✕
+            </button>
+          )}
+        </div>
+      ))}
+      <button className="btn sm" onClick={() => setPicking("add")}>
+        + Add folder
+      </button>
+      {picking && (
+        <FolderBrowser
+          onPick={(path) => {
+            if (picking === "add") addExtra.mutate(path);
+            else setPrimary.mutate(path);
+            setPicking(null);
+          }}
+          onClose={() => setPicking(null)}
+        />
+      )}
+    </div>
+  );
+}
 
 /** Preview + apply renames into mangarr's naming convention (Sonarr-style). */
 export function RenameModal({

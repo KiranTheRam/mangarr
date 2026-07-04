@@ -212,6 +212,18 @@ class FileMapIn(BaseModel):
     chapter_id: int
 
 
+class SeriesFolderOut(BaseModel):
+    id: int | None  # None for the primary folder
+    path: str
+    resolved: str
+    primary: bool
+    exists: bool
+
+
+class SeriesFolderIn(BaseModel):
+    path: str
+
+
 class FilesystemEntryOut(BaseModel):
     name: str
     path: str

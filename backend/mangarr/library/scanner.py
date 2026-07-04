@@ -1,9 +1,14 @@
-"""Scan an existing library folder and adopt files in place.
+"""Scan existing library folders and adopt files in place.
 
 Read-only with respect to the filesystem: it only records which tracked
 chapters are already present on disk (setting Chapter.downloaded/file_path).
 It never copies, moves, or writes files — that's what lets mangarr sit on top
-of a library the user already has without re-downloading anything."""
+of a library the user already has without re-downloading anything.
+
+A series can have several folders (a primary plus extras), e.g. a volumes
+directory and a separate loose-chapters directory; scanning looks across all
+of them and, where a chapter is available both as a loose file and inside a
+whole-volume archive, the exact chapter file wins."""
 
 import logging
 from dataclasses import dataclass, field
@@ -12,6 +17,7 @@ from pathlib import Path
 from ..models import Chapter, Series
 from ..util import normalize_title
 from .matcher import MediaFile, find_media_files, match_files
+from .naming import series_folder
 
 log = logging.getLogger(__name__)
 
@@ -29,9 +35,25 @@ class ScanResult:
 
 
 def series_dir(root: Path, series: Series) -> Path:
-    from .naming import series_folder
-
     return root / (series.folder_name or series_folder(series.title))
+
+
+def resolve_folders(root: Path, series: Series, extra_paths: list[str]) -> list[Path]:
+    """All directories to scan for a series: the primary folder plus any extra
+    folders. Extra paths may be relative to the root or absolute (pathlib joins
+    an absolute right-hand side by replacing, so `root / abs` == abs)."""
+    root = Path(root)
+    values = [series.folder_name or series_folder(series.title), *extra_paths]
+    folders: list[Path] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        p = root / value
+        if str(p) not in seen:
+            seen.add(str(p))
+            folders.append(p)
+    return folders
 
 
 def find_existing_folder(root: Path, series: Series) -> str | None:
@@ -56,23 +78,47 @@ def find_existing_folder(root: Path, series: Series) -> str | None:
     return best
 
 
-def scan_series(series: Series, chapters: list[Chapter], folder: Path) -> ScanResult:
-    """Mark chapters present in `folder` as downloaded (in place)."""
-    folder = Path(folder)
+def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) -> ScanResult:
+    """Mark chapters present across `folders` as downloaded (in place)."""
+    folders = [Path(f) for f in folders]
     result = ScanResult()
-    if not folder.exists():
-        # nothing on disk — reconcile away any stale ownership
-        result.cleared = _reconcile(chapters, folder)
+    existing = [f for f in folders if f.exists()]
+    if not existing:
+        result.cleared = _reconcile(chapters, keep=set())
         return result
 
-    match = match_files(find_media_files(folder), chapters)
+    media: list[MediaFile] = []
+    for folder in existing:
+        media.extend(find_media_files(folder))
+    match = match_files(media, chapters)
+
     owned_now: set[int] = set()
 
+    # exact chapter files first — they take precedence over volume coverage
     for mf in match.matched:
+        if mf.chapter is None:
+            continue
+        chapter = mf.chapter
         path_str = str(mf.media.path)
-        if mf.volume is not None and mf.chapter is None:
+        if chapter.id not in owned_now and (
+            not chapter.downloaded or chapter.file_path != path_str
+        ):
+            if not chapter.downloaded:
+                result.matched_chapters += 1
+            chapter.downloaded = True
+            chapter.file_path = path_str
+        owned_now.add(chapter.id)
+
+    # whole-volume archives fill in any chapters not already covered exactly
+    for mf in match.matched:
+        if mf.chapter is not None:
+            continue
+        if mf.volume is not None:
             result.volume_files += 1
+        path_str = str(mf.media.path)
         for chapter in mf.covered_chapters:
+            if chapter.id in owned_now:
+                continue
             if not chapter.downloaded or not chapter.file_path:
                 chapter.downloaded = True
                 chapter.file_path = path_str
@@ -80,16 +126,16 @@ def scan_series(series: Series, chapters: list[Chapter], folder: Path) -> ScanRe
             owned_now.add(chapter.id)
 
     result.unmatched = match.unmatched
-    result.cleared = _reconcile(chapters, folder, keep=owned_now)
-    log.info("Scanned %r: +%d chapters, %d volume files, %d unmatched, -%d cleared",
-             series.title, result.matched_chapters, result.volume_files,
-             result.unmatched_count, result.cleared)
+    result.cleared = _reconcile(chapters, keep=owned_now)
+    log.info("Scanned %r across %d folder(s): +%d chapters, %d volume files, "
+             "%d unmatched, -%d cleared", series.title, len(existing),
+             result.matched_chapters, result.volume_files, result.unmatched_count,
+             result.cleared)
     return result
 
 
-def _reconcile(chapters: list[Chapter], folder: Path, keep: set[int] | None = None) -> int:
+def _reconcile(chapters: list[Chapter], keep: set[int]) -> int:
     """Clear downloaded state for chapters whose recorded file is gone."""
-    keep = keep or set()
     cleared = 0
     for chapter in chapters:
         if not chapter.downloaded or chapter.id in keep:

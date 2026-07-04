@@ -151,6 +151,14 @@ export interface SeriesFile {
   matched_chapter_id: number | null;
 }
 
+export interface SeriesFolder {
+  id: number | null;
+  path: string;
+  resolved: string;
+  primary: boolean;
+  exists: boolean;
+}
+
 export interface FilesystemEntry {
   name: string;
   path: string;

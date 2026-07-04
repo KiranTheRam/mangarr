@@ -74,6 +74,24 @@ class Series(Base):
     source_links: Mapped[list[SeriesSourceLink]] = relationship(
         back_populates="series", cascade="all, delete-orphan"
     )
+    extra_folders: Mapped[list[SeriesFolder]] = relationship(
+        back_populates="series", cascade="all, delete-orphan"
+    )
+
+
+class SeriesFolder(Base):
+    """Additional library directories scanned for a series, beyond its primary
+    folder (Series.folder_name). Lets one series span, e.g., a volumes folder
+    and a separate loose-chapters folder."""
+
+    __tablename__ = "series_folders"
+    __table_args__ = (UniqueConstraint("series_id", "path"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
+    path: Mapped[str] = mapped_column(String)  # relative to root when under it, else absolute
+
+    series: Mapped[Series] = relationship(back_populates="extra_folders")
 
 
 class SeriesSourceLink(Base):

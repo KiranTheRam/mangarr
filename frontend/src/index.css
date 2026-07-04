@@ -797,3 +797,15 @@ table.data-table {
   color: var(--text-faint);
   cursor: default;
 }
+
+.folders-panel {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.folders-panel .folder-line {
+  margin-top: 0;
+}

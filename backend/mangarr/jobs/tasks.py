@@ -187,20 +187,21 @@ async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> i
 
 
 async def scan_series_folder(session: AsyncSession, series: Series) -> None:
-    """Adopt an existing library folder for the series and mark chapters that
-    are already on disk as owned (so they aren't re-downloaded)."""
-    from ..library.scanner import find_existing_folder, scan_series, series_dir
+    """Adopt existing library folders for the series and mark chapters that are
+    already on disk as owned (so they aren't re-downloaded)."""
+    from ..library.scanner import find_existing_folder, resolve_folders, scan_series
 
     if series.root_folder is None:
         return
     root = Path(series.root_folder.path)
-    folder = series_dir(root, series)
-    if not folder.exists():
+    extras = [f.path for f in series.extra_folders]
+    folders = resolve_folders(root, series, extras)
+    if not folders[0].exists() and not extras:
         found = find_existing_folder(root, series)
         if found:
             series.folder_name = found
-            folder = root / found
-    scan_series(series, list(series.chapters), folder)
+            folders = resolve_folders(root, series, extras)
+    scan_series(series, list(series.chapters), folders)
     await session.commit()
 
 
@@ -245,7 +246,7 @@ async def _load_series(session: AsyncSession, series_id: int) -> Series | None:
     result = await session.execute(
         select(Series)
         .options(selectinload(Series.chapters), selectinload(Series.source_links),
-                 selectinload(Series.root_folder))
+                 selectinload(Series.root_folder), selectinload(Series.extra_folders))
         .where(Series.id == series_id)
     )
     return result.scalar_one_or_none()

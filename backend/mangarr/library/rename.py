@@ -41,14 +41,15 @@ def _desired_name(series: Series, chapter: Chapter, ext: str,
 def plan_renames(
     series: Series,
     chapters: list[Chapter],
-    folder: Path,
     template: str,
     template_no_volume: str,
 ) -> list[RenameItem]:
     """Rename items for owned chapters whose on-disk name differs from the
-    naming convention. Files shared by several chapters (whole-volume
-    archives) produce one item."""
-    folder = Path(folder)
+    naming convention. Each file is renamed in place (within its own
+    directory), so a series that spans a volumes folder and a chapters folder
+    keeps that split. Files shared by several chapters (whole-volume archives)
+    produce one item, named with the volume convention; single chapter files
+    use the chapter convention."""
     # group chapters by the file they point at
     by_file: dict[str, list[Chapter]] = {}
     for ch in chapters:
@@ -61,14 +62,16 @@ def plan_renames(
         ext = current_path.suffix.lower()
         volumes = {c.volume for c in chs}
         if len(chs) > 1 and len(volumes) == 1 and None not in volumes:
-            # one archive covering a whole volume
+            # one archive covering a whole volume → volume naming
             desired = volume_filename(series_folder(series.title), chs[0].volume, ext)
         elif len(chs) == 1:
+            # a single chapter file → chapter naming
             desired = _desired_name(series, chs[0], ext, template, template_no_volume)
         else:
             # ambiguous grouping (multiple chapters, mixed volumes) — leave it
             continue
-        new_path = folder / desired
+        # rename in place, in the file's own directory
+        new_path = current_path.parent / desired
         if new_path.name != current_path.name:
             items.append(RenameItem(
                 chapter_ids=[c.id for c in chs],
