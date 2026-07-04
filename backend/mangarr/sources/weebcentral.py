@@ -75,6 +75,16 @@ class WeebCentralSource(DirectSource):
             )
         return results
 
+    @staticmethod
+    def _chapter_label(link) -> str:
+        """The chapter title lives in a leaf <span> inside the link; the link
+        also holds a "Last Read" span and a <time> whose date digits would
+        otherwise confuse chapter-number parsing."""
+        for span in link.find_all("span"):
+            if not span.find("span") and any(c.isdigit() for c in span.get_text()):
+                return span.get_text(" ", strip=True)
+        return link.get_text(" ", strip=True)
+
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:
         soup = await self._get_html(f"{BASE_URL}/series/{external_id}/full-chapter-list")
         chapters: dict[float, SourceChapter] = {}
@@ -82,7 +92,7 @@ class WeebCentralSource(DirectSource):
             m = CHAPTER_URL_RE.search(link.get("href", ""))
             if not m:
                 continue
-            text = link.get_text(" ", strip=True)
+            text = self._chapter_label(link)
             number = parse_chapter_number(text)
             if number is None:
                 continue
