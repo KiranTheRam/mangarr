@@ -186,6 +186,24 @@ async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> i
     return missing
 
 
+async def scan_series_folder(session: AsyncSession, series: Series) -> None:
+    """Adopt an existing library folder for the series and mark chapters that
+    are already on disk as owned (so they aren't re-downloaded)."""
+    from ..library.scanner import find_existing_folder, scan_series, series_dir
+
+    if series.root_folder is None:
+        return
+    root = Path(series.root_folder.path)
+    folder = series_dir(root, series)
+    if not folder.exists():
+        found = find_existing_folder(root, series)
+        if found:
+            series.folder_name = found
+            folder = root / found
+    scan_series(series, list(series.chapters), folder)
+    await session.commit()
+
+
 async def refresh_series_full(series_id: int) -> None:
     async with session_scope() as session:
         series = await _load_series(session, series_id)
@@ -198,7 +216,27 @@ async def refresh_series_full(series_id: int) -> None:
             log.warning("metadata refresh failed for series %d: %s", series_id, exc)
         await link_sources(session, series, values)
         await update_chapters(session, series, values)
+        # adopt existing on-disk files before the monitor considers grabbing
+        if values.get("library_scan_on_add", "true") == "true":
+            try:
+                await scan_series_folder(session, series)
+            except Exception as exc:
+                log.warning("library scan failed for series %d: %s", series_id, exc)
         await reconcile_downloaded_files(session, series)
+
+
+async def scan_all_series() -> None:
+    """Scan every series' folder to adopt on-disk files (background job)."""
+    async with session_scope() as session:
+        series_ids = [row[0] for row in (await session.execute(select(Series.id))).all()]
+    for series_id in series_ids:
+        async with session_scope() as session:
+            series = await _load_series(session, series_id)
+            if series is not None:
+                try:
+                    await scan_series_folder(session, series)
+                except Exception as exc:
+                    log.warning("library scan failed for series %d: %s", series_id, exc)
 
 
 async def _load_series(session: AsyncSession, series_id: int) -> Series | None:

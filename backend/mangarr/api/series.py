@@ -28,6 +28,24 @@ def _series_out(series: Series, chapter_count: int, downloaded_count: int) -> Se
     return out
 
 
+async def _normalize_folder_name(session: AsyncSession, series: Series, folder_name: str) -> str:
+    """Store the folder relative to the series' root folder when the given path
+    is under it (so it survives a root-folder move); otherwise keep as given."""
+    from pathlib import Path
+
+    from ..models import RootFolder
+
+    folder_name = folder_name.strip()
+    if series.root_folder_id is not None and folder_name.startswith("/"):
+        root = await session.get(RootFolder, series.root_folder_id)
+        if root is not None:
+            try:
+                return str(Path(folder_name).relative_to(root.path))
+            except ValueError:
+                pass  # outside the root — keep absolute
+    return folder_name.strip("/") if not folder_name.startswith("/") else folder_name
+
+
 @router.get("", response_model=list[SeriesOut])
 async def list_series(session: AsyncSession = Depends(get_session)):
     counts: dict[int, tuple[int, int]] = {}
@@ -107,6 +125,8 @@ async def update_series(
         series.monitored = body.monitored
     if body.root_folder_id is not None:
         series.root_folder_id = body.root_folder_id
+    if body.folder_name is not None:
+        series.folder_name = await _normalize_folder_name(session, series, body.folder_name)
     await session.commit()
     return await get_series(series_id, session)
 

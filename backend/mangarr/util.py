@@ -36,6 +36,12 @@ BRACKET_GROUPS = re.compile(r"\([^)]*\)|\[[^\]]*\]")
 VOLUME_PATTERN = re.compile(r"\bv(?:ol(?:ume)?)?[ ._]{0,2}(\d+)", re.I)
 
 
+def has_chapter_marker(text: str) -> bool:
+    """True when text has an explicit chapter token (c/ch/chapter + number),
+    as opposed to a bare trailing number that might actually be a volume."""
+    return CHAPTER_PREFIX_PATTERN.search(text) is not None
+
+
 def parse_chapter_number(text: str) -> float | None:
     m = CHAPTER_PREFIX_PATTERN.search(text)
     if m:

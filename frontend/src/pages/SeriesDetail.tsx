@@ -2,7 +2,12 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
-import type { Chapter, Release, SeriesDetail as SeriesDetailType } from "../api/types";
+import type {
+  Chapter,
+  Release,
+  ScanResult,
+  SeriesDetail as SeriesDetailType,
+} from "../api/types";
 import {
   chapterLabel,
   formatBytes,
@@ -11,6 +16,8 @@ import {
   statusPill,
   Toolbar,
 } from "../components/common";
+import { FolderBrowser } from "../components/FolderBrowser";
+import { FilesModal, RenameModal } from "../components/LibraryTools";
 
 function InteractiveSearch({
   seriesId,
@@ -124,6 +131,10 @@ export default function SeriesDetail() {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState<{ chapterId?: number; title: string } | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [showRename, setShowRename] = useState(false);
+  const [showFiles, setShowFiles] = useState(false);
+  const [showFolderPicker, setShowFolderPicker] = useState(false);
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
 
   const { data: series, isLoading } = useQuery({
     queryKey: ["series", seriesId],
@@ -144,6 +155,22 @@ export default function SeriesDetail() {
   const refresh = useMutation({
     mutationFn: () => api.post(`/series/${seriesId}/refresh`),
     onSuccess: () => setTimeout(invalidate, 4000),
+  });
+
+  const scan = useMutation({
+    mutationFn: () => api.post<ScanResult>(`/series/${seriesId}/scan`),
+    onSuccess: (res) => {
+      setScanResult(res);
+      invalidate();
+    },
+  });
+
+  const setFolder = useMutation({
+    mutationFn: (folder_name: string) => api.put(`/series/${seriesId}`, { folder_name }),
+    onSuccess: () => {
+      setShowFolderPicker(false);
+      invalidate();
+    },
   });
 
   const deleteSeries = useMutation({
@@ -241,6 +268,15 @@ export default function SeriesDetail() {
         <button className="btn" onClick={() => refresh.mutate()} disabled={refresh.isPending}>
           ⟳ Refresh
         </button>
+        <button className="btn" onClick={() => scan.mutate()} disabled={scan.isPending}>
+          {scan.isPending ? "Scanning…" : "🗂 Scan Disk"}
+        </button>
+        <button className="btn" onClick={() => setShowFiles(true)}>
+          📄 Files
+        </button>
+        <button className="btn" onClick={() => setShowRename(true)}>
+          ✏️ Rename
+        </button>
         <button
           className="btn"
           onClick={() => setSearch({ title: `${series.title} (all releases)` })}
@@ -261,6 +297,22 @@ export default function SeriesDetail() {
         </button>
       </Toolbar>
       <div className="content">
+        {scanResult && (
+          <div className="scan-banner" onClick={() => setScanResult(null)}>
+            <strong>Scan complete.</strong> {scanResult.matched_chapters} chapter
+            {scanResult.matched_chapters === 1 ? "" : "s"} matched
+            {scanResult.volume_files > 0 && `, ${scanResult.volume_files} volume file(s)`}
+            {scanResult.unmatched.length > 0 &&
+              `, ${scanResult.unmatched.length} unmatched`}
+            {scanResult.cleared > 0 && `, ${scanResult.cleared} cleared (missing)`}
+            {!scanResult.folder_exists && " — folder not found on disk"}
+            {scanResult.unmatched.length > 0 && (
+              <button className="btn sm" onClick={() => setShowFiles(true)}>
+                Review files
+              </button>
+            )}
+          </div>
+        )}
         <div
           className="series-header"
           style={series.banner_url ? { backgroundImage: `url(${series.banner_url})` } : {}}
@@ -300,6 +352,12 @@ export default function SeriesDetail() {
                 ))}
               </div>
             )}
+            <div className="folder-line">
+              📁 <code>{series.folder_name || "(unset)"}</code>
+              <button className="btn sm" onClick={() => setShowFolderPicker(true)}>
+                Change folder
+              </button>
+            </div>
           </div>
         </div>
 
@@ -355,6 +413,23 @@ export default function SeriesDetail() {
           chapterId={search.chapterId}
           title={search.title}
           onClose={() => setSearch(null)}
+        />
+      )}
+      {showRename && (
+        <RenameModal seriesId={seriesId} onClose={() => setShowRename(false)} onDone={invalidate} />
+      )}
+      {showFiles && (
+        <FilesModal
+          seriesId={seriesId}
+          chapters={series.chapters}
+          onClose={() => setShowFiles(false)}
+          onChanged={invalidate}
+        />
+      )}
+      {showFolderPicker && (
+        <FolderBrowser
+          onPick={(path) => setFolder.mutate(path)}
+          onClose={() => setShowFolderPicker(false)}
         />
       )}
     </>

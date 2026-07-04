@@ -33,6 +33,7 @@ def chapter_filename(
     chapter: float,
     volume: int | None = None,
     title: str = "",
+    ext: str = ".cbz",
 ) -> str:
     chosen = template if volume is not None else template_no_volume
     chosen = _format_chapter(chosen, chapter)
@@ -42,7 +43,12 @@ def chapter_filename(
         chapter=chapter,
         title=title,
     )
-    return sanitize_filename(name) + ".cbz"
+    return sanitize_filename(name) + ext
+
+
+def volume_filename(series_title: str, volume: int, ext: str = ".cbz") -> str:
+    """Name for a whole-volume archive (no per-chapter number)."""
+    return sanitize_filename(f"{series_title} - Vol. {volume:02d}") + ext
 
 
 def series_folder(series_title: str) -> str:

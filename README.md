@@ -64,6 +64,33 @@ First-run checklist, in the mangarr UI:
 4. **Add New**: search a title, pick a root folder, add. Chapters appear after
    the automatic source-linking pass (a few seconds).
 
+## Using an existing library
+
+Mangarr can sit on top of a library you already have and adopt it in place —
+it won't re-download what's on disk.
+
+1. **Mount your library** into the mangarr container and add it as a root
+   folder. In `docker-compose.yml`, add a volume (e.g.
+   `- /mnt/nas/manga:/library`), then Settings → Root Folders → add `/library`.
+2. **Add each series** as usual. On add (and on every refresh) mangarr finds the
+   matching folder in the root, scans it, and marks chapters/volumes you already
+   have as owned. The Wanted list then shows only what's genuinely missing.
+3. **Per-series tools** (on the series page):
+   - **Scan Disk** — re-scan the folder and adopt any new files.
+   - **Files** — see everything found, with unmatched files you can map to a
+     chapter by hand.
+   - **Rename** — preview and apply mangarr's naming convention
+     (`Series - Vol. 01 Ch. 0021.cbz`). Renaming **preserves the original
+     format** (a `.cbr` stays `.cbr`), never overwrites an existing file, and
+     never deletes anything.
+   - **Change folder** — browse the filesystem to point a series at its folder,
+     including a subfolder for collections (e.g. `Attack On Titan/Attack On
+     Titan`).
+
+Matching is filename-based and handles the usual variety: `Series - Ch. 12.cbz`,
+`Series ch. 12`, `Volume 03.cbr`, `Series v03 (2019).cbz`, whole-volume archives
+(which mark every chapter in that volume), and folders of loose images.
+
 ## Local development
 
 Backend (Python ≥3.11):

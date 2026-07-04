@@ -69,6 +69,7 @@ class AddSeriesIn(BaseModel):
 class SeriesUpdateIn(BaseModel):
     monitored: bool | None = None
     root_folder_id: int | None = None
+    folder_name: str | None = None
 
 
 class ChapterMonitorIn(BaseModel):
@@ -164,3 +165,59 @@ class SystemStatus(BaseModel):
     chapter_count: int
     downloaded_count: int
     queue_count: int
+
+
+# ---- library import / scan / rename ----
+
+class ScanResultOut(BaseModel):
+    folder: str
+    folder_exists: bool
+    matched_chapters: int
+    volume_files: int
+    cleared: int
+    unmatched: list[str] = []
+
+
+class RenameItemOut(BaseModel):
+    chapter_ids: list[int]
+    current_path: str
+    current_name: str
+    new_path: str
+    new_name: str
+
+
+class RenameApplyIn(BaseModel):
+    # optional subset; when omitted, apply all currently-planned renames
+    chapter_ids: list[int] | None = None
+
+
+class RenameOutcomeOut(BaseModel):
+    current_name: str
+    new_name: str
+    status: str
+    detail: str = ""
+
+
+class SeriesFileOut(BaseModel):
+    path: str
+    name: str
+    is_dir: bool
+    chapter_number: float | None = None
+    volume_number: int | None = None
+    matched_chapter_id: int | None = None
+
+
+class FileMapIn(BaseModel):
+    file_path: str
+    chapter_id: int
+
+
+class FilesystemEntryOut(BaseModel):
+    name: str
+    path: str
+
+
+class FilesystemListOut(BaseModel):
+    path: str
+    parent: str | None
+    entries: list[FilesystemEntryOut]
