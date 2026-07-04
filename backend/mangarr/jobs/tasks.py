@@ -383,10 +383,16 @@ async def _import_torrent(
         dl.error = str(exc)[:500]
         await session.commit()
         return
-    for dest, chapter in imported:
+    for dest, chapter, volume in imported:
         if chapter is not None:
             chapter.downloaded = True
             chapter.file_path = str(dest)
+        elif volume is not None:
+            # a volume archive covers every chapter assigned to that volume
+            for ch in series.chapters:
+                if ch.volume == volume and not ch.downloaded:
+                    ch.downloaded = True
+                    ch.file_path = str(dest)
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
     session.add(HistoryEvent(
@@ -423,6 +429,13 @@ async def monitor_all() -> None:
                 )
             )
             active = {row[0] for row in result.all()}
+            if None in active:
+                # a series-level download (e.g. a Nyaa volume pack) is in
+                # flight — its chapter coverage is unknown until it imports,
+                # so grabbing per-chapter now would duplicate everything
+                log.info("monitor: %r has a series-level download in flight; skipping grabs",
+                         series.title)
+                continue
             wanted = [
                 c for c in series.chapters
                 if c.monitored and not c.downloaded and c.id not in active

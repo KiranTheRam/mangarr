@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import type { MetadataResult, RootFolder } from "../api/types";
-import { EmptyState, Spinner, Toolbar, statusPill } from "../components/common";
+import { EmptyState, Spinner, Toggle, Toolbar, statusPill } from "../components/common";
 
 export default function AddSeries() {
   const [query, setQuery] = useState("");
@@ -23,6 +23,7 @@ export default function AddSeries() {
   });
 
   const [rootFolderId, setRootFolderId] = useState<number | null>(null);
+  const [monitored, setMonitored] = useState(true);
   const effectiveRoot = rootFolderId ?? rootFolders?.[0]?.id ?? null;
 
   const addMutation = useMutation({
@@ -30,7 +31,7 @@ export default function AddSeries() {
       api.post<{ id: number }>("/series", {
         anilist_id: anilistId,
         root_folder_id: effectiveRoot,
-        monitored: true,
+        monitored,
       }),
     onSuccess: (series) => {
       queryClient.invalidateQueries({ queryKey: ["series"] });
@@ -82,6 +83,16 @@ export default function AddSeries() {
             </select>
           </div>
         )}
+
+        <div className="form-row" style={{ maxWidth: 640 }}>
+          <label>Monitor new series</label>
+          <Toggle on={monitored} onChange={setMonitored} />
+          <span style={{ color: "var(--text-faint)", fontSize: 13 }}>
+            {monitored
+              ? "Chapters will be grabbed automatically"
+              : "Added to the library only — no automatic downloads"}
+          </span>
+        </div>
 
         {addMutation.isError && (
           <div className="error-banner">{(addMutation.error as Error).message}</div>

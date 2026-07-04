@@ -48,12 +48,13 @@ def import_torrent_payload(
     library_root: Path,
     template: str,
     template_no_volume: str,
-) -> list[tuple[Path, Chapter | None]]:
+) -> list[tuple[Path, Chapter | None, int | None]]:
     """Copies/renames payload files into the library. Returns (dest, matched
-    chapter) pairs; chapter is None for volume archives that span chapters."""
+    chapter, volume) triples; chapter is None for volume archives that span
+    chapters — those carry the parsed volume number instead."""
     folder = library_root / (series.folder_name or series_folder(series.title))
     folder.mkdir(parents=True, exist_ok=True)
-    imported: list[tuple[Path, Chapter | None]] = []
+    imported: list[tuple[Path, Chapter | None, int | None]] = []
     by_number = {c.number: c for c in chapters}
 
     for src in find_importable_files(content_path):
@@ -76,7 +77,7 @@ def import_torrent_payload(
         if not dest.exists():
             shutil.copy2(src, dest)
             log.info("Imported %s -> %s", src.name, dest)
-        imported.append((dest, chapter))
+        imported.append((dest, chapter, vol_num if chapter is None else None))
 
     # loose image directories → zip each into a CBZ
     for img_dir in find_image_dirs(content_path):
@@ -102,6 +103,6 @@ def import_torrent_payload(
                 for img in images:
                     zf.write(img, img.name)
             log.info("Packed %s (%d images) -> %s", img_dir, len(images), dest)
-        imported.append((dest, chapter))
+        imported.append((dest, chapter, vol_num if chapter is None else None))
 
     return imported

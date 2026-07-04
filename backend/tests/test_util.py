@@ -29,6 +29,18 @@ class TestParseChapterNumber:
     def test_no_match(self):
         assert parse_chapter_number("Complete Series Batch") is None
 
+    def test_scene_style_tags_after_number(self):
+        # number followed by (year) (quality) (group) tags
+        assert parse_chapter_number("Kagurabachi 057 (2024) (Digital) (1r0n)") == 57.0
+        assert parse_chapter_number("One Piece - 1044 [Viz]") == 1044.0
+
+    def test_year_alone_is_not_a_chapter(self):
+        assert parse_chapter_number("Kagurabachi (2024) (Digital)") is None
+
+    def test_scene_style_volume_is_not_chapter(self):
+        assert parse_chapter_number("Kagurabachi v01 (2023) (Digital) (1r0n)") is None
+        assert parse_volume_number("Kagurabachi v01 (2023) (Digital) (1r0n)") == 1
+
     def test_volume_only_is_not_chapter(self):
         # "v01"/"v03" must not be read as a chapter number
         assert parse_chapter_number("Berserk v01") is None

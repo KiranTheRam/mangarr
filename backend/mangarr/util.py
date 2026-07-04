@@ -28,23 +28,25 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"\s+", " ", cleaned) or "Unknown"
 
 
-CHAPTER_PATTERNS = [
-    # "c002", "ch 21", "Ch. 21", "Chapter 3" — up to two separator chars
-    # so dotted forms like "Ch. 21" parse too
-    re.compile(r"\bc(?:h(?:apter)?)?[ ._]{0,2}(\d+(?:\.\d+)?)", re.I),
-    re.compile(r"\b(\d+(?:\.\d+)?)\s*$"),
-]
+# "c002", "ch 21", "Ch. 21", "Chapter 3" — up to two separator chars
+# so dotted forms like "Ch. 21" parse too
+CHAPTER_PREFIX_PATTERN = re.compile(r"\bc(?:h(?:apter)?)?[ ._]{0,2}(\d+(?:\.\d+)?)", re.I)
+TRAILING_NUMBER_PATTERN = re.compile(r"\b(\d+(?:\.\d+)?)\s*$")
+BRACKET_GROUPS = re.compile(r"\([^)]*\)|\[[^\]]*\]")
 VOLUME_PATTERN = re.compile(r"\bv(?:ol(?:ume)?)?[ ._]{0,2}(\d+)", re.I)
 
 
 def parse_chapter_number(text: str) -> float | None:
-    for pattern in CHAPTER_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                continue
+    m = CHAPTER_PREFIX_PATTERN.search(text)
+    if m:
+        return float(m.group(1))
+    # scene-style names bury the chapter before tag groups:
+    # "Kagurabachi 057 (2024) (Digital) (1r0n)" → strip (…)/[…], then the
+    # chapter is the trailing number
+    stripped = BRACKET_GROUPS.sub(" ", text).strip()
+    m = TRAILING_NUMBER_PATTERN.search(stripped)
+    if m:
+        return float(m.group(1))
     return None
 
 

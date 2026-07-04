@@ -657,3 +657,41 @@ table.data-table {
   margin-bottom: 16px;
   font-size: 13px;
 }
+
+/* ---- volume groups on series detail ---- */
+
+.volume-group {
+  margin-bottom: 18px;
+}
+
+.volume-group .data-table {
+  margin-top: 0;
+}
+
+.volume-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px 4px 0 0;
+  cursor: pointer;
+  user-select: none;
+}
+
+.volume-header:hover {
+  background: var(--bg-hover, #313746);
+}
+
+.volume-header .chevron {
+  color: var(--text-faint);
+  width: 14px;
+}
+
+.volume-header h4 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  flex: 1;
+}

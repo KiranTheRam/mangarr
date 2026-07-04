@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
-import type { Release, SeriesDetail as SeriesDetailType } from "../api/types";
+import type { Chapter, Release, SeriesDetail as SeriesDetailType } from "../api/types";
 import {
   chapterLabel,
   formatBytes,
@@ -103,12 +103,27 @@ function InteractiveSearch({
   );
 }
 
+function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: Chapter[] }[] {
+  const byVolume = new Map<number | null, Chapter[]>();
+  for (const ch of chapters) {
+    const key = ch.volume;
+    if (!byVolume.has(key)) byVolume.set(key, []);
+    byVolume.get(key)!.push(ch);
+  }
+  // volume-less chapters first (usually the newest, not yet collected),
+  // then volumes descending — like Sonarr's latest-season-on-top
+  return [...byVolume.entries()]
+    .sort(([a], [b]) => (a === null ? -1 : b === null ? 1 : b - a))
+    .map(([volume, chs]) => ({ volume, chapters: chs.sort((a, b) => b.number - a.number) }));
+}
+
 export default function SeriesDetail() {
   const { id } = useParams();
   const seriesId = Number(id);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState<{ chapterId?: number; title: string } | null>(null);
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   const { data: series, isLoading } = useQuery({
     queryKey: ["series", seriesId],
@@ -157,7 +172,68 @@ export default function SeriesDetail() {
     );
   }
 
-  const chapters = [...series.chapters].sort((a, b) => b.number - a.number);
+  const hasVolumes = series.chapters.some((c) => c.volume !== null);
+  const groups = hasVolumes
+    ? groupByVolume(series.chapters)
+    : [{ volume: null, chapters: [...series.chapters].sort((a, b) => b.number - a.number) }];
+
+  const chapterRows = (chapters: Chapter[]) => (
+    <table className="data-table">
+      <thead>
+        <tr>
+          <th style={{ width: 36 }}></th>
+          <th style={{ width: 130 }}>Chapter</th>
+          <th>Title</th>
+          <th style={{ width: 120 }}>Status</th>
+          <th style={{ width: 90 }}></th>
+        </tr>
+      </thead>
+      <tbody>
+        {chapters.map((ch) => (
+          <tr key={ch.id}>
+            <td>
+              <button
+                className={`monitor-toggle${ch.monitored ? " on" : ""}`}
+                title={ch.monitored ? "Monitored" : "Unmonitored"}
+                onClick={() =>
+                  toggleChapter.mutate({ chapterIds: [ch.id], monitored: !ch.monitored })
+                }
+              >
+                {ch.monitored ? "🔖" : "◻"}
+              </button>
+            </td>
+            <td>{chapterLabel(ch.number, ch.volume)}</td>
+            <td style={{ color: ch.title ? "inherit" : "var(--text-faint)" }}>
+              {ch.title || "—"}
+            </td>
+            <td>
+              {ch.downloaded ? (
+                <span className="pill green" title={ch.file_path}>
+                  Downloaded
+                </span>
+              ) : (
+                <span className="pill gray">Missing</span>
+              )}
+            </td>
+            <td>
+              <button
+                className="btn icon-btn"
+                title="Interactive search"
+                onClick={() =>
+                  setSearch({
+                    chapterId: ch.id,
+                    title: `${series.title} ${chapterLabel(ch.number, ch.volume)}`,
+                  })
+                }
+              >
+                🔍
+              </button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
 
   return (
     <>
@@ -227,66 +303,49 @@ export default function SeriesDetail() {
           </div>
         </div>
 
-        {chapters.length === 0 ? (
+        {series.chapters.length === 0 ? (
           <p style={{ color: "var(--text-dim)" }}>
             No chapters found yet — sources may still be syncing. Use Refresh to retry.
           </p>
+        ) : !hasVolumes ? (
+          chapterRows(groups[0].chapters)
         ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th style={{ width: 36 }}></th>
-                <th style={{ width: 130 }}>Chapter</th>
-                <th>Title</th>
-                <th style={{ width: 120 }}>Status</th>
-                <th style={{ width: 90 }}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {chapters.map((ch) => (
-                <tr key={ch.id}>
-                  <td>
-                    <button
-                      className={`monitor-toggle${ch.monitored ? " on" : ""}`}
-                      title={ch.monitored ? "Monitored" : "Unmonitored"}
-                      onClick={() =>
-                        toggleChapter.mutate({ chapterIds: [ch.id], monitored: !ch.monitored })
-                      }
-                    >
-                      {ch.monitored ? "🔖" : "◻"}
-                    </button>
-                  </td>
-                  <td>{chapterLabel(ch.number, ch.volume)}</td>
-                  <td style={{ color: ch.title ? "inherit" : "var(--text-faint)" }}>
-                    {ch.title || "—"}
-                  </td>
-                  <td>
-                    {ch.downloaded ? (
-                      <span className="pill green" title={ch.file_path}>
-                        Downloaded
-                      </span>
-                    ) : (
-                      <span className="pill gray">Missing</span>
-                    )}
-                  </td>
-                  <td>
-                    <button
-                      className="btn icon-btn"
-                      title="Interactive search"
-                      onClick={() =>
-                        setSearch({
-                          chapterId: ch.id,
-                          title: `${series.title} ${chapterLabel(ch.number, ch.volume)}`,
-                        })
-                      }
-                    >
-                      🔍
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          groups.map(({ volume, chapters }) => {
+            const key = volume === null ? "none" : String(volume);
+            const isCollapsed = collapsed[key] ?? false;
+            const downloaded = chapters.filter((c) => c.downloaded).length;
+            const allMonitored = chapters.every((c) => c.monitored);
+            return (
+              <div className="volume-group" key={key}>
+                <div
+                  className="volume-header"
+                  onClick={() => setCollapsed({ ...collapsed, [key]: !isCollapsed })}
+                >
+                  <span className="chevron">{isCollapsed ? "▸" : "▾"}</span>
+                  <button
+                    className={`monitor-toggle${allMonitored ? " on" : ""}`}
+                    title={allMonitored ? "Unmonitor this volume" : "Monitor this volume"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleChapter.mutate({
+                        chapterIds: chapters.map((c) => c.id),
+                        monitored: !allMonitored,
+                      });
+                    }}
+                  >
+                    {allMonitored ? "🔖" : "◻"}
+                  </button>
+                  <h4>{volume === null ? "Chapters without volume" : `Volume ${volume}`}</h4>
+                  <span
+                    className={`pill ${downloaded === chapters.length ? "green" : "gray"}`}
+                  >
+                    {downloaded} / {chapters.length}
+                  </span>
+                </div>
+                {!isCollapsed && chapterRows(chapters)}
+              </div>
+            );
+          })
         )}
       </div>
 
