@@ -102,6 +102,14 @@ async def test_asura_search():
 
 
 @respx.mock
+async def test_asura_search_null_data():
+    # Asura returns {"data": null} for a no-match; must not crash
+    src = AsuraSource(client=httpx.AsyncClient())
+    respx.get(f"{ASURA_API}/api/series").respond(json={"data": None, "meta": {}})
+    assert await src.search_series("no such title") == []
+
+
+@respx.mock
 async def test_asura_list_chapters_skips_locked_premium():
     src = AsuraSource(client=httpx.AsyncClient())
     respx.get(f"{ASURA_API}/api/series/slug-abc/chapters").respond(

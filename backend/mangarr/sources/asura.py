@@ -50,7 +50,7 @@ class AsuraSource(DirectSource):
     async def search_series(self, query: str) -> list[SourceSeries]:
         data = await self._get("/api/series", params={"search": query})
         results = []
-        for item in data.get("data", []):
+        for item in data.get("data") or []:
             slug = self._public_slug(item)
             if not slug:
                 continue
