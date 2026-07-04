@@ -117,3 +117,47 @@ export interface SystemStatus {
 }
 
 export type Settings = Record<string, string>;
+
+export interface ScanResult {
+  folder: string;
+  folder_exists: boolean;
+  matched_chapters: number;
+  volume_files: number;
+  cleared: number;
+  unmatched: string[];
+}
+
+export interface RenameItem {
+  chapter_ids: number[];
+  current_path: string;
+  current_name: string;
+  new_path: string;
+  new_name: string;
+}
+
+export interface RenameOutcome {
+  current_name: string;
+  new_name: string;
+  status: string;
+  detail: string;
+}
+
+export interface SeriesFile {
+  path: string;
+  name: string;
+  is_dir: boolean;
+  chapter_number: number | null;
+  volume_number: number | null;
+  matched_chapter_id: number | null;
+}
+
+export interface FilesystemEntry {
+  name: string;
+  path: string;
+}
+
+export interface FilesystemList {
+  path: string;
+  parent: string | null;
+  entries: FilesystemEntry[];
+}
