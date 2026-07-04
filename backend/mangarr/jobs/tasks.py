@@ -131,13 +131,14 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
             ch = existing.get(sc.number)
             if ch is None:
                 ch = Chapter(
-                    series_id=series.id,
                     number=sc.number,
                     volume=sc.volume,
                     title=sc.title,
                     monitored=series.monitored,
                 )
-                session.add(ch)
+                # append via the relationship so series.chapters is current for
+                # the scan/backfill later in this same pass
+                series.chapters.append(ch)
                 existing[sc.number] = ch
                 added += 1
             else:
