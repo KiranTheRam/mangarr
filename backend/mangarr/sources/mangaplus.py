@@ -13,11 +13,11 @@ Notes:
   home server); it will not work from most cloud hosts.
 """
 
+import secrets
 import time
 
 import httpx
 
-from .. import USER_AGENT
 from ..util import RateLimiter, normalize_title, parse_chapter_number
 from .base import DirectSource, SourceChapter, SourceSeries
 
@@ -45,8 +45,17 @@ class MangaPlusSource(DirectSource):
     name = "mangaplus"
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        # MangaPlus rejects requests without a device secret in the
+        # Session-Token header ("Account Banned"); the app generates this
+        # client-side, so a random per-instance value is enough.
+        self._session_token = secrets.token_hex(8)
         self._client = client or httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT}, timeout=60, follow_redirects=True
+            headers={
+                "User-Agent": "okhttp/4.9.0",
+                "Session-Token": self._session_token,
+            },
+            timeout=60,
+            follow_redirects=True,
         )
         self._catalog: list[SourceSeries] = []
         self._catalog_at = 0.0
@@ -55,7 +64,9 @@ class MangaPlusSource(DirectSource):
         await _limiter.acquire()
         query = {"format": "json", "os": "android", "os_ver": "32", "app_ver": "40"}
         query.update(params or {})
-        resp = await self._client.get(f"{API_URL}{path}", params=query)
+        resp = await self._client.get(
+            f"{API_URL}{path}", params=query, headers={"Session-Token": self._session_token}
+        )
         resp.raise_for_status()
         body = resp.json()
         if "error" in body:
