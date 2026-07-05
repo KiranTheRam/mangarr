@@ -28,12 +28,13 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"\s+", " ", cleaned) or "Unknown"
 
 
-# "c002", "ch 21", "Ch. 21", "Chapter 3" — up to two separator chars
-# so dotted forms like "Ch. 21" parse too
-CHAPTER_PREFIX_PATTERN = re.compile(r"\bc(?:h(?:apter)?)?[ ._]{0,2}(\d+(?:\.\d+)?)", re.I)
+# "c002", "ch 21", "Ch. 21", "Chapter 3", "_Chapter_1" — the lookbehind (no
+# preceding letter) lets it match after an underscore/bracket/digit too, since
+# \b treats "_" as a word char and would miss "[0001]_Chapter_1"
+CHAPTER_PREFIX_PATTERN = re.compile(r"(?<![a-z])c(?:h(?:apter)?)?[ ._]{0,2}(\d+(?:\.\d+)?)", re.I)
 TRAILING_NUMBER_PATTERN = re.compile(r"\b(\d+(?:\.\d+)?)\s*$")
 BRACKET_GROUPS = re.compile(r"\([^)]*\)|\[[^\]]*\]")
-VOLUME_PATTERN = re.compile(r"\bv(?:ol(?:ume)?)?[ ._]{0,2}(\d+)", re.I)
+VOLUME_PATTERN = re.compile(r"(?<![a-z])v(?:ol(?:ume)?)?[ ._]{0,2}(\d+)", re.I)
 
 
 def has_chapter_marker(text: str) -> bool:
