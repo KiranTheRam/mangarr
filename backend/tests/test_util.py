@@ -29,6 +29,11 @@ class TestParseChapterNumber:
     def test_no_match(self):
         assert parse_chapter_number("Complete Series Batch") is None
 
+    def test_underscore_separated_chapter(self):
+        # "[0001]_Chapter_1_-_Her name" — underscore before "Chapter"
+        assert parse_chapter_number("[0001]_Chapter_1_-_Her name is Urumin") == 1.0
+        assert parse_chapter_number("Series_Chapter_42") == 42.0
+
     def test_scene_style_tags_after_number(self):
         # number followed by (year) (quality) (group) tags
         assert parse_chapter_number("Kagurabachi 057 (2024) (Digital) (1r0n)") == 57.0
