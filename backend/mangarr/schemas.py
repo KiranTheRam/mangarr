@@ -184,6 +184,7 @@ class RenameItemOut(BaseModel):
     current_name: str
     new_path: str
     new_name: str
+    conflict: bool = False
 
 
 class RenameApplyIn(BaseModel):
