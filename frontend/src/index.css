@@ -820,3 +820,14 @@ table.data-table {
   width: 52px;
   padding: 2px 6px;
 }
+
+.rename-table th {
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.rename-table tr.row-off {
+  opacity: 0.4;
+}
+.rename-table tr.row-off .new {
+  text-decoration: line-through;
+}
