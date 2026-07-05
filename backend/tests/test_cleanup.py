@@ -17,7 +17,7 @@ def plan(series, chapters, folder):
 
 
 class TestAnalyze:
-    def test_duplicate_volume_prefers_canonical_name(self, tmp_path):
+    def test_duplicate_volume_keeps_the_in_use_copy(self, tmp_path):
         # the Chained Soldier case: original "v01" (referenced) + torrent "Vol. 01"
         make(tmp_path / "Series v01.cbz")
         make(tmp_path / "Series - Vol. 01.cbz")
@@ -31,8 +31,8 @@ class TestAnalyze:
         assert g.label == "Volume 1"
         keep = [f for f in g.files if f.keep]
         assert len(keep) == 1
-        # the canonically-named file is the keeper, even though the other is referenced
-        assert keep[0].name == "Series - Vol. 01.cbz"
+        # keep the file already in use; the unreferenced duplicate is removed
+        assert keep[0].name == "Series v01.cbz" and keep[0].referenced
 
     def test_redundant_orphan_default_delete(self, tmp_path):
         # a stray volume file whose chapters are all downloaded elsewhere

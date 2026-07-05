@@ -125,10 +125,14 @@ def _group(series, kind, num, files, referenced, ch_by_num, template, template_n
 
     cfiles = [CleanupFile(str(mf.path), _size(str(mf.path)), str(mf.path) in referenced, False)
               for mf in files]
-    keeper = next((c for c in cfiles if Path(c.path).name == canonical), None)
+    # default to keeping the file that's already in use (the established library
+    # copy), so cleanup only removes the accidental duplicate and never has to
+    # delete an in-use file. Fall back to the canonically-named one, then size.
+    keeper = next((c for c in cfiles if c.referenced), None)
     if keeper is None:
-        refd = [c for c in cfiles if c.referenced]
-        keeper = refd[0] if refd else max(cfiles, key=lambda c: c.size)
+        keeper = next((c for c in cfiles if Path(c.path).name == canonical), None)
+    if keeper is None:
+        keeper = max(cfiles, key=lambda c: c.size)
     keeper.keep = True
     return CleanupGroup(label, cfiles)
 
