@@ -1,0 +1,126 @@
+"""Build a trustworthy chapter→volume map from source metadata.
+
+Volume→chapter data (MangaDex /aggregate is the only structured source) is
+community-entered and has two failure modes this module corrects:
+
+1. **Strays** — a lone mislabeled chapter (e.g. one scanlation tagging
+   chapter 232 as volume 1). Volume numbers must be non-decreasing in
+   chapter order, so we keep the largest internally-consistent subset
+   (longest non-decreasing subsequence) and drop the rest.
+
+2. **Gaps** — recent volumes simply never entered (e.g. volumes 12–17
+   missing while 18+ exist from a stray special). Chapters between two
+   known anchors can only belong to the volumes between them, so we
+   distribute them evenly across that range. Volume sizes within one
+   series are near-constant in practice, which makes this accurate to
+   about ±1 chapter at each inferred boundary — and any assignment the
+   source later provides replaces the inference on the next resync.
+
+Chapters after the last anchor stay unassigned: for an ongoing series they
+genuinely aren't collected in a volume yet, and guessing volumes that may
+not exist would be worse than none. Chapters before the first anchor
+(cover specials, oneshots) also stay unassigned.
+"""
+
+import bisect
+from collections.abc import Iterable
+
+
+def merge_volume_maps(maps: Iterable[dict[float, int]]) -> dict[float, int]:
+    """Union per-source maps; earlier maps (higher-priority sources) win."""
+    merged: dict[float, int] = {}
+    for m in maps:
+        for number, volume in m.items():
+            merged.setdefault(number, volume)
+    return merged
+
+
+def sanitize_volume_map(mapping: dict[float, int]) -> dict[float, int]:
+    """Drop assignments that break volume monotonicity in chapter order,
+    keeping the largest consistent subset."""
+    items = sorted(mapping.items())
+    keep = _longest_non_decreasing([v for _, v in items])
+    return {items[i][0]: items[i][1] for i in keep}
+
+
+def _longest_non_decreasing(values: list[int]) -> set[int]:
+    """Indices of one longest non-decreasing subsequence (O(n log n))."""
+    tail_values: list[int] = []  # smallest tail value per subsequence length
+    tail_index: list[int] = []
+    prev = [-1] * len(values)
+    for i, v in enumerate(values):
+        j = bisect.bisect_right(tail_values, v)
+        if j == len(tail_values):
+            tail_values.append(v)
+            tail_index.append(i)
+        else:
+            tail_values[j] = v
+            tail_index[j] = i
+        prev[i] = tail_index[j - 1] if j > 0 else -1
+    keep: set[int] = set()
+    i = tail_index[-1] if tail_index else -1
+    while i != -1:
+        keep.add(i)
+        i = prev[i]
+    return keep
+
+
+def interpolate_volume_gaps(
+    mapping: dict[float, int], chapter_numbers: Iterable[float]
+) -> dict[float, int]:
+    """Assign unmapped chapters that lie between two known anchors.
+
+    A gap between the last known chapter of volume A and the first known
+    chapter of volume B belongs to volumes A+1..B-1, extended to include B
+    itself when B's own data is sparse (a volume known only from a stray
+    special has its front missing too; a volume with several entered
+    chapters starts where its data says it starts). A's span is complete —
+    aggregate data is entered per released chapter, so it's whole volumes
+    that go missing. The gap is split evenly across the range.
+    """
+    if not mapping:
+        return dict(mapping)
+    result = dict(mapping)
+    anchor_count: dict[int, int] = {}
+    for vol in mapping.values():
+        anchor_count[vol] = anchor_count.get(vol, 0) + 1
+    gap: list[float] = []  # unmapped chapters since the previous anchor
+    numbers = sorted(set(chapter_numbers) | set(mapping))
+    prev_vol: int | None = None
+    for number in numbers:
+        if number not in mapping:
+            if prev_vol is not None:
+                gap.append(number)
+            continue
+        vol = mapping[number]
+        if gap and vol > prev_vol:
+            start = prev_vol + 1
+            end = vol if anchor_count[vol] < 3 else vol - 1
+            if end < start:
+                # adjacent fully-known volumes — stragglers (decimal
+                # extras between them) trail the earlier volume
+                for n in gap:
+                    result[n] = prev_vol
+            else:
+                span = end - start + 1
+                per = len(gap) / span
+                for i, n in enumerate(gap):
+                    result[n] = start + min(int(i / per), span - 1)
+        elif gap:
+            # same volume on both sides — the middle is that volume too
+            for n in gap:
+                result[n] = vol
+        gap = []
+        prev_vol = vol
+    return result
+
+
+def build_volume_map(
+    maps: Iterable[dict[float, int]], chapter_numbers: Iterable[float]
+) -> dict[float, int]:
+    """Merge, sanitize, and gap-fill source volume maps into one
+    chapter→volume assignment covering every chapter it can justify."""
+    merged = sanitize_volume_map(merge_volume_maps(maps))
+    if not merged:
+        return {}
+    return interpolate_volume_gaps(merged, chapter_numbers)

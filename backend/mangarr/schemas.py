@@ -273,6 +273,14 @@ class ResyncOut(BaseModel):
     matched_chapters: int
 
 
+class VolumeResyncOut(BaseModel):
+    has_data: bool  # False when no linked source provides volume data
+    assigned: int  # chapters with a volume after the resync
+    changed: int  # chapters whose volume assignment changed
+    repointed: int  # chapters re-covered by a different file on disk
+    cleared: int  # chapters no longer backed by any file
+
+
 class SeriesFolderOut(BaseModel):
     id: int | None  # None for the primary folder
     path: str

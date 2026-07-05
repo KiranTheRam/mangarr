@@ -127,6 +127,14 @@ export interface ScanResult {
   unmatched: string[];
 }
 
+export interface VolumeResyncResult {
+  has_data: boolean;
+  assigned: number;
+  changed: number;
+  repointed: number;
+  cleared: number;
+}
+
 export interface RenameItem {
   chapter_ids: number[];
   current_path: string;

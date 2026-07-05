@@ -42,6 +42,7 @@ from ..schemas import (
     SourceCandidateOut,
     SourceLinkIn,
     SourceLinkOut,
+    VolumeResyncOut,
 )
 from ..sources import registry
 
@@ -403,6 +404,62 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     await update_chapters(session, series, values)
     scan = await _scan_now(session, series)
     return ResyncOut(chapters=len(series.chapters), matched_chapters=scan)
+
+
+@router.post("/series/{series_id}/volumes/resync", response_model=VolumeResyncOut)
+async def resync_volumes(series_id: int, session: AsyncSession = Depends(get_session)):
+    """Rebuild every chapter's volume assignment from source volume data
+    (sanitized + gap-filled, see mangarr.volumes), overwriting whatever is
+    there — the fix for stale or wrongly-stamped assignments. Chapters backed
+    by a volume archive that no longer matches their volume are re-scanned so
+    file coverage follows the corrected map. No-op when no linked source has
+    volume data (so manual mappings on metadata-gap series survive)."""
+    from ..jobs.tasks import fetch_volume_map
+    from ..util import has_chapter_marker, parse_volume_number
+
+    series = await _load(session, series_id)
+    values = await registry.apply_settings(session)
+    volume_map = await fetch_volume_map(series, values)
+    if not volume_map:
+        return VolumeResyncOut(has_data=False, assigned=0, changed=0,
+                               repointed=0, cleared=0)
+
+    changed = 0
+    for ch in series.chapters:
+        new_volume = volume_map.get(ch.number)
+        if ch.volume != new_volume:
+            ch.volume = new_volume
+            changed += 1
+
+    # un-point chapters from volume archives that don't match their (new)
+    # volume, then rescan: exact chapter files win, matching archives cover
+    # the rest, and anything no longer backed by a file is cleared honestly
+    before: dict[int, str] = {}
+    for ch in series.chapters:
+        if not ch.downloaded or not ch.file_path:
+            continue
+        before[ch.id] = ch.file_path
+        stem = Path(ch.file_path).stem
+        file_volume = parse_volume_number(stem)
+        if file_volume is not None and not has_chapter_marker(stem) \
+                and file_volume != ch.volume:
+            ch.downloaded = False
+            ch.file_path = ""
+    scan_series(series, list(series.chapters), _folders_of(series))
+    await session.commit()
+
+    repointed = sum(
+        1 for ch in series.chapters
+        if ch.downloaded and ch.file_path and before.get(ch.id, ch.file_path) != ch.file_path
+    )
+    cleared = sum(1 for ch in series.chapters if ch.id in before and not ch.downloaded)
+    return VolumeResyncOut(
+        has_data=True,
+        assigned=sum(1 for ch in series.chapters if ch.volume is not None),
+        changed=changed,
+        repointed=repointed,
+        cleared=cleared,
+    )
 
 
 async def _scan_now(session: AsyncSession, series: Series) -> int:

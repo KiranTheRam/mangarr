@@ -7,6 +7,7 @@ import type {
   Release,
   ScanResult,
   SeriesDetail as SeriesDetailType,
+  VolumeResyncResult,
 } from "../api/types";
 import {
   chapterLabel,
@@ -143,6 +144,7 @@ export default function SeriesDetail() {
   const [showSources, setShowSources] = useState(false);
   const [showCleanup, setShowCleanup] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [volumeResult, setVolumeResult] = useState<VolumeResyncResult | null>(null);
 
   const { data: series, isLoading } = useQuery({
     queryKey: ["series", seriesId],
@@ -173,6 +175,14 @@ export default function SeriesDetail() {
     },
   });
 
+
+  const resyncVolumes = useMutation({
+    mutationFn: () => api.post<VolumeResyncResult>(`/series/${seriesId}/volumes/resync`),
+    onSuccess: (res) => {
+      setVolumeResult(res);
+      invalidate();
+    },
+  });
 
   const deleteSeries = useMutation({
     mutationFn: () => api.del(`/series/${seriesId}`),
@@ -306,6 +316,14 @@ export default function SeriesDetail() {
         </button>
         <button
           className="btn"
+          title="Rebuild chapter→volume assignments from source metadata"
+          onClick={() => resyncVolumes.mutate()}
+          disabled={resyncVolumes.isPending}
+        >
+          {resyncVolumes.isPending ? "Resyncing…" : "📚 Resync Volumes"}
+        </button>
+        <button
+          className="btn"
           onClick={() => setSearch({ title: `${series.title} (all releases)` })}
         >
           🔍 Search Releases
@@ -324,6 +342,26 @@ export default function SeriesDetail() {
         </button>
       </Toolbar>
       <div className="content">
+        {volumeResult && (
+          <div className="scan-banner" onClick={() => setVolumeResult(null)}>
+            {volumeResult.has_data ? (
+              <>
+                <strong>Volumes resynced.</strong> {volumeResult.assigned} chapter
+                {volumeResult.assigned === 1 ? "" : "s"} assigned to volumes
+                {volumeResult.changed > 0 && `, ${volumeResult.changed} changed`}
+                {volumeResult.repointed > 0 &&
+                  `, ${volumeResult.repointed} re-pointed to a different file`}
+                {volumeResult.cleared > 0 &&
+                  `, ${volumeResult.cleared} no longer backed by a file (now missing)`}
+              </>
+            ) : (
+              <>
+                <strong>No volume data.</strong> None of this series' linked sources
+                provide volume→chapter assignments; existing values were left as-is.
+              </>
+            )}
+          </div>
+        )}
         {scanResult && (
           <div className="scan-banner" onClick={() => setScanResult(null)}>
             <strong>Scan complete.</strong> {scanResult.matched_chapters} chapter

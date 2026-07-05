@@ -26,6 +26,7 @@ from ..models import (
 from ..sources import registry
 from ..sources.base import DirectSource
 from ..util import normalize_title
+from ..volumes import build_volume_map
 
 log = logging.getLogger(__name__)
 
@@ -151,24 +152,33 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
     # volume data (e.g. WeebCentral, or MangaDex titles whose chapters are
     # external and thus never appear in the feed)
     if any(c.volume is None for c in existing.values()):
-        for src in registry.enabled_direct_sources(values):
-            link = links.get(src.name)
-            if link is None:
-                continue
-            try:
-                volume_map = await src.get_volume_map(link.external_id)
-            except Exception as exc:
-                log.warning("volume map failed on %s for %r: %s", src.name, series.title, exc)
-                continue
-            if not volume_map:
-                continue
-            for number, ch in existing.items():
-                if ch.volume is None and number in volume_map:
-                    ch.volume = volume_map[number]
-            break
+        volume_map = await fetch_volume_map(series, values)
+        for number, ch in existing.items():
+            if ch.volume is None and number in volume_map:
+                ch.volume = volume_map[number]
 
     await session.commit()
     return added
+
+
+async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float, int]:
+    """Chapter→volume assignments for a series: the union of every linked
+    source's volume data, sanitized (stray mislabeled chapters dropped) and
+    with gaps between known volumes filled in (see mangarr.volumes)."""
+    links = {sl.source_name: sl for sl in series.source_links}
+    maps: list[dict[float, int]] = []
+    for src in registry.enabled_direct_sources(values):
+        link = links.get(src.name)
+        if link is None:
+            continue
+        try:
+            volume_map = await src.get_volume_map(link.external_id)
+        except Exception as exc:
+            log.warning("volume map failed on %s for %r: %s", src.name, series.title, exc)
+            continue
+        if volume_map:
+            maps.append(volume_map)
+    return build_volume_map(maps, [c.number for c in series.chapters])
 
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
