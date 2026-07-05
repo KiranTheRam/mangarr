@@ -9,17 +9,19 @@ whose early-access window hasn't opened yet.
 import httpx
 
 from .. import USER_AGENT
-from ..util import RateLimiter, parse_chapter_number
+from ..util import RateLimiter, parse_chapter_number, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
 
 SITE_URL = "https://asurascans.com"
 API_URL = "https://api.asurascans.com"
 
 _limiter = RateLimiter(rate=2, per_seconds=1)
+_image_limiter = RateLimiter(rate=5, per_seconds=1)
 
 
 class AsuraSource(DirectSource):
     name = "asura"
+    image_limiter = _image_limiter
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(
@@ -32,9 +34,12 @@ class AsuraSource(DirectSource):
             follow_redirects=True,
         )
 
+    def image_headers(self) -> dict:
+        return {"Referer": f"{SITE_URL}/"}
+
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        await _limiter.acquire()
-        resp = await self._client.get(f"{API_URL}{path}", params=params)
+        resp = await rl_request(self._client, "GET", f"{API_URL}{path}",
+                                limiter=_limiter, params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -108,10 +113,7 @@ class AsuraSource(DirectSource):
                 urls.append(url)
         return urls
 
-    async def download_page(self, client: httpx.AsyncClient, url: str) -> bytes:
-        resp = await client.get(url, headers={"Referer": f"{SITE_URL}/"})
-        resp.raise_for_status()
-        return resp.content
+    # download_page inherited: rate-limited image fetch with back-off + Referer
 
 
 source = AsuraSource()

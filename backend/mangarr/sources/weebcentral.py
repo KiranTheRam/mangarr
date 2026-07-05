@@ -10,7 +10,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .. import USER_AGENT
-from ..util import RateLimiter, parse_chapter_number
+from ..util import RateLimiter, parse_chapter_number, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
 
 BASE_URL = "https://weebcentral.com"
@@ -18,10 +18,12 @@ SERIES_URL_RE = re.compile(r"/series/([A-Z0-9]+)")
 CHAPTER_URL_RE = re.compile(r"/chapters/([A-Z0-9]+)")
 
 _limiter = RateLimiter(rate=1, per_seconds=1)
+_image_limiter = RateLimiter(rate=5, per_seconds=1)
 
 
 class WeebCentralSource(DirectSource):
     name = "weebcentral"
+    image_limiter = _image_limiter
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(
@@ -30,9 +32,11 @@ class WeebCentralSource(DirectSource):
             follow_redirects=True,
         )
 
+    def image_headers(self) -> dict:
+        return {"Referer": f"{BASE_URL}/"}
+
     async def _get_html(self, url: str, params: dict | None = None) -> BeautifulSoup:
-        await _limiter.acquire()
-        resp = await self._client.get(url, params=params)
+        resp = await rl_request(self._client, "GET", url, limiter=_limiter, params=params)
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
 
@@ -117,11 +121,8 @@ class WeebCentralSource(DirectSource):
                 urls.append(src)
         return urls
 
-    async def download_page(self, client: httpx.AsyncClient, url: str) -> bytes:
-        # Image CDN requires the site referer
-        resp = await client.get(url, headers={"Referer": f"{BASE_URL}/"})
-        resp.raise_for_status()
-        return resp.content
+    # download_page is inherited: rate-limited (image_limiter) with back-off,
+    # sending the Referer from image_headers().
 
 
 source = WeebCentralSource()

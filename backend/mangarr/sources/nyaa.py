@@ -6,7 +6,7 @@ from urllib.parse import quote
 import httpx
 
 from .. import USER_AGENT
-from ..util import RateLimiter
+from ..util import RateLimiter, rl_request
 from .base import TorrentIndexer, TorrentRelease
 
 BASE_URL = "https://nyaa.si"
@@ -64,9 +64,8 @@ class NyaaIndexer(TorrentIndexer):
         )
 
     async def search(self, query: str) -> list[TorrentRelease]:
-        await _limiter.acquire()
-        resp = await self._client.get(
-            BASE_URL,
+        resp = await rl_request(
+            self._client, "GET", BASE_URL, limiter=_limiter,
             # c=3_1 → Literature - English-translated; f=0 → no filter
             params={"page": "rss", "q": query, "c": "3_1", "f": "0"},
         )

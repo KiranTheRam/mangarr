@@ -1,7 +1,7 @@
 import httpx
 
 from .. import USER_AGENT
-from ..util import RateLimiter
+from ..util import RateLimiter, rl_request
 from .base import MetadataProvider, SeriesMetadata
 
 API_URL = "https://graphql.anilist.co"
@@ -55,8 +55,10 @@ class AniListProvider(MetadataProvider):
         )
 
     async def _query(self, query: str, variables: dict) -> dict:
-        await _limiter.acquire()
-        resp = await self._client.post(API_URL, json={"query": query, "variables": variables})
+        resp = await rl_request(
+            self._client, "POST", API_URL, limiter=_limiter,
+            json={"query": query, "variables": variables},
+        )
         resp.raise_for_status()
         data = resp.json()
         if data.get("errors"):
