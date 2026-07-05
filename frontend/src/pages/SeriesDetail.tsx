@@ -130,6 +130,8 @@ export default function SeriesDetail() {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState<{ chapterId?: number; title: string } | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [revealed, setRevealed] = useState<Record<string, boolean>>({});
+  const toggleReveal = (k: string) => setRevealed((r) => ({ ...r, [k]: !r[k] }));
   const [showRename, setShowRename] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [showSources, setShowSources] = useState(false);
@@ -196,6 +198,14 @@ export default function SeriesDetail() {
     ? groupByVolume(series.chapters)
     : [{ volume: null, chapters: [...series.chapters].sort((a, b) => b.number - a.number) }];
 
+  // how many chapters share each file — a file used by >1 chapter is a
+  // whole-volume archive (those chapters have no individual file of their own)
+  const fileCounts: Record<string, number> = {};
+  for (const c of series.chapters) {
+    if (c.file_path) fileCounts[c.file_path] = (fileCounts[c.file_path] ?? 0) + 1;
+  }
+  const isVolumeArchive = (path: string) => (fileCounts[path] ?? 0) > 1;
+
   const chapterRows = (chapters: Chapter[]) => (
     <table className="data-table">
       <thead>
@@ -221,7 +231,22 @@ export default function SeriesDetail() {
                 {ch.monitored ? "🔖" : "◻"}
               </button>
             </td>
-            <td>{chapterLabel(ch.number, ch.volume)}</td>
+            <td>
+              {ch.downloaded && ch.file_path && !isVolumeArchive(ch.file_path) ? (
+                <button
+                  className="link-text"
+                  title="Show filename on disk"
+                  onClick={() => toggleReveal(`c${ch.id}`)}
+                >
+                  {chapterLabel(ch.number, ch.volume)}
+                </button>
+              ) : (
+                chapterLabel(ch.number, ch.volume)
+              )}
+              {revealed[`c${ch.id}`] && ch.file_path && (
+                <div className="filepath">{ch.file_path}</div>
+              )}
+            </td>
             <td style={{ color: ch.title ? "inherit" : "var(--text-faint)" }}>
               {ch.title || "—"}
             </td>
@@ -359,6 +384,12 @@ export default function SeriesDetail() {
             const isCollapsed = collapsed[key] ?? false;
             const downloaded = chapters.filter((c) => c.downloaded).length;
             const allMonitored = chapters.every((c) => c.monitored);
+            // the single archive file backing this volume, if it is one
+            const files = new Set(
+              chapters.filter((c) => c.downloaded && c.file_path).map((c) => c.file_path),
+            );
+            const archiveFile =
+              files.size === 1 && isVolumeArchive([...files][0]) ? [...files][0] : null;
             return (
               <div className="volume-group" key={key}>
                 <div
@@ -379,13 +410,29 @@ export default function SeriesDetail() {
                   >
                     {allMonitored ? "🔖" : "◻"}
                   </button>
-                  <h4>{volume === null ? "Chapters without volume" : `Volume ${volume}`}</h4>
+                  {archiveFile ? (
+                    <h4
+                      className="link-text"
+                      title="Show volume filename on disk"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleReveal(`v${key}`);
+                      }}
+                    >
+                      Volume {volume}
+                    </h4>
+                  ) : (
+                    <h4>{volume === null ? "Chapters without volume" : `Volume ${volume}`}</h4>
+                  )}
                   <span
                     className={`pill ${downloaded === chapters.length ? "green" : "gray"}`}
                   >
                     {downloaded} / {chapters.length}
                   </span>
                 </div>
+                {revealed[`v${key}`] && archiveFile && (
+                  <div className="filepath volume-filepath">{archiveFile}</div>
+                )}
                 {!isCollapsed && chapterRows(chapters)}
               </div>
             );

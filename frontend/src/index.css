@@ -831,3 +831,45 @@ table.data-table {
 .rename-table tr.row-off .new {
   text-decoration: line-through;
 }
+
+/* ---- clickable chapter/volume text revealing the filename on disk ---- */
+
+.link-text {
+  color: var(--text);
+  cursor: pointer;
+  border-bottom: 1px dotted var(--text-faint);
+  padding: 0;
+}
+.link-text:hover {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+h4.link-text {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+  flex: 1;
+  text-align: left;
+  border-bottom: none;
+}
+h4.link-text:hover {
+  color: var(--accent);
+}
+
+.filepath {
+  margin-top: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  word-break: break-all;
+  user-select: all;
+}
+.volume-filepath {
+  margin: 0 0 0 0;
+  border-radius: 0;
+  border-top: none;
+}
