@@ -16,7 +16,13 @@ import {
   statusPill,
   Toolbar,
 } from "../components/common";
-import { FilesModal, FoldersPanel, RenameModal, SourcesModal } from "../components/LibraryTools";
+import {
+  CleanupModal,
+  FilesModal,
+  FoldersPanel,
+  RenameModal,
+  SourcesModal,
+} from "../components/LibraryTools";
 
 function InteractiveSearch({
   seriesId,
@@ -135,6 +141,7 @@ export default function SeriesDetail() {
   const [showRename, setShowRename] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [showSources, setShowSources] = useState(false);
+  const [showCleanup, setShowCleanup] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
 
   const { data: series, isLoading } = useQuery({
@@ -293,6 +300,9 @@ export default function SeriesDetail() {
         </button>
         <button className="btn" onClick={() => setShowRename(true)}>
           ✏️ Rename
+        </button>
+        <button className="btn" onClick={() => setShowCleanup(true)}>
+          🧹 Clean up
         </button>
         <button
           className="btn"
@@ -465,6 +475,13 @@ export default function SeriesDetail() {
           links={series.source_links}
           onClose={() => setShowSources(false)}
           onChanged={invalidate}
+        />
+      )}
+      {showCleanup && (
+        <CleanupModal
+          seriesId={seriesId}
+          onClose={() => setShowCleanup(false)}
+          onDone={invalidate}
         />
       )}
     </>

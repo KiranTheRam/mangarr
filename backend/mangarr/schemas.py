@@ -224,6 +224,35 @@ class FileMapRangeOut(BaseModel):
     volume: int | None
 
 
+class CleanupFileOut(BaseModel):
+    path: str
+    name: str
+    size: int
+    referenced: bool
+    keep: bool
+
+
+class CleanupGroupOut(BaseModel):
+    label: str
+    files: list[CleanupFileOut]
+
+
+class CleanupPlanOut(BaseModel):
+    groups: list[CleanupGroupOut] = []
+    orphans: list[CleanupFileOut] = []
+
+
+class CleanupApplyIn(BaseModel):
+    delete: list[str]
+
+
+class CleanupResultOut(BaseModel):
+    deleted: int
+    repointed: int
+    skipped: int
+    freed_bytes: int
+
+
 class SourceCandidateOut(BaseModel):
     source_name: str
     external_id: str

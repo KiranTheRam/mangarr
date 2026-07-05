@@ -31,6 +31,13 @@ async def start() -> None:
     log.info("Scheduler started (monitor every %d min)", interval)
 
 
+def reschedule_monitor(minutes: int) -> None:
+    """Apply a new monitor interval without restarting the app."""
+    if scheduler.running and scheduler.get_job("monitor"):
+        scheduler.reschedule_job("monitor", trigger="interval", minutes=max(1, minutes))
+        log.info("Monitor rescheduled to every %d min", minutes)
+
+
 def shutdown() -> None:
     if scheduler.running:
         scheduler.shutdown(wait=False)

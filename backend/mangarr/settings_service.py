@@ -35,7 +35,7 @@ DEFAULTS: dict[str, str] = {
     "source_mangaplus_enabled": "false",
     "source_nyaa_enabled": "false",
     # Jobs
-    "monitor_interval_minutes": "15",
+    "monitor_interval_minutes": "60",
     # Library
     "library_scan_on_add": "true",  # adopt existing on-disk files on add/refresh
 }

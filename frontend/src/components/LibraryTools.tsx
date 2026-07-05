@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type {
   Chapter,
+  CleanupPlan,
   RenameItem,
   RenameOutcome,
   SeriesFile,
@@ -10,7 +11,7 @@ import type {
   SourceCandidate,
   SourceLink,
 } from "../api/types";
-import { Modal, Spinner, chapterLabel } from "./common";
+import { Modal, Spinner, chapterLabel, formatBytes } from "./common";
 import { FolderBrowser } from "./FolderBrowser";
 
 /** Lists the folders a series spans (primary + extras) with add/remove and a
@@ -213,6 +214,142 @@ export function SourcesModal({
         </button>
         {resyncMsg && <span style={{ fontSize: 13, color: "var(--success)" }}>{resyncMsg}</span>}
       </div>
+    </Modal>
+  );
+}
+
+/** Interactive duplicate/orphan cleanup: pick which copy to keep per duplicate
+ *  group, choose which stray files to delete. Sensible defaults pre-selected. */
+export function CleanupModal({
+  seriesId,
+  onClose,
+  onDone,
+}: {
+  seriesId: number;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { data, isLoading, isError, error } = useQuery({
+    queryKey: ["cleanup", seriesId],
+    queryFn: () => api.get<CleanupPlan>(`/series/${seriesId}/cleanup`),
+  });
+  // per duplicate group: the path to KEEP; per orphan: whether to DELETE
+  const [keepers, setKeepers] = useState<Record<number, string>>({});
+  const [orphanDel, setOrphanDel] = useState<Record<string, boolean>>({});
+  const [result, setResult] = useState<{ deleted: number; freed_bytes: number; repointed: number; skipped: number } | null>(null);
+
+  useEffect(() => {
+    if (!data) return;
+    const k: Record<number, string> = {};
+    data.groups.forEach((g, i) => {
+      k[i] = (g.files.find((f) => f.keep) ?? g.files[0]).path;
+    });
+    setKeepers(k);
+    setOrphanDel(Object.fromEntries(data.orphans.map((o) => [o.path, !o.keep])));
+  }, [data]);
+
+  const deletePaths = () => {
+    const del: string[] = [];
+    data?.groups.forEach((g, i) => {
+      g.files.forEach((f) => {
+        if (f.path !== keepers[i]) del.push(f.path);
+      });
+    });
+    data?.orphans.forEach((o) => {
+      if (orphanDel[o.path]) del.push(o.path);
+    });
+    return del;
+  };
+
+  const apply = useMutation({
+    mutationFn: () => api.post<typeof result>(`/series/${seriesId}/cleanup`, { delete: deletePaths() }),
+    onSuccess: (r) => {
+      setResult(r);
+      onDone();
+    },
+  });
+
+  const toDelete = deletePaths();
+
+  return (
+    <Modal title="Clean up files" onClose={onClose}>
+      {isLoading ? (
+        <Spinner />
+      ) : isError ? (
+        <div className="error-banner">{(error as Error).message}</div>
+      ) : result ? (
+        <>
+          <p className="section-hint">
+            Deleted {result.deleted} file{result.deleted === 1 ? "" : "s"} ({formatBytes(result.freed_bytes)} freed)
+            {result.repointed > 0 && `, re-pointed ${result.repointed} chapter(s)`}
+            {result.skipped > 0 && `, skipped ${result.skipped}`}.
+          </p>
+          <div style={{ textAlign: "right" }}>
+            <button className="btn primary" onClick={onClose}>Done</button>
+          </div>
+        </>
+      ) : !data || (data.groups.length === 0 && data.orphans.length === 0) ? (
+        <p style={{ color: "var(--text-dim)" }}>No duplicates or stray files — nothing to clean up.</p>
+      ) : (
+        <>
+          {data.groups.length > 0 && (
+            <>
+              <h4 className="files-heading">Duplicates — choose the copy to keep</h4>
+              {data.groups.map((g, i) => (
+                <div key={g.label} className="cleanup-group">
+                  <div className="cleanup-label">{g.label}</div>
+                  {g.files.map((f) => (
+                    <label key={f.path} className="cleanup-row">
+                      <input
+                        type="radio"
+                        name={`grp${i}`}
+                        checked={keepers[i] === f.path}
+                        onChange={() => setKeepers({ ...keepers, [i]: f.path })}
+                      />
+                      <span className={keepers[i] === f.path ? "keep" : "del"}>{f.name}</span>
+                      <span className="cleanup-meta">
+                        {formatBytes(f.size)}
+                        {f.referenced && <span className="tag">in use</span>}
+                        {keepers[i] !== f.path && <span className="tag danger-tag">delete</span>}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ))}
+            </>
+          )}
+          {data.orphans.length > 0 && (
+            <>
+              <h4 className="files-heading">Stray files</h4>
+              {data.orphans.map((o) => (
+                <label key={o.path} className="cleanup-row">
+                  <input
+                    type="checkbox"
+                    checked={!!orphanDel[o.path]}
+                    onChange={(e) => setOrphanDel({ ...orphanDel, [o.path]: e.target.checked })}
+                  />
+                  <span className={orphanDel[o.path] ? "del" : ""}>{o.name}</span>
+                  <span className="cleanup-meta">
+                    {formatBytes(o.size)}
+                    {orphanDel[o.path] && <span className="tag danger-tag">delete</span>}
+                  </span>
+                </label>
+              ))}
+            </>
+          )}
+          {apply.isError && <div className="error-banner">{(apply.error as Error).message}</div>}
+          <div style={{ marginTop: 16, display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button className="btn" onClick={onClose}>Cancel</button>
+            <button
+              className="btn danger"
+              disabled={apply.isPending || toDelete.length === 0}
+              onClick={() => apply.mutate()}
+            >
+              Delete {toDelete.length} file{toDelete.length === 1 ? "" : "s"}
+            </button>
+          </div>
+        </>
+      )}
     </Modal>
   );
 }
