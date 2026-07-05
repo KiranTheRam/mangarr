@@ -48,6 +48,7 @@ async def _load(session: AsyncSession, series_id: int) -> Series:
         select(Series)
         .options(
             selectinload(Series.chapters),
+            selectinload(Series.source_links),
             selectinload(Series.root_folder),
             selectinload(Series.extra_folders),
         )
