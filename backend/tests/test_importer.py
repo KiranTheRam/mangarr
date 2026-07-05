@@ -45,7 +45,7 @@ class TestImportTorrentPayload:
 
         assert len(imported) == 1
         dest, chapter, volume = imported[0]
-        assert dest.name == "Ashita no Joe - Vol. 01 Ch. 0002.cbz"
+        assert dest.name == "Ashita no Joe - Ch. 0002.cbz"
         assert dest.exists()
         assert chapter is chapters[1]
         assert volume is None  # chapter matched, so no volume-level claim
@@ -105,7 +105,7 @@ class TestImportTorrentPayload:
 
         by_dest = {dest.name: (ch, vol) for dest, ch, vol in imported}
         assert by_dest["Ashita no Joe - Vol. 01.cbz"] == (None, 1)
-        chapter, volume = by_dest["Ashita no Joe - Vol. 01 Ch. 0004.cbz"]
+        chapter, volume = by_dest["Ashita no Joe - Ch. 0004.cbz"]
         assert chapter is chapters[3]
         assert volume is None
 

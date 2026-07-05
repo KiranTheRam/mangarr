@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..models import Chapter, Series
+from ..util import has_chapter_marker, parse_volume_number
 from .naming import chapter_filename, series_folder, volume_filename
 
 log = logging.getLogger(__name__)
@@ -60,15 +61,19 @@ def plan_renames(
     for current, chs in by_file.items():
         current_path = Path(current)
         ext = current_path.suffix.lower()
-        volumes = {c.volume for c in chs}
-        if len(chs) > 1 and len(volumes) == 1 and None not in volumes:
-            # one archive covering a whole volume → volume naming
-            desired = volume_filename(series_folder(series.title), chs[0].volume, ext)
+        stem = current_path.stem
+        # a whole-volume archive is decided by its NAME (a volume number and no
+        # explicit chapter marker) — not by how many chapters happen to map to
+        # it, so a "v13" archive that covers a single chapter still gets a
+        # volume name rather than a chapter name
+        vol = parse_volume_number(stem)
+        if vol is not None and not has_chapter_marker(stem):
+            desired = volume_filename(series_folder(series.title), vol, ext)
         elif len(chs) == 1:
             # a single chapter file → chapter naming
             desired = _desired_name(series, chs[0], ext, template, template_no_volume)
         else:
-            # ambiguous grouping (multiple chapters, mixed volumes) — leave it
+            # ambiguous grouping (several chapters, not a named volume) — leave it
             continue
         # rename in place, in the file's own directory
         new_path = current_path.parent / desired

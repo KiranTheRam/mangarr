@@ -19,7 +19,7 @@ from ..library.scanner import (
     scan_series,
     series_dir,
 )
-from ..models import RootFolder, Series, SeriesFolder
+from ..models import RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     FileMapIn,
     FileMapRangeIn,
@@ -29,11 +29,16 @@ from ..schemas import (
     RenameApplyIn,
     RenameItemOut,
     RenameOutcomeOut,
+    ResyncOut,
     ScanResultOut,
     SeriesFileOut,
     SeriesFolderIn,
     SeriesFolderOut,
+    SourceCandidateOut,
+    SourceLinkIn,
+    SourceLinkOut,
 )
+from ..sources import registry
 
 router = APIRouter(tags=["library"])
 
@@ -275,6 +280,94 @@ async def remove_folder(
         raise HTTPException(404, "Folder not found")
     await session.delete(folder)
     await session.commit()
+
+
+# ---------------------------------------------------------- source links
+
+@router.get("/sources", response_model=list[str])
+async def list_sources():
+    """Names of the direct sources that can be linked/searched."""
+    return list(registry.DIRECT_SOURCES.keys())
+
+
+@router.get("/series/{series_id}/sources/search", response_model=list[SourceCandidateOut])
+async def source_search(
+    series_id: int, source_name: str, query: str,
+    session: AsyncSession = Depends(get_session),
+):
+    await _load(session, series_id)  # 404 if series missing
+    values = await registry.apply_settings(session)  # noqa: F841 (configures sources)
+    src = registry.DIRECT_SOURCES.get(source_name)
+    if src is None:
+        raise HTTPException(404, f"Unknown source {source_name!r}")
+    try:
+        candidates = await src.search_series(query)
+    except Exception as exc:
+        raise HTTPException(502, f"{source_name} search failed: {exc}") from exc
+    return [
+        SourceCandidateOut(source_name=source_name, external_id=c.external_id,
+                           title=c.title, url=c.url, alt_titles=c.alt_titles)
+        for c in candidates[:20]
+    ]
+
+
+@router.post("/series/{series_id}/sources", response_model=SourceLinkOut, status_code=201)
+async def set_source_link(
+    series_id: int, body: SourceLinkIn, session: AsyncSession = Depends(get_session)
+):
+    series = await _load(session, series_id)
+    link = next((l for l in series.source_links if l.source_name == body.source_name), None)
+    if link is None:
+        link = SeriesSourceLink(source_name=body.source_name)
+        series.source_links.append(link)
+    link.external_id = body.external_id
+    link.external_title = body.external_title
+    link.external_url = body.external_url
+    await session.commit()
+    await session.refresh(link)
+    return link
+
+
+@router.delete("/series/{series_id}/sources/{link_id}", status_code=204)
+async def delete_source_link(
+    series_id: int, link_id: int, session: AsyncSession = Depends(get_session)
+):
+    link = await session.get(SeriesSourceLink, link_id)
+    if link is None or link.series_id != series_id:
+        raise HTTPException(404, "Source link not found")
+    await session.delete(link)
+    await session.commit()
+
+
+@router.post("/series/{series_id}/resync", response_model=ResyncOut)
+async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_session)):
+    """Rebuild the chapter list from the current source links (use after fixing
+    a wrong link). Clears existing chapters + this series' download records,
+    re-syncs from the corrected links, then re-adopts files from disk."""
+    from sqlalchemy import delete as sa_delete
+
+    from ..jobs.tasks import scan_series_folder, update_chapters
+    from ..models import Download, HistoryEvent
+
+    series = await _load(session, series_id)
+    values = await registry.apply_settings(session)
+    await session.execute(sa_delete(Download).where(Download.series_id == series_id))
+    await session.execute(sa_delete(HistoryEvent).where(HistoryEvent.series_id == series_id))
+    for ch in list(series.chapters):
+        await session.delete(ch)
+    await session.commit()
+
+    series = await _load(session, series_id)
+    await update_chapters(session, series, values)
+    scan = await _scan_now(session, series)
+    return ResyncOut(chapters=len(series.chapters), matched_chapters=scan)
+
+
+async def _scan_now(session: AsyncSession, series: Series) -> int:
+    from ..library.scanner import scan_series
+    result = scan_series(series, list(series.chapters), _folders_of(series))
+    await session.commit()
+    return result.matched_chapters
 
 
 # ---------------------------------------------------------- filesystem browse

@@ -16,7 +16,7 @@ import {
   statusPill,
   Toolbar,
 } from "../components/common";
-import { FilesModal, FoldersPanel, RenameModal } from "../components/LibraryTools";
+import { FilesModal, FoldersPanel, RenameModal, SourcesModal } from "../components/LibraryTools";
 
 function InteractiveSearch({
   seriesId,
@@ -132,6 +132,7 @@ export default function SeriesDetail() {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [showRename, setShowRename] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
+  const [showSources, setShowSources] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
 
   const { data: series, isLoading } = useQuery({
@@ -332,17 +333,16 @@ export default function SeriesDetail() {
                 ))}
             </div>
             <div className="series-desc" dangerouslySetInnerHTML={{ __html: series.description }} />
-            {series.source_links.length > 0 && (
-              <div style={{ marginTop: 12 }}>
-                {series.source_links.map((sl) => (
-                  <a key={sl.id} href={sl.external_url} target="_blank" rel="noreferrer">
-                    <span className="tag" title={sl.external_title}>
-                      🔗 {sl.source_name}
-                    </span>
-                  </a>
-                ))}
-              </div>
-            )}
+            <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              {series.source_links.map((sl) => (
+                <span className="tag" key={sl.id} title={sl.external_title}>
+                  🔗 {sl.source_name}
+                </span>
+              ))}
+              <button className="btn sm" onClick={() => setShowSources(true)}>
+                {series.source_links.length ? "Edit sources" : "Add sources"}
+              </button>
+            </div>
             <FoldersPanel seriesId={seriesId} onChanged={invalidate} />
           </div>
         </div>
@@ -409,6 +409,14 @@ export default function SeriesDetail() {
           seriesId={seriesId}
           chapters={series.chapters}
           onClose={() => setShowFiles(false)}
+          onChanged={invalidate}
+        />
+      )}
+      {showSources && (
+        <SourcesModal
+          seriesId={seriesId}
+          links={series.source_links}
+          onClose={() => setShowSources(false)}
           onChanged={invalidate}
         />
       )}

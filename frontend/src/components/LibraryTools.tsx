@@ -7,6 +7,8 @@ import type {
   RenameOutcome,
   SeriesFile,
   SeriesFolder,
+  SourceCandidate,
+  SourceLink,
 } from "../api/types";
 import { Modal, Spinner, chapterLabel } from "./common";
 import { FolderBrowser } from "./FolderBrowser";
@@ -77,6 +79,141 @@ export function FoldersPanel({
         />
       )}
     </div>
+  );
+}
+
+/** Edit a series' source links: remove wrong links, search a source and pick
+ *  the right entry, and re-sync the chapter list from the corrected links. */
+export function SourcesModal({
+  seriesId,
+  links,
+  onClose,
+  onChanged,
+}: {
+  seriesId: number;
+  links: SourceLink[];
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ["series", seriesId] });
+    onChanged();
+  };
+  const [source, setSource] = useState("");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SourceCandidate[] | null>(null);
+  const [resyncMsg, setResyncMsg] = useState("");
+
+  const { data: sources } = useQuery({
+    queryKey: ["sources"],
+    queryFn: () => api.get<string[]>("/sources"),
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: number) => api.del(`/series/${seriesId}/sources/${id}`),
+    onSuccess: invalidate,
+  });
+  const search = useMutation({
+    mutationFn: () =>
+      api.get<SourceCandidate[]>(
+        `/series/${seriesId}/sources/search?source_name=${source}&query=${encodeURIComponent(query)}`,
+      ),
+    onSuccess: setResults,
+  });
+  const setLink = useMutation({
+    mutationFn: (c: SourceCandidate) =>
+      api.post(`/series/${seriesId}/sources`, {
+        source_name: c.source_name,
+        external_id: c.external_id,
+        external_title: c.title,
+        external_url: c.url,
+      }),
+    onSuccess: () => {
+      setResults(null);
+      setQuery("");
+      invalidate();
+    },
+  });
+  const resync = useMutation({
+    mutationFn: () => api.post<{ chapters: number; matched_chapters: number }>(
+      `/series/${seriesId}/resync`,
+    ),
+    onSuccess: (r) => {
+      setResyncMsg(`Rebuilt: ${r.chapters} chapters, ${r.matched_chapters} adopted from disk.`);
+      invalidate();
+    },
+  });
+
+  return (
+    <Modal title="Edit sources" onClose={onClose}>
+      <p className="section-hint">
+        Current links. Remove a wrong one, then search the correct source below and pick the
+        right entry. After fixing links, re-sync to rebuild the chapter list.
+      </p>
+      <table className="data-table">
+        <tbody>
+          {links.length === 0 && (
+            <tr><td className="muted">No source links.</td></tr>
+          )}
+          {links.map((l) => (
+            <tr key={l.id}>
+              <td><span className="pill blue">{l.source_name}</span></td>
+              <td>{l.external_title || l.external_id}</td>
+              <td style={{ width: 40 }}>
+                <button className="btn sm" title="Remove" onClick={() => remove.mutate(l.id)}>
+                  ✕
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h4 className="files-heading">Add / fix a source</h4>
+      <div className="form-row">
+        <select value={source} onChange={(e) => setSource(e.target.value)}>
+          <option value="">Source…</option>
+          {sources?.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <input
+          placeholder="Search title…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && source && query && search.mutate()}
+          style={{ flex: 1 }}
+        />
+        <button className="btn" disabled={!source || !query || search.isPending}
+          onClick={() => search.mutate()}>
+          Search
+        </button>
+      </div>
+      {search.isError && <div className="error-banner">{(search.error as Error).message}</div>}
+      {results && (
+        <table className="data-table">
+          <tbody>
+            {results.length === 0 && <tr><td className="muted">No matches.</td></tr>}
+            {results.map((c) => (
+              <tr key={c.external_id}>
+                <td>{c.title}</td>
+                <td style={{ width: 70 }}>
+                  <button className="btn sm primary" onClick={() => setLink.mutate(c)}>
+                    Use
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <div style={{ marginTop: 16, display: "flex", gap: 10, alignItems: "center" }}>
+        <button className="btn danger" disabled={resync.isPending} onClick={() => resync.mutate()}>
+          {resync.isPending ? "Re-syncing…" : "Re-sync chapters from links"}
+        </button>
+        {resyncMsg && <span style={{ fontSize: 13, color: "var(--success)" }}>{resyncMsg}</span>}
+      </div>
+    </Modal>
   );
 }
 

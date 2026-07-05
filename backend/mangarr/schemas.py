@@ -223,6 +223,26 @@ class FileMapRangeOut(BaseModel):
     volume: int | None
 
 
+class SourceCandidateOut(BaseModel):
+    source_name: str
+    external_id: str
+    title: str
+    url: str = ""
+    alt_titles: list[str] = []
+
+
+class SourceLinkIn(BaseModel):
+    source_name: str
+    external_id: str
+    external_title: str = ""
+    external_url: str = ""
+
+
+class ResyncOut(BaseModel):
+    chapters: int
+    matched_chapters: int
+
+
 class SeriesFolderOut(BaseModel):
     id: int | None  # None for the primary folder
     path: str
