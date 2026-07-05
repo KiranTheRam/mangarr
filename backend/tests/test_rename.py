@@ -35,6 +35,17 @@ class TestPlanRenames:
                      file_path=str(tmp_path / "Dandadan - Ch. 0148.cbz"))
         assert plan(series, [ch], tmp_path) == []
 
+    def test_volume_archive_with_single_chapter_stays_volume(self, tmp_path):
+        # regression: a v13 archive that only one chapter maps to must still be
+        # named as a volume, not renamed to that single chapter
+        make(tmp_path / "Chained Soldier v13.cbz")
+        series = Series(id=1, title="Chained Soldier", folder_name="Chained Soldier")
+        fp = str(tmp_path / "Chained Soldier v13.cbz")
+        ch = Chapter(id=1, series_id=1, number=106.5, volume=13, downloaded=True, file_path=fp)
+        items = plan(series, [ch])
+        assert len(items) == 1
+        assert items[0].new_name == "Chained Soldier - Vol. 13.cbz"
+
     def test_volume_file_shared_by_chapters_yields_one_item(self, tmp_path):
         make(tmp_path / "Akira Volume 01.cbz")
         series = Series(id=1, title="Akira", folder_name="Akira")
@@ -81,7 +92,7 @@ class TestApplyRenames:
 
         # volume archive renamed inside the volumes dir; chapter file inside chapters dir
         assert (vols / "Series - Vol. 01.cbz").exists()
-        assert (chaps / "Series - Vol. 02 Ch. 0010.cbz").exists()
+        assert (chaps / "Series - Ch. 0010.cbz").exists()
         assert not (chaps / "Series - Vol. 01.cbz").exists()  # not moved across dirs
 
     def test_collision_is_skipped_not_overwritten(self, tmp_path):

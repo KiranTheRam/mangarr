@@ -151,6 +151,14 @@ export interface SeriesFile {
   matched_chapter_id: number | null;
 }
 
+export interface SourceCandidate {
+  source_name: string;
+  external_id: string;
+  title: string;
+  url: string;
+  alt_titles: string[];
+}
+
 export interface SeriesFolder {
   id: number | null;
   path: string;

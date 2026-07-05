@@ -7,7 +7,9 @@ from pathlib import Path
 
 from ..util import sanitize_filename
 
-DEFAULT_TEMPLATE = "{series} - Vol. {volume:02d} Ch. {chapter:04.1f}"
+# Chapter files are named by chapter only — the volume is kept in ComicInfo.xml
+# (Komga/Kavita read it there), and volume in the filename just adds noise.
+DEFAULT_TEMPLATE = "{series} - Ch. {chapter:04.1f}"
 DEFAULT_TEMPLATE_NO_VOLUME = "{series} - Ch. {chapter:04.1f}"
 
 _CHAPTER_FMT = re.compile(r"\{chapter:0(\d+)\.1f\}")

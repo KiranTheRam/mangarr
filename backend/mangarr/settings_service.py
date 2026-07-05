@@ -7,7 +7,7 @@ from .models import Setting
 
 DEFAULTS: dict[str, str] = {
     # Media management
-    "naming_template": "{series} - Vol. {volume:02d} Ch. {chapter:04.1f}",
+    "naming_template": "{series} - Ch. {chapter:04.1f}",
     "naming_template_no_volume": "{series} - Ch. {chapter:04.1f}",
     # Source priority: comma-separated source names, first = preferred.
     # Fast scanlation sources (tcbscans) ahead of archive sources so new

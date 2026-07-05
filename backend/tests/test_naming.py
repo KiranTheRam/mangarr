@@ -15,22 +15,31 @@ def name(chapter: float, volume: int | None = None, title: str = "") -> str:
     )
 
 
+WITH_VOLUME = "{series} - Vol. {volume:02d} Ch. {chapter:04.1f}"
+
+
 class TestChapterFilename:
-    def test_whole_chapter_with_volume(self):
-        assert name(21, volume=3) == "Ashita no Joe - Vol. 03 Ch. 0021.cbz"
+    def test_whole_chapter_default_no_volume(self):
+        # default drops the volume from the filename even when volume is known
+        assert name(21, volume=3) == "Ashita no Joe - Ch. 0021.cbz"
 
     def test_fractional_chapter(self):
-        assert name(21.5, volume=3) == "Ashita no Joe - Vol. 03 Ch. 0021.5.cbz"
+        assert name(21.5, volume=3) == "Ashita no Joe - Ch. 0021.5.cbz"
 
-    def test_no_volume_template(self):
+    def test_no_volume(self):
         assert name(7) == "Ashita no Joe - Ch. 0007.cbz"
+
+    def test_explicit_volume_template_still_supported(self):
+        result = chapter_filename(WITH_VOLUME, DEFAULT_TEMPLATE_NO_VOLUME,
+                                  "Ashita no Joe", 21, 3)
+        assert result == "Ashita no Joe - Vol. 03 Ch. 0021.cbz"
 
     def test_series_name_sanitized(self):
         result = chapter_filename(
             DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME,
             "Ashita no Joe: Fighting for Tomorrow", 1, 1,
         )
-        assert result == "Ashita no Joe Fighting for Tomorrow - Vol. 01 Ch. 0001.cbz"
+        assert result == "Ashita no Joe Fighting for Tomorrow - Ch. 0001.cbz"
 
     def test_custom_template_with_title(self):
         result = chapter_filename(
@@ -51,7 +60,7 @@ class TestChapterPath:
             Path("/library"), DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME,
             "Ashita no Joe", "", 2, 1,
         )
-        assert p == Path("/library/Ashita no Joe/Ashita no Joe - Vol. 01 Ch. 0002.cbz")
+        assert p == Path("/library/Ashita no Joe/Ashita no Joe - Ch. 0002.cbz")
 
     def test_explicit_folder_name_wins(self):
         p = chapter_path(
