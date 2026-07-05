@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type {
@@ -95,9 +95,31 @@ export function RenameModal({
     queryFn: () => api.get<RenameItem[]>(`/series/${seriesId}/rename`),
   });
   const [outcomes, setOutcomes] = useState<RenameOutcome[] | null>(null);
+  // which rows are checked, keyed by row index; default all on when data loads
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  useEffect(() => {
+    if (data) setSelected(new Set(data.map((_, i) => i)));
+  }, [data]);
+
+  const toggle = (i: number) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
+    });
+  const allOn = !!data && selected.size === data.length;
+  const toggleAll = () =>
+    setSelected(allOn ? new Set() : new Set((data ?? []).map((_, i) => i)));
 
   const apply = useMutation({
-    mutationFn: () => api.post<RenameOutcome[]>(`/series/${seriesId}/rename`, {}),
+    mutationFn: () => {
+      const chapterIds = (data ?? [])
+        .filter((_, i) => selected.has(i))
+        .flatMap((item) => item.chapter_ids);
+      return api.post<RenameOutcome[]>(`/series/${seriesId}/rename`, {
+        chapter_ids: chapterIds,
+      });
+    },
     onSuccess: (res) => {
       setOutcomes(res);
       onDone();
@@ -140,12 +162,29 @@ export function RenameModal({
       ) : (
         <>
           <p className="section-hint">
-            {data.length} file{data.length === 1 ? "" : "s"} will be renamed (format preserved):
+            Select the files to rename (format preserved). {selected.size} of {data.length} selected.
           </p>
           <table className="data-table rename-table">
+            <thead>
+              <tr>
+                <th style={{ width: 28 }}>
+                  <input type="checkbox" checked={allOn} onChange={toggleAll} title="Select all" />
+                </th>
+                <th>Current</th>
+                <th></th>
+                <th>New</th>
+              </tr>
+            </thead>
             <tbody>
               {data.map((i, idx) => (
-                <tr key={idx}>
+                <tr key={idx} className={selected.has(idx) ? "" : "row-off"}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={selected.has(idx)}
+                      onChange={() => toggle(idx)}
+                    />
+                  </td>
                   <td className="old">{i.current_name}</td>
                   <td className="arrow">→</td>
                   <td className="new">{i.new_name}</td>
@@ -158,8 +197,12 @@ export function RenameModal({
           )}
           <div style={{ marginTop: 14, display: "flex", gap: 8, justifyContent: "flex-end" }}>
             <button className="btn" onClick={onClose}>Cancel</button>
-            <button className="btn primary" disabled={apply.isPending} onClick={() => apply.mutate()}>
-              Organize {data.length} file{data.length === 1 ? "" : "s"}
+            <button
+              className="btn primary"
+              disabled={apply.isPending || selected.size === 0}
+              onClick={() => apply.mutate()}
+            >
+              Organize {selected.size} file{selected.size === 1 ? "" : "s"}
             </button>
           </div>
         </>
