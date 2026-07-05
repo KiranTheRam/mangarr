@@ -13,7 +13,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .. import USER_AGENT
-from ..util import RateLimiter, normalize_title, parse_chapter_number
+from ..util import RateLimiter, normalize_title, parse_chapter_number, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
 
 BASE_URL = "https://tcbonepiecechapters.com"
@@ -21,11 +21,13 @@ MANGA_URL_RE = re.compile(r"/mangas/(\d+/[^\"']+)")
 CHAPTER_URL_RE = re.compile(r"/chapters/(\d+/[^\"']+)")
 
 _limiter = RateLimiter(rate=1, per_seconds=1)
+_image_limiter = RateLimiter(rate=5, per_seconds=1)
 _CATALOG_TTL = 600  # seconds
 
 
 class TCBScansSource(DirectSource):
     name = "tcbscans"
+    image_limiter = _image_limiter
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(
@@ -39,9 +41,11 @@ class TCBScansSource(DirectSource):
         self._catalog: list[SourceSeries] = []
         self._catalog_at = 0.0
 
+    def image_headers(self) -> dict:
+        return {"Referer": f"{BASE_URL}/"}
+
     async def _get_html(self, url: str) -> BeautifulSoup:
-        await _limiter.acquire()
-        resp = await self._client.get(url)
+        resp = await rl_request(self._client, "GET", url, limiter=_limiter)
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
 
@@ -123,10 +127,7 @@ class TCBScansSource(DirectSource):
                 urls.append(src)
         return urls
 
-    async def download_page(self, client: httpx.AsyncClient, url: str) -> bytes:
-        resp = await client.get(url, headers={"Referer": f"{BASE_URL}/"})
-        resp.raise_for_status()
-        return resp.content
+    # download_page inherited: rate-limited image fetch with back-off + Referer
 
 
 source = TCBScansSource()

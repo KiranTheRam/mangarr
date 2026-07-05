@@ -3,7 +3,7 @@ import time
 import httpx
 
 from .. import USER_AGENT
-from ..util import RateLimiter, parse_chapter_number
+from ..util import RateLimiter, parse_chapter_number, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
 
 API_URL = "https://api.mangadex.org"
@@ -81,11 +81,14 @@ class MangaDexSource(DirectSource):
 
     async def _get(self, path: str, params: dict | None = None, athome: bool = False) -> dict:
         await self._ensure_token()
-        await (_athome_limiter if athome else _api_limiter).acquire()
         headers = {}
         if self._access_token:
             headers["Authorization"] = f"Bearer {self._access_token}"
-        resp = await self._client.get(f"{API_URL}{path}", params=params, headers=headers)
+        resp = await rl_request(
+            self._client, "GET", f"{API_URL}{path}",
+            limiter=_athome_limiter if athome else _api_limiter,
+            params=params, headers=headers,
+        )
         resp.raise_for_status()
         return resp.json()
 

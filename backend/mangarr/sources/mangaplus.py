@@ -18,7 +18,7 @@ import time
 
 import httpx
 
-from ..util import RateLimiter, normalize_title, parse_chapter_number
+from ..util import RateLimiter, normalize_title, parse_chapter_number, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
 
 API_URL = "https://jumpg-webapi.tokyo-cdn.com/api"
@@ -27,6 +27,7 @@ KEY_FRAGMENT = "#mangarr_key="
 _ENGLISH = (0, None)
 
 _limiter = RateLimiter(rate=2, per_seconds=1)
+_image_limiter = RateLimiter(rate=5, per_seconds=1)
 _CATALOG_TTL = 3600
 
 
@@ -61,11 +62,11 @@ class MangaPlusSource(DirectSource):
         self._catalog_at = 0.0
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        await _limiter.acquire()
         query = {"format": "json", "os": "android", "os_ver": "32", "app_ver": "40"}
         query.update(params or {})
-        resp = await self._client.get(
-            f"{API_URL}{path}", params=query, headers={"Session-Token": self._session_token}
+        resp = await rl_request(
+            self._client, "GET", f"{API_URL}{path}", limiter=_limiter,
+            params=query, headers={"Session-Token": self._session_token},
         )
         resp.raise_for_status()
         body = resp.json()
@@ -176,8 +177,10 @@ class MangaPlusSource(DirectSource):
         return urls
 
     async def download_page(self, client: httpx.AsyncClient, url: str) -> bytes:
+        # the per-page XOR key is smuggled in the URL fragment; strip it, fetch
+        # (rate-limited + back-off), then decrypt
         real_url, _, key = url.partition(KEY_FRAGMENT)
-        resp = await client.get(real_url)
+        resp = await rl_request(client, "GET", real_url, limiter=_image_limiter)
         resp.raise_for_status()
         return _xor_decrypt(resp.content, key) if key else resp.content
 

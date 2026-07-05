@@ -1,6 +1,10 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+import httpx
+
+from ..util import RateLimiter, rl_request
+
 
 @dataclass
 class SourceSeries:
@@ -37,6 +41,9 @@ class DirectSource(ABC):
     """A site we can search, list chapters on, and pull page images from."""
 
     name: str
+    # per-source proactive limiter for page-image fetches (separate from the
+    # HTML/API limiter so images can be pulled a bit faster). Sources override.
+    image_limiter: RateLimiter | None = None
 
     @abstractmethod
     async def search_series(self, query: str) -> list[SourceSeries]: ...
@@ -48,9 +55,16 @@ class DirectSource(ABC):
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         """Returns ordered page image URLs."""
 
-    async def download_page(self, client, url: str) -> bytes:
-        """Fetch one page image. Override for sources needing special headers."""
-        resp = await client.get(url)
+    def image_headers(self) -> dict:
+        """Extra headers image CDNs need (e.g. a Referer). Override per source."""
+        return {}
+
+    async def download_page(self, client: httpx.AsyncClient, url: str) -> bytes:
+        """Fetch one page image — rate-limited, with reactive back-off on 429
+        and retry on transient errors (shared by all sources)."""
+        resp = await rl_request(
+            client, "GET", url, limiter=self.image_limiter, headers=self.image_headers()
+        )
         resp.raise_for_status()
         return resp.content
 
