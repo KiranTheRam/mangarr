@@ -235,7 +235,8 @@ export function RenameModal({
   // which rows are checked, keyed by row index; default all on when data loads
   const [selected, setSelected] = useState<Set<number>>(new Set());
   useEffect(() => {
-    if (data) setSelected(new Set(data.map((_, i) => i)));
+    // default-select only the items that can actually be renamed (not conflicts)
+    if (data) setSelected(new Set(data.map((_, i) => i).filter((i) => !data[i].conflict)));
   }, [data]);
 
   const toggle = (i: number) =>
@@ -244,9 +245,9 @@ export function RenameModal({
       next.has(i) ? next.delete(i) : next.add(i);
       return next;
     });
-  const allOn = !!data && selected.size === data.length;
-  const toggleAll = () =>
-    setSelected(allOn ? new Set() : new Set((data ?? []).map((_, i) => i)));
+  const selectable = (data ?? []).map((_, i) => i).filter((i) => !data![i].conflict);
+  const allOn = selectable.length > 0 && selectable.every((i) => selected.has(i));
+  const toggleAll = () => setSelected(allOn ? new Set() : new Set(selectable));
 
   const apply = useMutation({
     mutationFn: () => {
@@ -300,6 +301,14 @@ export function RenameModal({
         <>
           <p className="section-hint">
             Select the files to rename (format preserved). {selected.size} of {data.length} selected.
+            {data.some((i) => i.conflict) && (
+              <>
+                {" "}
+                <span style={{ color: "var(--danger)" }}>
+                  ⚠ some targets already exist (a duplicate file) and can't be renamed.
+                </span>
+              </>
+            )}
           </p>
           <table className="data-table rename-table">
             <thead>
@@ -319,12 +328,18 @@ export function RenameModal({
                     <input
                       type="checkbox"
                       checked={selected.has(idx)}
+                      disabled={i.conflict}
                       onChange={() => toggle(idx)}
                     />
                   </td>
                   <td className="old">{i.current_name}</td>
                   <td className="arrow">→</td>
-                  <td className="new">{i.new_name}</td>
+                  <td className="new">
+                    {i.new_name}
+                    {i.conflict && (
+                      <span className="tag" style={{ color: "var(--danger)" }}>already exists</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

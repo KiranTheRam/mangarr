@@ -20,6 +20,7 @@ class RenameItem:
     chapter_ids: list[int]  # chapters that point at this file (>1 for volumes)
     current_path: str
     new_path: str
+    conflict: bool = False  # a different file already occupies the target name
 
     @property
     def current_name(self) -> str:
@@ -82,6 +83,9 @@ def plan_renames(
                 chapter_ids=[c.id for c in chs],
                 current_path=str(current_path),
                 new_path=str(new_path),
+                # a different file already occupies the target — rename would
+                # be skipped (never overwrites); flag it so the preview is honest
+                conflict=new_path.exists() and new_path != current_path,
             ))
     items.sort(key=lambda i: i.current_name)
     return items

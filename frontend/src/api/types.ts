@@ -133,6 +133,7 @@ export interface RenameItem {
   current_name: string;
   new_path: string;
   new_name: string;
+  conflict: boolean;
 }
 
 export interface RenameOutcome {

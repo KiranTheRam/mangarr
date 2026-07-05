@@ -129,6 +129,7 @@ async def rename_preview(series_id: int, session: AsyncSession = Depends(get_ses
         RenameItemOut(
             chapter_ids=i.chapter_ids, current_path=i.current_path,
             current_name=i.current_name, new_path=i.new_path, new_name=i.new_name,
+            conflict=i.conflict,
         )
         for i in await _plan(session, series)
     ]
