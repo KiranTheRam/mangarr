@@ -152,6 +152,24 @@ export interface SeriesFile {
   matched_chapter_id: number | null;
 }
 
+export interface CleanupFile {
+  path: string;
+  name: string;
+  size: number;
+  referenced: boolean;
+  keep: boolean;
+}
+
+export interface CleanupGroup {
+  label: string;
+  files: CleanupFile[];
+}
+
+export interface CleanupPlan {
+  groups: CleanupGroup[];
+  orphans: CleanupFile[];
+}
+
 export interface SourceCandidate {
   source_name: string;
   external_id: string;

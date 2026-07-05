@@ -21,6 +21,11 @@ from ..library.scanner import (
 )
 from ..models import RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
+    CleanupApplyIn,
+    CleanupFileOut,
+    CleanupGroupOut,
+    CleanupPlanOut,
+    CleanupResultOut,
     FileMapIn,
     FileMapRangeIn,
     FileMapRangeOut,
@@ -194,6 +199,41 @@ async def map_file(
     chapter.downloaded = True
     chapter.file_path = body.file_path
     await session.commit()
+
+
+@router.get("/series/{series_id}/cleanup", response_model=CleanupPlanOut)
+async def cleanup_plan(series_id: int, session: AsyncSession = Depends(get_session)):
+    from ..library.cleanup import analyze
+
+    series = await _load(session, series_id)
+    values = await settings_service.get_all(session)
+    plan = analyze(series, list(series.chapters), _folders_of(series),
+                   values["naming_template"], values["naming_template_no_volume"])
+
+    def out(f):
+        return CleanupFileOut(path=f.path, name=Path(f.path).name, size=f.size,
+                              referenced=f.referenced, keep=f.keep)
+
+    return CleanupPlanOut(
+        groups=[CleanupGroupOut(label=g.label, files=[out(f) for f in g.files])
+                for g in plan.groups],
+        orphans=[out(f) for f in plan.orphans],
+    )
+
+
+@router.post("/series/{series_id}/cleanup", response_model=CleanupResultOut)
+async def cleanup_apply(
+    series_id: int, body: CleanupApplyIn, session: AsyncSession = Depends(get_session)
+):
+    from ..library.cleanup import apply_cleanup
+
+    series = await _load(session, series_id)
+    result = apply_cleanup(series, list(series.chapters), _folders_of(series), body.delete)
+    await session.commit()
+    return CleanupResultOut(
+        deleted=result.deleted, repointed=result.repointed,
+        skipped=result.skipped, freed_bytes=result.freed_bytes,
+    )
 
 
 @router.post("/series/{series_id}/files/map-range", response_model=FileMapRangeOut)
