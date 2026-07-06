@@ -189,6 +189,8 @@ class MangaDexSource(DirectSource):
                 vol_num = int(float(vol_key))
             except (TypeError, ValueError):
                 continue  # "none" bucket — unassigned chapters
+            if vol_num < 1:
+                continue  # junk "volume 0" entries (real specials sit in "none")
             chapters = vol.get("chapters")
             if not isinstance(chapters, dict):
                 continue

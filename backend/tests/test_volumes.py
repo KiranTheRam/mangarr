@@ -58,12 +58,23 @@ class TestInterpolateVolumeGaps:
         result = interpolate_volume_gaps(mapping, [176.0, 190.0, 203.0])
         assert result[190.0] == 20
 
-    def test_leading_and_trailing_stay_unassigned(self):
+    def test_leading_joins_first_volume_trailing_stays_unassigned(self):
         mapping = {5.0: 1, 10.0: 2}
         result = interpolate_volume_gaps(mapping, [0.5, 5.0, 10.0, 11.0, 200.0])
-        assert 0.5 not in result  # cover special before any anchor
+        assert result[0.5] == 1  # the series starts at volume 1
         assert 11.0 not in result  # ongoing tail not collected yet
         assert 200.0 not in result
+
+    def test_leading_run_spans_up_to_first_anchor(self):
+        # first anchor is vol 11 (well-populated) — chapters 1..50 before it
+        # spread across vols 1-10, not dumped into one volume
+        mapping = {float(c): 11 for c in range(51, 57)}
+        chapters = [float(c) for c in range(1, 57)]
+        result = interpolate_volume_gaps(mapping, chapters)
+        assert result[1.0] == 1
+        assert result[50.0] == 10
+        vols = [result[float(c)] for c in range(1, 51)]
+        assert vols == sorted(vols) and set(vols) == set(range(1, 11))
 
     def test_even_split_across_many_volumes(self):
         # 18 unknown chapters between vol 1 (ends ch 9) and a well-entered

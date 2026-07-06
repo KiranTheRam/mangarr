@@ -77,6 +77,10 @@ def interpolate_volume_gaps(
     chapters starts where its data says it starts). A's span is complete —
     aggregate data is entered per released chapter, so it's whole volumes
     that go missing. The gap is split evenly across the range.
+
+    Chapters before the first anchor get the same treatment against a
+    virtual volume-0 boundary — every series starts at volume 1, so the
+    leading run spans volumes 1..first-anchored-volume.
     """
     if not mapping:
         return dict(mapping)
@@ -86,11 +90,10 @@ def interpolate_volume_gaps(
         anchor_count[vol] = anchor_count.get(vol, 0) + 1
     gap: list[float] = []  # unmapped chapters since the previous anchor
     numbers = sorted(set(chapter_numbers) | set(mapping))
-    prev_vol: int | None = None
+    prev_vol = 0  # virtual boundary: the series starts at volume 1
     for number in numbers:
         if number not in mapping:
-            if prev_vol is not None:
-                gap.append(number)
+            gap.append(number)
             continue
         vol = mapping[number]
         if gap and vol > prev_vol:
@@ -98,9 +101,10 @@ def interpolate_volume_gaps(
             end = vol if anchor_count[vol] < 3 else vol - 1
             if end < start:
                 # adjacent fully-known volumes — stragglers (decimal
-                # extras between them) trail the earlier volume
+                # extras between them) trail the earlier volume; at the
+                # very front they lead the first volume instead
                 for n in gap:
-                    result[n] = prev_vol
+                    result[n] = max(prev_vol, 1)
             else:
                 span = end - start + 1
                 per = len(gap) / span
