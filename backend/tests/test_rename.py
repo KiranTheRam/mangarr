@@ -57,6 +57,27 @@ class TestPlanRenames:
         assert items[0].new_name == "Akira - Vol. 01.cbz"
         assert sorted(items[0].chapter_ids) == [1, 2, 3]
 
+    def test_preview_ordered_volumes_then_chapters_numerically(self, tmp_path):
+        # volumes 1, 2, 10 then chapters 3, 12, 100 — lexicographic order
+        # would give v1, v10, v2 and c100 before c12
+        series = Series(id=1, title="My Manga", folder_name="My Manga")
+        chapters = []
+        for i, vol in enumerate([10, 1, 2], start=1):
+            p = tmp_path / f"My Manga v{vol}.cbz"
+            make(p)
+            chapters.append(Chapter(id=i, series_id=1, number=float(i), volume=vol,
+                                    downloaded=True, file_path=str(p)))
+        for j, num in enumerate([100, 3, 12], start=10):
+            p = tmp_path / f"My Manga c{num}.cbz"
+            make(p)
+            chapters.append(Chapter(id=j, series_id=1, number=float(num), volume=None,
+                                    downloaded=True, file_path=str(p)))
+        items = plan(series, chapters, tmp_path)
+        assert [i.current_name for i in items] == [
+            "My Manga v1.cbz", "My Manga v2.cbz", "My Manga v10.cbz",
+            "My Manga c3.cbz", "My Manga c12.cbz", "My Manga c100.cbz",
+        ]
+
 
 class TestApplyRenames:
     def test_moves_and_updates_chapter(self, tmp_path):

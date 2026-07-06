@@ -58,7 +58,9 @@ def plan_renames(
         if ch.downloaded and ch.file_path:
             by_file.setdefault(ch.file_path, []).append(ch)
 
-    items: list[RenameItem] = []
+    # numeric reading order: volume archives first (by volume), then
+    # chapter files (by chapter) — not lexicographic, where v10 < v2
+    keyed: list[tuple[tuple, RenameItem]] = []
     for current, chs in by_file.items():
         current_path = Path(current)
         ext = current_path.suffix.lower()
@@ -70,25 +72,27 @@ def plan_renames(
         vol = parse_volume_number(stem)
         if vol is not None and not has_chapter_marker(stem):
             desired = volume_filename(series_folder(series.title), vol, ext)
+            key = (0, float(vol))
         elif len(chs) == 1:
             # a single chapter file → chapter naming
             desired = _desired_name(series, chs[0], ext, template, template_no_volume)
+            key = (1, chs[0].number)
         else:
             # ambiguous grouping (several chapters, not a named volume) — leave it
             continue
         # rename in place, in the file's own directory
         new_path = current_path.parent / desired
         if new_path.name != current_path.name:
-            items.append(RenameItem(
+            keyed.append((key, RenameItem(
                 chapter_ids=[c.id for c in chs],
                 current_path=str(current_path),
                 new_path=str(new_path),
                 # a different file already occupies the target — rename would
                 # be skipped (never overwrites); flag it so the preview is honest
                 conflict=new_path.exists() and new_path != current_path,
-            ))
-    items.sort(key=lambda i: i.current_name)
-    return items
+            )))
+    keyed.sort(key=lambda kv: kv[0])
+    return [item for _, item in keyed]
 
 
 @dataclass
