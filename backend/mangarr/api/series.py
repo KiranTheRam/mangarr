@@ -1,0 +1,161 @@
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import Integer, cast, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from ..db import get_session
+from ..jobs.tasks import refresh_series_full
+from ..metadata.anilist import provider as anilist
+from ..models import Chapter, Series, SeriesStatus
+from ..schemas import (
+    AddSeriesIn,
+    ChapterMonitorIn,
+    SeriesDetailOut,
+    SeriesOut,
+    SeriesUpdateIn,
+)
+from ..util import sanitize_filename
+
+router = APIRouter(prefix="/series", tags=["series"])
+
+
+def _series_out(series: Series, chapter_count: int, downloaded_count: int) -> SeriesOut:
+    out = SeriesOut.model_validate(series)
+    out.chapter_count = chapter_count
+    out.downloaded_count = downloaded_count
+    return out
+
+
+async def _normalize_folder_name(session: AsyncSession, series: Series, folder_name: str) -> str:
+    """Store the folder relative to the series' root folder when the given path
+    is under it (so it survives a root-folder move); otherwise keep as given."""
+    from pathlib import Path
+
+    from ..models import RootFolder
+
+    folder_name = folder_name.strip()
+    if series.root_folder_id is not None and folder_name.startswith("/"):
+        root = await session.get(RootFolder, series.root_folder_id)
+        if root is not None:
+            try:
+                return str(Path(folder_name).relative_to(root.path))
+            except ValueError:
+                pass  # outside the root — keep absolute
+    return folder_name.strip("/") if not folder_name.startswith("/") else folder_name
+
+
+@router.get("", response_model=list[SeriesOut])
+async def list_series(session: AsyncSession = Depends(get_session)):
+    counts: dict[int, tuple[int, int]] = {}
+    rows = await session.execute(
+        select(
+            Chapter.series_id,
+            func.count(Chapter.id),
+            func.sum(cast(Chapter.downloaded, Integer)),
+        ).group_by(Chapter.series_id)
+    )
+    for series_id, total, downloaded in rows.all():
+        counts[series_id] = (total, int(downloaded or 0))
+    result = await session.execute(select(Series).order_by(Series.sort_title, Series.title))
+    return [
+        _series_out(s, *counts.get(s.id, (0, 0)))
+        for s in result.scalars().all()
+    ]
+
+
+@router.post("", response_model=SeriesDetailOut, status_code=201)
+async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_session)):
+    existing = await session.execute(select(Series).where(Series.anilist_id == body.anilist_id))
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(409, "Series already in library")
+    meta = await anilist.get_series(str(body.anilist_id))
+    if meta is None:
+        raise HTTPException(404, "AniList series not found")
+    series = Series(
+        anilist_id=body.anilist_id,
+        title=meta.title,
+        sort_title=meta.title.lower(),
+        alt_titles="\n".join(meta.alt_titles),
+        description=meta.description,
+        status=SeriesStatus(meta.status),
+        year=meta.year,
+        cover_url=meta.cover_url,
+        banner_url=meta.banner_url,
+        genres=",".join(meta.genres),
+        total_chapters=meta.total_chapters,
+        total_volumes=meta.total_volumes,
+        monitored=body.monitored,
+        root_folder_id=body.root_folder_id,
+        folder_name=sanitize_filename(meta.title),
+    )
+    session.add(series)
+    await session.commit()
+    await session.refresh(series)
+    # link sources + fetch chapters in the background
+    asyncio.get_running_loop().create_task(refresh_series_full(series.id))
+    return await get_series(series.id, session)
+
+
+@router.get("/{series_id}", response_model=SeriesDetailOut)
+async def get_series(series_id: int, session: AsyncSession = Depends(get_session)):
+    result = await session.execute(
+        select(Series)
+        .options(selectinload(Series.chapters), selectinload(Series.source_links))
+        .where(Series.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if series is None:
+        raise HTTPException(404, "Series not found")
+    out = SeriesDetailOut.model_validate(series)
+    out.chapter_count = len(series.chapters)
+    out.downloaded_count = sum(1 for c in series.chapters if c.downloaded)
+    return out
+
+
+@router.put("/{series_id}", response_model=SeriesDetailOut)
+async def update_series(
+    series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
+):
+    series = await session.get(Series, series_id)
+    if series is None:
+        raise HTTPException(404, "Series not found")
+    if body.monitored is not None:
+        series.monitored = body.monitored
+    if body.root_folder_id is not None:
+        series.root_folder_id = body.root_folder_id
+    if body.folder_name is not None:
+        series.folder_name = await _normalize_folder_name(session, series, body.folder_name)
+    await session.commit()
+    return await get_series(series_id, session)
+
+
+@router.delete("/{series_id}", status_code=204)
+async def delete_series(series_id: int, session: AsyncSession = Depends(get_session)):
+    series = await session.get(Series, series_id)
+    if series is None:
+        raise HTTPException(404, "Series not found")
+    await session.delete(series)
+    await session.commit()
+
+
+@router.post("/{series_id}/refresh", status_code=202)
+async def refresh_series(series_id: int, session: AsyncSession = Depends(get_session)):
+    series = await session.get(Series, series_id)
+    if series is None:
+        raise HTTPException(404, "Series not found")
+    asyncio.get_running_loop().create_task(refresh_series_full(series_id))
+    return {"status": "refreshing"}
+
+
+@router.put("/{series_id}/chapters/monitor", status_code=204)
+async def monitor_chapters(
+    series_id: int, body: ChapterMonitorIn, session: AsyncSession = Depends(get_session)
+):
+    result = await session.execute(
+        select(Chapter).where(Chapter.series_id == series_id, Chapter.id.in_(body.chapter_ids))
+    )
+    for chapter in result.scalars().all():
+        chapter.monitored = body.monitored
+    await session.commit()
