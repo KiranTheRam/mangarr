@@ -177,6 +177,7 @@ async def series_files(series_id: int, session: AsyncSession = Depends(get_sessi
             path=str(mf.media.path), name=mf.media.path.name, is_dir=mf.media.is_dir,
             chapter_number=mf.media.chapter_number, volume_number=mf.media.volume_number,
             matched_chapter_id=mf.chapter.id if mf.chapter else None,
+            covered_count=len(mf.covered_chapters),
         ))
     for m in result.unmatched:
         out.append(SeriesFileOut(

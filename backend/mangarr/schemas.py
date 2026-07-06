@@ -206,6 +206,7 @@ class SeriesFileOut(BaseModel):
     chapter_number: float | None = None
     volume_number: int | None = None
     matched_chapter_id: int | None = None
+    covered_count: int = 0  # chapters this file covers (N for a volume archive)
 
 
 class FileMapIn(BaseModel):

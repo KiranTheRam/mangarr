@@ -563,8 +563,12 @@ export function FilesModal({
     },
   });
 
-  const unmatched = data?.filter((f) => f.matched_chapter_id == null) ?? [];
-  const matched = data?.filter((f) => f.matched_chapter_id != null) ?? [];
+  // a volume archive is matched by covering chapters, not by being a
+  // single chapter — only files covering nothing need manual mapping
+  const unmatched =
+    data?.filter((f) => f.matched_chapter_id == null && f.covered_count === 0) ?? [];
+  const matched =
+    data?.filter((f) => f.matched_chapter_id != null || f.covered_count > 0) ?? [];
 
   return (
     <Modal title="Files on disk" onClose={onClose}>
@@ -631,7 +635,9 @@ export function FilesModal({
                     {f.chapter_number != null
                       ? `Ch. ${f.chapter_number}`
                       : f.volume_number != null
-                      ? `Vol. ${f.volume_number}`
+                      ? `Vol. ${f.volume_number} — covers ${f.covered_count} chapter${
+                          f.covered_count === 1 ? "" : "s"
+                        }`
                       : ""}
                   </td>
                 </tr>

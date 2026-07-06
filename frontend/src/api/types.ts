@@ -152,6 +152,7 @@ export interface RenameOutcome {
 }
 
 export interface SeriesFile {
+  covered_count: number;
   path: string;
   name: string;
   is_dir: boolean;
