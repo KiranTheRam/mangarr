@@ -410,12 +410,16 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
 async def resync_volumes(series_id: int, session: AsyncSession = Depends(get_session)):
     """Rebuild every chapter's volume assignment from source volume data
     (sanitized + gap-filled, see mangarr.volumes), overwriting whatever is
-    there — the fix for stale or wrongly-stamped assignments. Chapters backed
-    by a volume archive that no longer matches their volume are re-scanned so
-    file coverage follows the corrected map. No-op when no linked source has
-    volume data (so manual mappings on metadata-gap series survive)."""
+    there — the fix for stale or wrongly-stamped assignments. Chapters the
+    source can't place are distributed across the volume archives found on
+    disk. Chapters backed by a volume archive that no longer matches their
+    volume are re-scanned so file coverage follows the corrected map. No-op
+    when no linked source has volume data (so manual mappings on
+    metadata-gap series survive)."""
     from ..jobs.tasks import fetch_volume_map
+    from ..models import SeriesStatus
     from ..util import has_chapter_marker, parse_volume_number
+    from ..volumes import distribute_over_disk_volumes
 
     series = await _load(session, series_id)
     values = await registry.apply_settings(session)
@@ -423,6 +427,28 @@ async def resync_volumes(series_id: int, session: AsyncSession = Depends(get_ses
     if not volume_map:
         return VolumeResyncOut(has_data=False, assigned=0, changed=0,
                                repointed=0, cleared=0)
+
+    # volume archives on disk anchor the chapters the source can't place
+    disk_volumes: set[int] = set()
+    for folder in _folders_of(series):
+        if not folder.exists():
+            continue
+        for mf in find_media_files(folder):
+            if mf.volume_number is not None and mf.chapter_number is None:
+                disk_volumes.add(mf.volume_number)
+    finished = series.status in (SeriesStatus.FINISHED, SeriesStatus.CANCELLED)
+    complete_set = bool(
+        finished and disk_volumes
+        and series.total_volumes and max(disk_volumes) >= series.total_volumes
+    )
+    fallback_rate = (
+        series.total_chapters / series.total_volumes
+        if series.total_chapters and series.total_volumes else None
+    )
+    volume_map = distribute_over_disk_volumes(
+        volume_map, [c.number for c in series.chapters], disk_volumes,
+        complete=complete_set, fallback_rate=fallback_rate,
+    )
 
     changed = 0
     for ch in series.chapters:

@@ -2,6 +2,7 @@
 
 from mangarr.volumes import (
     build_volume_map,
+    distribute_over_disk_volumes,
     interpolate_volume_gaps,
     merge_volume_maps,
     sanitize_volume_map,
@@ -89,6 +90,61 @@ class TestInterpolateVolumeGaps:
 
     def test_no_anchors_is_noop(self):
         assert interpolate_volume_gaps({}, [1.0, 2.0]) == {}
+
+
+class TestDistributeOverDiskVolumes:
+    def test_sparse_complete_set_splits_evenly(self):
+        # Naruto-style: 698 chapters, one stray source anchor, finished
+        # series with all 72 volume archives on disk
+        mapping = {700.0: 72}
+        chapters = [float(c) for c in range(1, 699)] + [700.0]
+        result = distribute_over_disk_volumes(
+            mapping, chapters, range(1, 73), complete=True
+        )
+        assert result[700.0] == 72  # anchor kept
+        assert result[1.0] == 1
+        assert result[698.0] == 72
+        vols = [result[float(c)] for c in range(1, 699)]
+        assert vols == sorted(vols)
+        assert set(vols) == set(range(1, 73))
+
+    def test_dense_map_only_extends_the_tail(self):
+        # source knows vols 1-3 exactly; disk has vols 1-6; finished set
+        mapping = {}
+        for c in range(1, 10):
+            mapping[float(c)] = (c - 1) // 3 + 1  # vols 1-3, 3 chs each
+        chapters = [float(c) for c in range(1, 19)]
+        result = distribute_over_disk_volumes(
+            mapping, chapters, range(1, 7), complete=True
+        )
+        assert result[9.0] == 3  # source data untouched
+        assert [result[float(c)] for c in range(10, 19)] == [4, 4, 4, 5, 5, 5, 6, 6, 6]
+
+    def test_ongoing_fills_at_observed_rate_and_stops(self):
+        # 3 known volumes of 3 chapters → rate 3; disk has vol 4 only, so
+        # chapters 10-12 go there and 13+ stay honestly unassigned
+        mapping = {float(c): (c - 1) // 3 + 1 for c in range(1, 10)}
+        chapters = [float(c) for c in range(1, 30)]
+        result = distribute_over_disk_volumes(
+            mapping, chapters, [1, 2, 3, 4], complete=False
+        )
+        assert [result[float(c)] for c in (10, 11, 12)] == [4, 4, 4]
+        assert 13.0 not in result
+
+    def test_sparse_ongoing_uses_fallback_rate(self):
+        mapping = {1.0: 1}
+        chapters = [float(c) for c in range(1, 25)]
+        result = distribute_over_disk_volumes(
+            mapping, chapters, [1, 2], complete=False, fallback_rate=10.0
+        )
+        assert result[10.0] == 1
+        assert result[11.0] == 2
+        assert result[20.0] == 2
+        assert 21.0 not in result  # past the owned volumes
+
+    def test_no_disk_volumes_is_noop(self):
+        mapping = {1.0: 1}
+        assert distribute_over_disk_volumes(mapping, [1.0, 2.0], [], True) == mapping
 
 
 class TestBuildVolumeMap:

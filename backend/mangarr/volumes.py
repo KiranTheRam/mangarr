@@ -124,3 +124,73 @@ def build_volume_map(
     if not merged:
         return {}
     return interpolate_volume_gaps(merged, chapter_numbers)
+
+
+def distribute_over_disk_volumes(
+    mapping: dict[float, int],
+    chapter_numbers: Iterable[float],
+    disk_volumes: Iterable[int],
+    complete: bool,
+    fallback_rate: float | None = None,
+) -> dict[float, int]:
+    """Assign the chapters the source couldn't place using the volume
+    archives that exist on disk (their numbering tells us which volumes
+    exist even when no metadata source knows their contents).
+
+    When the source knows at least a few volumes, its map is trusted as
+    scaffolding and only the chapters after its last anchor are spread
+    across the on-disk volumes that follow it. When it knows fewer (one
+    stray anchor tells us nothing about where volumes begin), everything
+    unassigned is distributed across the whole disk set, keeping the few
+    known anchors.
+
+    When `complete` (a finished series whose disk set reaches the final
+    volume) every distributed chapter belongs to some disk volume, so the
+    span splits evenly. Otherwise volumes fill at the rate observed in the
+    mapped region (else `fallback_rate`, else 9 — the prevailing tankobon
+    size), and chapters past the last disk volume stay unassigned rather
+    than guessed into volumes that may not exist.
+    """
+    result = dict(mapping)
+    sparse = len(set(mapping.values())) < 3
+    if sparse:
+        # positions count every chapter (anchored ones occupy their slot in
+        # a volume too), assignments only fill the unanchored
+        ordered = sorted(set(chapter_numbers) | set(mapping))
+        positioned = list(enumerate(ordered))
+        volumes = sorted(set(disk_volumes))
+    else:
+        last_ch = max(mapping)
+        positioned = list(enumerate(sorted(
+            n for n in set(chapter_numbers) if n not in mapping and n > last_ch
+        )))
+        volumes = sorted(v for v in set(disk_volumes) if v > max(mapping.values()))
+    if not positioned or not volumes:
+        return result
+    if complete:
+        per = len(positioned) / len(volumes)
+    else:
+        per = _typical_volume_size(mapping) or fallback_rate or 9.0
+    for position, number in positioned:
+        if number in mapping:
+            continue
+        index = int(position / per)
+        if index >= len(volumes):
+            if complete:
+                index = len(volumes) - 1
+            else:
+                continue  # past the owned volumes — honestly unknown
+        result[number] = volumes[index]
+    return result
+
+
+def _typical_volume_size(mapping: dict[float, int]) -> float | None:
+    """Median chapters-per-volume over the mapped region, when it has
+    enough volumes to be representative."""
+    counts: dict[int, int] = {}
+    for vol in mapping.values():
+        counts[vol] = counts.get(vol, 0) + 1
+    if len(counts) < 3:
+        return None
+    sizes = sorted(counts.values())
+    return float(sizes[len(sizes) // 2])
