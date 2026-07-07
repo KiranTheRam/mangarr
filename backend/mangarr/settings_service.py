@@ -12,7 +12,7 @@ DEFAULTS: dict[str, str] = {
     # Source priority: comma-separated source names, first = preferred.
     # Fast scanlation sources (tcbscans) ahead of archive sources so new
     # chapters are grabbed as soon as they appear.
-    "source_priority": "mangaplus,tcbscans,mangadex,weebcentral,asura,nyaa",
+    "source_priority": "mangaplus,tcbscans,mangadex,weebcentral,asura,wikipedia,nyaa",
     # MangaDex credentials (personal API client)
     "mangadex_client_id": "",
     "mangadex_client_secret": "",
@@ -42,6 +42,8 @@ DEFAULTS: dict[str, str] = {
     # confirms it reaches the API from their host
     "source_mangaplus_enabled": "false",
     "source_nyaa_enabled": "false",
+    # Wikipedia serves no chapters — it only contributes chapter→volume maps
+    "source_wikipedia_enabled": "true",
     # Jobs
     "monitor_interval_minutes": "60",
     # Library

@@ -93,3 +93,6 @@ class TestNormalizeTitle:
         assert normalize_title("KAGUYA-SAMA: Love is War") == normalize_title(
             "Kaguya sama   love is war"
         )
+
+    def test_multiplication_sign_matches_x(self):
+        assert normalize_title("Spy × Family") == normalize_title("Spy x Family")

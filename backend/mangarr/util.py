@@ -147,5 +147,8 @@ def parse_volume_number(text: str) -> int | None:
 def normalize_title(title: str) -> str:
     """Loose normalization for cross-source title matching."""
     t = title.lower()
+    # the multiplication sign must survive as a letter ("Spy × Family" has to
+    # equal "Spy x Family"), otherwise it strips to a bare space below
+    t = t.replace("×", "x")
     t = re.sub(r"[^a-z0-9]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()

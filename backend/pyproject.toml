@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "python-multipart>=0.0.9",
+    "mwparserfromhell>=0.7",
 ]
 
 [project.optional-dependencies]

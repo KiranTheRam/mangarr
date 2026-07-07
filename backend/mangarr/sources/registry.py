@@ -11,6 +11,7 @@ from .mangaplus import source as mangaplus_source
 from .nyaa import indexer as nyaa_indexer
 from .tcbscans import source as tcbscans_source
 from .weebcentral import source as weebcentral_source
+from .wikipedia import source as wikipedia_source
 
 DIRECT_SOURCES: dict[str, DirectSource] = {
     mangaplus_source.name: mangaplus_source,
@@ -18,6 +19,7 @@ DIRECT_SOURCES: dict[str, DirectSource] = {
     weebcentral_source.name: weebcentral_source,
     tcbscans_source.name: tcbscans_source,
     asura_source.name: asura_source,
+    wikipedia_source.name: wikipedia_source,
 }
 TORRENT_INDEXERS: dict[str, TorrentIndexer] = {
     nyaa_indexer.name: nyaa_indexer,
