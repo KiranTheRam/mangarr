@@ -25,6 +25,14 @@ DEFAULTS: dict[str, str] = {
     "qbittorrent_password": "",
     "qbittorrent_category": "mangarr",
     "qbittorrent_enabled": "false",
+    # Where torrents are downloaded to (a path both mangarr and qBittorrent
+    # see, ideally on the same filesystem as the library so imports can
+    # hardlink). Empty = qBittorrent's default save path.
+    "downloads_dir": "",
+    # Torrent import: "hardlink" keeps seeding without using double the
+    # space (needs downloads + library on one filesystem); "copy" is the
+    # safe cross-filesystem fallback.
+    "import_mode": "hardlink",
     # Sources on/off
     "source_mangadex_enabled": "true",
     "source_weebcentral_enabled": "true",

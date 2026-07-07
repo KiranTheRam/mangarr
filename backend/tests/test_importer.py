@@ -120,3 +120,54 @@ class TestImportTorrentPayload:
         second = run_import(payload, series, chapters, lib)
 
         assert second[0][0].stat().st_mtime_ns == mtime
+
+
+class TestImportModes:
+    def test_hardlink_mode_links_instead_of_copying(self, tmp_path, series, chapters):
+        src = tmp_path / "payload" / "Ashita no Joe - c002 (v01).cbz"
+        src.parent.mkdir()
+        make_cbz(src)
+
+        imported = import_torrent_payload(
+            src, series, chapters, tmp_path / "lib",
+            DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME, import_mode="hardlink",
+        )
+
+        dest = imported[0][0]
+        assert dest.exists()
+        assert dest.stat().st_ino == src.stat().st_ino  # same inode = hardlink
+        assert src.exists()  # source keeps seeding
+
+    def test_copy_mode_copies(self, tmp_path, series, chapters):
+        src = tmp_path / "payload" / "Ashita no Joe - c002 (v01).cbz"
+        src.parent.mkdir()
+        make_cbz(src)
+
+        imported = import_torrent_payload(
+            src, series, chapters, tmp_path / "lib",
+            DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME, import_mode="copy",
+        )
+
+        dest = imported[0][0]
+        assert dest.exists()
+        assert dest.stat().st_ino != src.stat().st_ino
+
+    def test_hardlink_falls_back_to_copy_on_error(self, tmp_path, series, chapters, monkeypatch):
+        import mangarr.library.importer as importer_mod
+
+        def fail_link(src, dst):
+            raise OSError(18, "Invalid cross-device link")
+
+        monkeypatch.setattr(importer_mod.os, "link", fail_link)
+        src = tmp_path / "payload" / "Ashita no Joe - c002 (v01).cbz"
+        src.parent.mkdir()
+        make_cbz(src)
+
+        imported = import_torrent_payload(
+            src, series, chapters, tmp_path / "lib",
+            DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME, import_mode="hardlink",
+        )
+
+        dest = imported[0][0]
+        assert dest.exists()
+        assert dest.stat().st_ino != src.stat().st_ino

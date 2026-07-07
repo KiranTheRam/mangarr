@@ -27,9 +27,9 @@ export default function AddSeries() {
   const effectiveRoot = rootFolderId ?? rootFolders?.[0]?.id ?? null;
 
   const addMutation = useMutation({
-    mutationFn: (anilistId: number) =>
+    mutationFn: (r: MetadataResult) =>
       api.post<{ id: number }>("/series", {
-        anilist_id: anilistId,
+        [r.provider === "anilist" ? "anilist_id" : "mangaupdates_id"]: Number(r.provider_id),
         root_folder_id: effectiveRoot,
         monitored,
       }),
@@ -53,7 +53,7 @@ export default function AddSeries() {
           <input
             autoFocus
             style={{ flex: 1 }}
-            placeholder="Search AniList for a manga title…"
+            placeholder="Search MangaUpdates for a manga title…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -126,7 +126,7 @@ export default function AddSeries() {
                   <button
                     className="btn primary"
                     disabled={!effectiveRoot || addMutation.isPending}
-                    onClick={() => addMutation.mutate(Number(r.provider_id))}
+                    onClick={() => addMutation.mutate(r)}
                   >
                     + Add
                   </button>

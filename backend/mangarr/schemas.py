@@ -37,6 +37,7 @@ class SeriesOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     anilist_id: int | None
+    mangaupdates_id: int | None
     title: str
     description: str
     status: str
@@ -60,7 +61,9 @@ class SeriesDetailOut(SeriesOut):
 
 
 class AddSeriesIn(BaseModel):
-    anilist_id: int
+    # exactly one of the provider ids (MangaUpdates is the primary provider)
+    mangaupdates_id: int | None = None
+    anilist_id: int | None = None
     root_folder_id: int
     monitored: bool = True
     search_now: bool = False

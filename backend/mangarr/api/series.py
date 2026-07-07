@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 from ..db import get_session
 from ..jobs.tasks import refresh_series_full
 from ..metadata.anilist import provider as anilist
+from ..metadata.mangaupdates import provider as mangaupdates
 from ..models import Chapter, Series, SeriesStatus
 from ..schemas import (
     AddSeriesIn,
@@ -67,14 +68,23 @@ async def list_series(session: AsyncSession = Depends(get_session)):
 
 @router.post("", response_model=SeriesDetailOut, status_code=201)
 async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_session)):
-    existing = await session.execute(select(Series).where(Series.anilist_id == body.anilist_id))
+    if (body.mangaupdates_id is None) == (body.anilist_id is None):
+        raise HTTPException(422, "Provide exactly one of mangaupdates_id or anilist_id")
+    if body.mangaupdates_id is not None:
+        id_filter = Series.mangaupdates_id == body.mangaupdates_id
+        provider, provider_id = mangaupdates, body.mangaupdates_id
+    else:
+        id_filter = Series.anilist_id == body.anilist_id
+        provider, provider_id = anilist, body.anilist_id
+    existing = await session.execute(select(Series).where(id_filter))
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(409, "Series already in library")
-    meta = await anilist.get_series(str(body.anilist_id))
+    meta = await provider.get_series(str(provider_id))
     if meta is None:
-        raise HTTPException(404, "AniList series not found")
+        raise HTTPException(404, f"{provider.name} series not found")
     series = Series(
         anilist_id=body.anilist_id,
+        mangaupdates_id=body.mangaupdates_id,
         title=meta.title,
         sort_title=meta.title.lower(),
         alt_titles="\n".join(meta.alt_titles),

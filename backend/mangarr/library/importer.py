@@ -5,6 +5,7 @@ directories of loose images (zipped into one CBZ). File→chapter matching is
 shared with the library scanner via library.matcher."""
 
 import logging
+import os
 import shutil
 import zipfile
 from pathlib import Path
@@ -26,6 +27,22 @@ def _dest_ext(media: MediaFile) -> str:
     )
 
 
+def place_file(src: Path, dest: Path, mode: str) -> None:
+    """Put a payload file into the library. Hardlink mode keeps the torrent
+    seeding without doubling disk use; it needs src and dest on one
+    filesystem, so cross-device (and any other) failure falls back to copy."""
+    if mode == "hardlink":
+        try:
+            os.link(src, dest)
+            log.info("Hardlinked %s -> %s", src.name, dest)
+            return
+        except OSError as exc:
+            log.warning("hardlink %s -> %s failed (%s); copying instead",
+                        src.name, dest, exc)
+    shutil.copy2(src, dest)
+    log.info("Imported %s -> %s", src.name, dest)
+
+
 def import_torrent_payload(
     content_path: Path,
     series: Series,
@@ -33,6 +50,7 @@ def import_torrent_payload(
     library_root: Path,
     template: str,
     template_no_volume: str,
+    import_mode: str = "hardlink",
 ) -> list[tuple[Path, Chapter | None, int | None]]:
     """Copies/renames payload files into the library. Returns (dest, matched
     chapter, volume) triples; chapter is None for volume archives that span
@@ -58,8 +76,7 @@ def import_torrent_payload(
             if media.is_dir:
                 _pack_images(media.path, dest)
             else:
-                shutil.copy2(media.path, dest)
-                log.info("Imported %s -> %s", media.path.name, dest)
+                place_file(media.path, dest, import_mode)
         imported.append((dest, chapter, volume if chapter is None else None))
 
     for mf in result.matched:

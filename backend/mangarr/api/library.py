@@ -77,14 +77,6 @@ def _folders_of(series: Series) -> list[Path]:
     return resolve_folders(_root_of(series), series, [f.path for f in series.extra_folders])
 
 
-def _within(p: Path, root: Path) -> bool:
-    try:
-        p.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
 # ------------------------------------------------------------------ scan
 
 @router.post("/series/{series_id}/scan", response_model=ScanResultOut)
@@ -502,28 +494,34 @@ async def _scan_now(session: AsyncSession, series: Series) -> int:
 async def browse(
     path: str = Query(default=""), session: AsyncSession = Depends(get_session)
 ):
+    """Folder browser (Sonarr-style, whole container filesystem). The empty
+    path lists the configured root folders as shortcuts plus the filesystem
+    root, so any mount — e.g. a downloads share — can be reached."""
     roots = [
         Path(r.path)
         for r in (await session.execute(select(RootFolder))).scalars().all()
     ]
     if not path:
-        return FilesystemListOut(
-            path="", parent=None,
-            entries=[FilesystemEntryOut(name=str(r), path=str(r)) for r in roots],
-        )
+        entries = [FilesystemEntryOut(name=str(r), path=str(r)) for r in roots]
+        if not any(str(r) == "/" for r in roots):
+            entries.append(FilesystemEntryOut(name="/", path="/"))
+        return FilesystemListOut(path="", parent=None, entries=entries)
     target = Path(path)
-    if not any(_within(target, r) for r in roots):
-        raise HTTPException(400, "Path is outside the configured root folders")
+    if not target.is_absolute():
+        raise HTTPException(400, "Path must be absolute")
     if not target.is_dir():
         raise HTTPException(404, "Not a directory")
+    try:
+        children = [c for c in target.iterdir() if c.is_dir()]
+    except OSError as exc:
+        raise HTTPException(400, f"Cannot list {target}: {exc}") from exc
     entries = sorted(
-        (FilesystemEntryOut(name=c.name, path=str(c))
-         for c in target.iterdir() if c.is_dir()),
+        (FilesystemEntryOut(name=c.name, path=str(c)) for c in children),
         key=lambda e: e.name.lower(),
     )
-    is_root = any(target == r for r in roots)
+    at_top = target == target.parent
     return FilesystemListOut(
         path=str(target),
-        parent=None if is_root else str(target.parent),
+        parent=None if at_top else str(target.parent),
         entries=entries,
     )

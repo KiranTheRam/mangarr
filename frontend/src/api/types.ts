@@ -24,6 +24,7 @@ export interface Chapter {
 export interface Series {
   id: number;
   anilist_id: number | null;
+  mangaupdates_id: number | null;
   title: string;
   description: string;
   status: string;

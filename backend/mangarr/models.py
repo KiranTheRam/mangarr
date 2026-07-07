@@ -4,6 +4,7 @@ import enum
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -48,6 +49,7 @@ class Series(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     anilist_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)
+    mangaupdates_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)
     title: Mapped[str] = mapped_column(String)
     sort_title: Mapped[str] = mapped_column(String, default="")
     alt_titles: Mapped[str] = mapped_column(Text, default="")  # newline-separated

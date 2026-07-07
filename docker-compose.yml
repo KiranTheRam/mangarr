@@ -8,10 +8,12 @@ services:
       - "6996:6996"
     volumes:
       - ./data/mangarr-config:/config
-      - ./data/manga:/manga
-      # qBittorrent's download dir must be visible at the same path mangarr
-      # sees when importing completed torrents
-      - ./data/downloads:/downloads
+      # One shared media mount for both containers: the manga library and the
+      # torrent downloads live on the same filesystem, so completed torrents
+      # can be hardlinked into the library (no copy, keeps seeding). In the
+      # mangarr UI: Root Folders -> /media/manga, Downloads folder ->
+      # /media/torrents.
+      - ./data/media:/media
     restart: unless-stopped
 
   qbittorrent:
@@ -28,5 +30,6 @@ services:
       - "6881:6881/udp"
     volumes:
       - ./data/qbittorrent-config:/config
-      - ./data/downloads:/downloads
+      # must match mangarr's mount so both see downloads at the same path
+      - ./data/media:/media
     restart: unless-stopped

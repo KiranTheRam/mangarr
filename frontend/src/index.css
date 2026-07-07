@@ -913,3 +913,48 @@ h4.link-text:hover {
   color: var(--danger);
   border-color: var(--danger);
 }
+
+/* ---------- source priority list ---------- */
+
+.priority-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 560px;
+}
+.priority-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.priority-row.disabled .priority-name,
+.priority-row.disabled .priority-rank {
+  color: var(--text-faint);
+}
+.priority-rank {
+  width: 18px;
+  text-align: right;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.priority-arrows {
+  display: flex;
+  gap: 2px;
+}
+.priority-name {
+  font-size: 13.5px;
+  min-width: 110px;
+}
+.priority-hint {
+  flex: 1;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.priority-row .toggle {
+  margin-left: auto;
+}

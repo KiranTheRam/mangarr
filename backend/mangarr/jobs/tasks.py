@@ -14,6 +14,7 @@ from ..download.qbittorrent import QbtClient
 from ..library.importer import import_torrent_payload
 from ..library.naming import chapter_path
 from ..metadata.anilist import provider as anilist
+from ..metadata.mangaupdates import provider as mangaupdates
 from ..models import (
     Chapter,
     Download,
@@ -36,22 +37,69 @@ BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 # ---------------------------------------------------------------- metadata
 
 async def refresh_series_metadata(session: AsyncSession, series: Series) -> None:
-    if not series.anilist_id:
-        return
-    meta = await anilist.get_series(str(series.anilist_id))
-    if meta is None:
-        return
-    series.title = meta.title
-    series.alt_titles = "\n".join(meta.alt_titles)
-    series.description = meta.description
-    series.status = SeriesStatus(meta.status)
-    series.year = meta.year
-    series.cover_url = meta.cover_url
-    series.banner_url = meta.banner_url
-    series.genres = ",".join(meta.genres)
-    series.total_chapters = meta.total_chapters
-    series.total_volumes = meta.total_volumes
+    """Refresh from the series' metadata provider. MangaUpdates is primary:
+    identity fields (title/description/cover/…) come from the provider the
+    series was added with, so an AniList-era library keeps its titles, while
+    progress fields (status, chapter/volume totals) prefer MangaUpdates —
+    AniList only fills totals once a series finishes."""
+    if series.mangaupdates_id is None:
+        try:
+            await link_mangaupdates(series)
+        except Exception as exc:
+            log.warning("mangaupdates link failed for %r: %s", series.title, exc)
+
+    identity_from_mu = series.anilist_id is None and series.mangaupdates_id is not None
+    mu_meta = None
+    if series.mangaupdates_id is not None:
+        mu_meta = await mangaupdates.get_series(str(series.mangaupdates_id))
+    meta = mu_meta if identity_from_mu else (
+        await anilist.get_series(str(series.anilist_id)) if series.anilist_id else None
+    )
+    if meta is not None:
+        series.title = meta.title
+        series.alt_titles = "\n".join(meta.alt_titles)
+        series.description = meta.description
+        series.status = SeriesStatus(meta.status)
+        series.year = meta.year
+        series.cover_url = meta.cover_url
+        series.banner_url = meta.banner_url or series.banner_url
+        series.genres = ",".join(meta.genres)
+        series.total_chapters = meta.total_chapters
+        series.total_volumes = meta.total_volumes
+    if mu_meta is not None:
+        # progress data: MangaUpdates wins whenever it knows more
+        if mu_meta.status != "unknown":
+            series.status = SeriesStatus(mu_meta.status)
+        if mu_meta.total_chapters:
+            series.total_chapters = max(mu_meta.total_chapters, series.total_chapters or 0)
+        if mu_meta.total_volumes:
+            series.total_volumes = max(mu_meta.total_volumes, series.total_volumes or 0)
+        # MangaUpdates' associated titles help cross-source matching
+        if meta is None or meta is not mu_meta:
+            known = set(series.alt_titles.split("\n"))
+            extra = [t for t in mu_meta.alt_titles if t and t not in known]
+            series.alt_titles = "\n".join(filter(None, [series.alt_titles, *extra]))
     await session.commit()
+
+
+async def link_mangaupdates(series: Series) -> bool:
+    """Find the series on MangaUpdates by title (same matching philosophy as
+    link_sources) and stamp its id. Returns True when linked."""
+    titles = _titles_of(series)
+    wanted = {nt for t in titles if (nt := normalize_title(t))}
+    for query in titles[:4]:
+        if not normalize_title(query):
+            continue
+        for cand in await mangaupdates.search(query, limit=10):
+            cand_titles = {
+                n for t in [cand.title, *cand.alt_titles] if (n := normalize_title(t))
+            }
+            if wanted & cand_titles:
+                series.mangaupdates_id = int(cand.provider_id)
+                log.info("Linked %r to mangaupdates:%s (%r)",
+                         series.title, cand.provider_id, cand.title)
+                return True
+    return False
 
 
 # ---------------------------------------------------------- source linking
@@ -148,6 +196,29 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
                 if not ch.title and sc.title:
                     ch.title = sc.title
 
+    # MangaUpdates tracks releases even when no direct source serves them
+    # yet (or ever) — add those chapters so Wanted reflects reality
+    if series.mangaupdates_id is not None:
+        try:
+            release_data = await mangaupdates.get_release_data(series.mangaupdates_id)
+        except Exception as exc:
+            log.warning("mangaupdates releases failed for %r: %s", series.title, exc)
+            release_data = None
+        if release_data:
+            for number, released_at in sorted(release_data.chapters.items()):
+                ch = existing.get(number)
+                if ch is None:
+                    ch = Chapter(
+                        number=number,
+                        monitored=series.monitored,
+                        released_at=released_at,
+                    )
+                    series.chapters.append(ch)
+                    existing[number] = ch
+                    added += 1
+                elif ch.released_at is None and released_at is not None:
+                    ch.released_at = released_at
+
     # backfill volume numbers for chapters that came from sources without
     # volume data (e.g. WeebCentral, or MangaDex titles whose chapters are
     # external and thus never appear in the feed)
@@ -178,6 +249,15 @@ async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float
             continue
         if volume_map:
             maps.append(volume_map)
+    # MangaUpdates release volume tags are sparse but real anchors — lowest
+    # priority so structured source data (MangaDex aggregate) wins on overlap
+    if series.mangaupdates_id is not None:
+        try:
+            release_data = await mangaupdates.get_release_data(series.mangaupdates_id)
+            if release_data.volume_anchors:
+                maps.append(release_data.volume_anchors)
+        except Exception as exc:
+            log.warning("mangaupdates volume anchors failed for %r: %s", series.title, exc)
     return build_volume_map(maps, [c.number for c in series.chapters])
 
 
@@ -318,8 +398,10 @@ async def enqueue_torrent(
     try:
         category = values["qbittorrent_category"]
         # put grabs in a category subfolder so they stay organized and separate
-        # from other qBittorrent downloads, regardless of its auto-management
-        base = await client.default_save_path()
+        # from other qBittorrent downloads, regardless of its auto-management.
+        # A configured downloads folder wins over qBittorrent's default save
+        # path — pick one on the library's filesystem so imports can hardlink.
+        base = values.get("downloads_dir", "").strip() or await client.default_save_path()
         save_path = f"{base.rstrip('/')}/{category}" if base else None
         await client.ensure_category(category, save_path)
         await client.add_magnet(magnet, category=category, save_path=save_path)
@@ -477,6 +559,7 @@ async def _import_torrent(
         imported = import_torrent_payload(
             content_path, series, list(series.chapters), Path(series.root_folder.path),
             values["naming_template"], values["naming_template_no_volume"],
+            import_mode=values.get("import_mode", "hardlink"),
         )
     except Exception as exc:
         log.exception("torrent import %d failed", dl.id)

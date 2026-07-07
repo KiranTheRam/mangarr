@@ -10,9 +10,13 @@ design; it is the automation half of your manga stack.
 
 ## Features
 
-- **Library management** — add series via AniList metadata search (covers,
-  descriptions, status), poster-grid library, per-series chapter tables with
-  monitor toggles, wanted/missing view.
+- **Library management** — add series via MangaUpdates metadata search
+  (covers, descriptions, status; AniList remains available as a fallback
+  provider), poster-grid library, per-series chapter tables with monitor
+  toggles, wanted/missing view. MangaUpdates tracks scanlation releases per
+  chapter, so chapter/volume counts stay current for ongoing series where
+  AniList lags, and its release feed fills in chapters no direct source
+  serves yet.
 - **Sources** — grabbed in a configurable priority order (fast scanlation
   sources first, archive sources as fallback):
   - **MangaPlus** (Shueisha, official) — the true same-day source for Shonen
@@ -31,7 +35,10 @@ design; it is the automation half of your manga stack.
     manga). Skips locked early-access (premium) chapters automatically.
   - **Nyaa.si** (torrents) — Literature/English-translated category, sent to
     qBittorrent; completed downloads are imported automatically (volume packs,
-    chapter archives, or loose-image folders).
+    chapter archives, or loose-image folders). Imports **hardlink** by
+    default — the torrent keeps seeding and the library copy costs no extra
+    space (downloads and library must share a filesystem; falls back to copy
+    automatically, and a copy mode setting is available).
 - **Automation** — a monitor loop checks linked sources for new chapters of
   monitored series and grabs them by configurable source priority. Manual
   per-chapter interactive search included.
@@ -48,16 +55,21 @@ docker compose up -d
 
 Open <http://localhost:6996>. The compose file also starts a
 [linuxserver/qbittorrent](https://docs.linuxserver.io/images/docker-qbittorrent/)
-container on <http://localhost:8080> sharing a `./data/downloads` volume with
-mangarr — the shared mount is what makes torrent import work (mangarr must see
-completed downloads at the same path qBittorrent reports).
+container on <http://localhost:8080> sharing one `./data/media` volume with
+mangarr — a single shared mount holding both the library and the torrent
+downloads, so mangarr sees completed downloads at the same path qBittorrent
+reports **and** can hardlink them into the library (no duplicate space, the
+torrent keeps seeding). On a NAS/unRAID, map your media share the same way
+into both containers (e.g. `/mnt/user/media:/media`).
 
 First-run checklist, in the mangarr UI:
 
-1. **Settings → Root Folders**: add `/manga` (mapped to `./data/manga`).
+1. **Settings → Root Folders**: add `/media/manga`.
 2. **Settings → Download Client**: qBittorrent URL `http://qbittorrent:8080`
    plus the WebUI credentials (check the qbittorrent container logs for the
-   temporary password on first boot), then *Test Connection*.
+   temporary password on first boot), then *Test Connection*. Set
+   **Downloads folder** to `/media/torrents` (browseable) so torrents land on
+   the same filesystem as the library and imports can hardlink.
 3. **Settings → MangaDex Account** (recommended): create a free account at
    mangadex.org, then *Settings → API Clients* there to make a personal
    client; paste client id/secret and your username/password.
@@ -136,8 +148,8 @@ The API key is generated on first start at `<data dir>/api_key` and shown by
 ## How grabbing works
 
 1. When you add a series, mangarr links it to each enabled source by title
-   (including AniList alt titles). Links are per-source, so a site changing
-   its layout breaks one source, never the app.
+   (including MangaUpdates associated titles). Links are per-source, so a
+   site changing its layout breaks one source, never the app.
 2. The monitor job (default: every 15 min) diffs source chapter lists against
    the library. New monitored, missing chapters are grabbed from the highest
    priority source that has them (`Settings → Sources → priority`).
@@ -153,5 +165,4 @@ legitimate.
 
 - Western comics support (ComicVine metadata + GetComics source) — the
   source/metadata plugin interfaces are already in place.
-- MangaUpdates metadata for better chapter-count data.
 - Notifications (Discord/webhooks) on grab/import.

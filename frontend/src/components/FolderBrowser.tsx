@@ -4,7 +4,8 @@ import { api } from "../api/client";
 import type { FilesystemList } from "../api/types";
 import { Modal, Spinner } from "./common";
 
-/** Sonarr-style folder picker constrained to the configured root folders. */
+/** Sonarr-style folder picker: starts at the configured root folders (plus
+ * the filesystem root) and can browse anywhere in the container. */
 export function FolderBrowser({
   onPick,
   onClose,

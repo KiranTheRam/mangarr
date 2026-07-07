@@ -5,6 +5,7 @@ from sqlalchemy.orm import selectinload
 
 from ..db import get_session
 from ..metadata.anilist import provider as anilist
+from ..metadata.mangaupdates import provider as mangaupdates
 from ..models import Chapter, Series
 from ..schemas import MetadataResult, ReleaseOut
 from ..sources import registry
@@ -13,11 +14,15 @@ router = APIRouter(prefix="/search", tags=["search"])
 
 
 @router.get("/metadata", response_model=list[MetadataResult])
-async def search_metadata(q: str, session: AsyncSession = Depends(get_session)):
-    results = await anilist.search(q)
+async def search_metadata(
+    q: str, provider: str = "mangaupdates", session: AsyncSession = Depends(get_session)
+):
+    meta_provider = anilist if provider == "anilist" else mangaupdates
+    id_column = Series.anilist_id if provider == "anilist" else Series.mangaupdates_id
+    results = await meta_provider.search(q)
     in_library = {
         row[0]
-        for row in (await session.execute(select(Series.anilist_id))).all()
+        for row in (await session.execute(select(id_column))).all()
         if row[0] is not None
     }
     return [

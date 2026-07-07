@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { RootFolder, Settings as SettingsType } from "../api/types";
+import { FolderBrowser } from "../components/FolderBrowser";
 import { Spinner, Toggle, Toolbar } from "../components/common";
 
 function RootFolders() {
@@ -54,6 +55,79 @@ function RootFolders() {
   );
 }
 
+const SOURCE_LABELS: Record<string, string> = {
+  mangaplus: "MangaPlus",
+  tcbscans: "TCB Scans",
+  mangadex: "MangaDex",
+  weebcentral: "WeebCentral",
+  asura: "Asura Scans",
+  nyaa: "Nyaa (torrents)",
+};
+
+const SOURCE_HINTS: Record<string, string> = {
+  mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
+  nyaa: "Sent to the download client below and imported when complete.",
+};
+
+/** Ordered, toggleable source list — stored as the comma-separated
+ * source_priority setting, but never hand-edited as text. */
+function SourcePriority({
+  form,
+  setForm,
+}: {
+  form: SettingsType;
+  setForm: (f: SettingsType) => void;
+}) {
+  const known = Object.keys(form)
+    .filter((k) => k.startsWith("source_") && k.endsWith("_enabled"))
+    .map((k) => k.slice("source_".length, -"_enabled".length));
+  const order = (form.source_priority ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s, i, arr) => s && known.includes(s) && arr.indexOf(s) === i);
+  for (const s of known) if (!order.includes(s)) order.push(s);
+
+  const move = (index: number, delta: number) => {
+    const next = [...order];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    setForm({ ...form, source_priority: next.join(",") });
+  };
+
+  return (
+    <div className="priority-list">
+      {order.map((name, i) => {
+        const enabled = form[`source_${name}_enabled`] === "true";
+        return (
+          <div className={`priority-row${enabled ? "" : " disabled"}`} key={name}>
+            <span className="priority-rank">{i + 1}</span>
+            <span className="priority-arrows">
+              <button className="btn icon-btn" disabled={i === 0} onClick={() => move(i, -1)} title="Higher priority">
+                ↑
+              </button>
+              <button
+                className="btn icon-btn"
+                disabled={i === order.length - 1}
+                onClick={() => move(i, 1)}
+                title="Lower priority"
+              >
+                ↓
+              </button>
+            </span>
+            <span className="priority-name">{SOURCE_LABELS[name] ?? name}</span>
+            {SOURCE_HINTS[name] && <span className="priority-hint">{SOURCE_HINTS[name]}</span>}
+            <Toggle
+              on={enabled}
+              onChange={(v) => setForm({ ...form, [`source_${name}_enabled`]: v ? "true" : "false" })}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function Settings() {
   const queryClient = useQueryClient();
   const { data: saved, isLoading } = useQuery({
@@ -85,6 +159,8 @@ export default function Settings() {
     onSuccess: (d) => setQbtTest(`✔ Connected — qBittorrent ${d.version}`),
     onError: (e) => setQbtTest(`✖ ${(e as Error).message}`),
   });
+
+  const [browsing, setBrowsing] = useState(false);
 
   if (isLoading || !saved) {
     return (
@@ -137,40 +213,10 @@ export default function Settings() {
         <div className="settings-section">
           <h3>Sources</h3>
           <p className="section-hint">
-            Priority order decides which source is grabbed from first when a chapter is available in
-            several places.
+            Chapters are grabbed from the highest-priority enabled source that has them — use the
+            arrows to reorder.
           </p>
-          <div className="form-row">
-            <label>Source priority</label>
-            {text("source_priority")}
-          </div>
-          <div className="form-row">
-            <label>MangaDex enabled</label>
-            <Toggle on={form.source_mangadex_enabled === "true"} onChange={setBool("source_mangadex_enabled")} />
-          </div>
-          <div className="form-row">
-            <label>WeebCentral enabled</label>
-            <Toggle on={form.source_weebcentral_enabled === "true"} onChange={setBool("source_weebcentral_enabled")} />
-          </div>
-          <div className="form-row">
-            <label>TCB Scans enabled</label>
-            <Toggle on={form.source_tcbscans_enabled === "true"} onChange={setBool("source_tcbscans_enabled")} />
-          </div>
-          <div className="form-row">
-            <label>Asura Scans enabled</label>
-            <Toggle on={form.source_asura_enabled === "true"} onChange={setBool("source_asura_enabled")} />
-          </div>
-          <div className="form-row">
-            <label>MangaPlus enabled</label>
-            <Toggle on={form.source_mangaplus_enabled === "true"} onChange={setBool("source_mangaplus_enabled")} />
-            <span style={{ color: "var(--text-faint)", fontSize: 13 }}>
-              Official same-day Shonen Jump. Needs a residential IP — bans datacenters.
-            </span>
-          </div>
-          <div className="form-row">
-            <label>Nyaa (torrents) enabled</label>
-            <Toggle on={form.source_nyaa_enabled === "true"} onChange={setBool("source_nyaa_enabled")} />
-          </div>
+          <SourcePriority form={form} setForm={setForm} />
         </div>
 
         <div className="settings-section">
@@ -228,6 +274,25 @@ export default function Settings() {
             {text("qbittorrent_category")}
           </div>
           <div className="form-row">
+            <label>Downloads folder</label>
+            {text("downloads_dir")}
+            <button className="btn" onClick={() => setBrowsing(true)}>
+              Browse…
+            </button>
+          </div>
+          <p className="section-hint">
+            Where torrents are saved (both mangarr and qBittorrent must see this path). Leave empty
+            to use qBittorrent's default. Put it on the same filesystem/share as the library so
+            imports can hardlink instead of copy.
+          </p>
+          <div className="form-row">
+            <label>Import mode</label>
+            <select value={form.import_mode ?? "hardlink"} onChange={set("import_mode")}>
+              <option value="hardlink">Hardlink (keeps seeding, no extra space)</option>
+              <option value="copy">Copy (safe across filesystems)</option>
+            </select>
+          </div>
+          <div className="form-row">
             <label></label>
             <button className="btn" onClick={() => testQbt.mutate()} disabled={testQbt.isPending}>
               Test Connection
@@ -240,6 +305,15 @@ export default function Settings() {
           </div>
         </div>
       </div>
+      {browsing && (
+        <FolderBrowser
+          onPick={(path) => {
+            setForm({ ...form, downloads_dir: path });
+            setBrowsing(false);
+          }}
+          onClose={() => setBrowsing(false)}
+        />
+      )}
     </>
   );
 }
