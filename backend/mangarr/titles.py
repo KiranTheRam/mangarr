@@ -178,12 +178,17 @@ def english_title(primary: str, alt_titles: list[str], query: str | None = None)
 
 def title_queries(primary: str, alt_titles: list[str], limit: int = 6) -> list[str]:
     """Search queries ordered by value: canonical title, likely English title,
-    then other alternates. Raw CJK titles are kept; callers that need loose
-    matching can still skip empty normalized forms."""
+    then other alternates with English-looking ones first — sources index
+    licensed series under their official English name, which isn't always the
+    heuristic's top pick (e.g. "You and I Are Polar Opposites" losing to a
+    fan-translated "The Polar Opposite You And Me"), so every plausible
+    English variant must rank ahead of other-language titles. Raw CJK titles
+    are kept; callers that need loose matching can still skip empty
+    normalized forms."""
 
     english = english_title(primary, alt_titles)
     ordered = [primary]
     if english:
         ordered.append(english)
-    ordered.extend(alt_titles)
+    ordered.extend(sorted(alt_titles, key=_english_score, reverse=True))
     return unique_titles(ordered)[:limit]

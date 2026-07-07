@@ -31,7 +31,7 @@ from ..sources import registry
 from ..sources.base import DirectSource
 from ..titles import split_alt_titles, title_queries
 from ..util import normalize_title
-from ..volumes import build_volume_map, distribute_over_disk_volumes
+from ..volumes import distribute_over_disk_volumes, select_volume_map
 
 log = logging.getLogger(__name__)
 
@@ -241,9 +241,10 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
 
 
 async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float, int]:
-    """Chapter→volume assignments for a series: the union of every linked
-    source's volume data, sanitized (stray mislabeled chapters dropped) and
-    with gaps between known volumes filled in (see mangarr.volumes)."""
+    """Chapter→volume assignments for a series: every linked source's volume
+    data is collected, and the single most complete source's assignments are
+    applied verbatim (sanitized of stray mislabeled chapters, never merged or
+    gap-guessed — see mangarr.volumes)."""
     links = {sl.source_name: sl for sl in series.source_links}
     maps: list[dict[float, int]] = []
     for src in registry.enabled_direct_sources(values):
@@ -257,8 +258,8 @@ async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float
             continue
         if volume_map:
             maps.append(volume_map)
-    # MangaUpdates release volume tags are sparse but real anchors — lowest
-    # priority so structured source data (MangaDex aggregate) wins on overlap
+    # MangaUpdates per-release volume tags compete too — usually sparse, but
+    # listed last so structured source data (MangaDex aggregate) wins ties
     if series.mangaupdates_id is not None:
         try:
             release_data = await mangaupdates.get_release_data(series.mangaupdates_id)
@@ -266,7 +267,7 @@ async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float
                 maps.append(release_data.volume_anchors)
         except Exception as exc:
             log.warning("mangaupdates volume anchors failed for %r: %s", series.title, exc)
-    return build_volume_map(maps, [c.number for c in series.chapters])
+    return select_volume_map(maps)
 
 
 def _series_folders(series: Series) -> list[Path]:
@@ -304,8 +305,10 @@ def refine_volume_map_with_disk(
     series: Series, volume_map: dict[float, int]
 ) -> dict[float, int]:
     """Extend a source-derived volume map using the volume archives on disk:
-    chapters the sources couldn't place are distributed across the volumes the
-    files prove exist (see mangarr.volumes.distribute_over_disk_volumes)."""
+    chapters the source couldn't place are distributed across the volumes the
+    user's own files prove exist (see distribute_over_disk_volumes). Metadata
+    alone is never extrapolated — with no matching files on disk, chapters
+    the source can't place stay unassigned."""
     if not volume_map:
         return volume_map
     disk_volumes = disk_volume_numbers(series)
@@ -734,6 +737,11 @@ async def grab_missing_chapters(
             remaining.pop(sc.number, None)
             await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url)
             queued += 1
+    if queued == 0:
+        # e.g. only MangaDex is linked but its chapters are all external —
+        # say so instead of failing silently
+        log.info("monitor: no linked source serves any of the %d missing chapter(s) of %r",
+                 len(remaining), series.title)
     return queued
 
 

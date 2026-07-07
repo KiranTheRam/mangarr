@@ -403,13 +403,14 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
 
 @router.post("/series/{series_id}/volumes/resync", response_model=VolumeResyncOut)
 async def resync_volumes(series_id: int, session: AsyncSession = Depends(get_session)):
-    """Rebuild every chapter's volume assignment from source volume data
-    (sanitized + gap-filled, see mangarr.volumes), overwriting whatever is
-    there — the fix for stale or wrongly-stamped assignments. Chapters the
-    source can't place are distributed across the volume archives found on
-    disk. Chapters backed by a volume archive that no longer matches their
-    volume are re-scanned so file coverage follows the corrected map. No-op
-    when no linked source has volume data (so manual mappings on
+    """Rebuild every chapter's volume assignment from the most complete
+    source's volume data (sanitized, applied verbatim — see mangarr.volumes),
+    overwriting whatever is there — the fix for stale or wrongly-stamped
+    assignments. Chapters the source can't place are distributed across the
+    volume archives found on disk; with no matching files they stay
+    unassigned. Chapters backed by a volume archive that no longer matches
+    their volume are re-scanned so file coverage follows the corrected map.
+    No-op when no linked source has volume data (so manual mappings on
     metadata-gap series survive)."""
     from ..jobs.tasks import fetch_volume_map, refine_volume_map_with_disk
     from ..util import has_chapter_marker, parse_volume_number

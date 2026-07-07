@@ -1,38 +1,36 @@
-"""Build a trustworthy chapter→volume map from source metadata.
+"""Select a trustworthy chapter→volume map from source metadata.
 
-Volume→chapter data (MangaDex /aggregate is the only structured source) is
-community-entered and has two failure modes this module corrects:
+Volume→chapter data (MangaDex /aggregate is the only structured source;
+MangaUpdates contributes sparse per-release volume tags) is community-entered
+and varies wildly in completeness per source. mangarr does not guess: each
+source's map is sanitized (a lone mislabeled chapter — e.g. one scanlation
+tagging chapter 232 as volume 1 — breaks volume monotonicity in chapter order
+and is dropped), and then the single most complete source's assignments are
+applied verbatim. Chapters no source can place stay unassigned rather than
+being distributed by heuristics.
 
-1. **Strays** — a lone mislabeled chapter (e.g. one scanlation tagging
-   chapter 232 as volume 1). Volume numbers must be non-decreasing in
-   chapter order, so we keep the largest internally-consistent subset
-   (longest non-decreasing subsequence) and drop the rest.
-
-2. **Gaps** — recent volumes simply never entered (e.g. volumes 12–17
-   missing while 18+ exist from a stray special). Chapters between two
-   known anchors can only belong to the volumes between them, so we
-   distribute them evenly across that range. Volume sizes within one
-   series are near-constant in practice, which makes this accurate to
-   about ±1 chapter at each inferred boundary — and any assignment the
-   source later provides replaces the inference on the next resync.
-
-Chapters after the last anchor stay unassigned: for an ongoing series they
-genuinely aren't collected in a volume yet, and guessing volumes that may
-not exist would be worse than none. Chapters before the first anchor
-(cover specials, oneshots) also stay unassigned.
+The one exception is the user's own files: volume archives already on disk
+prove those volumes exist, and distribute_over_disk_volumes() uses their
+numbering to place chapters when adopting an existing library — without it,
+owned chapters couldn't be matched to the archives that contain them and
+would be re-downloaded.
 """
 
 import bisect
 from collections.abc import Iterable
 
 
-def merge_volume_maps(maps: Iterable[dict[float, int]]) -> dict[float, int]:
-    """Union per-source maps; earlier maps (higher-priority sources) win."""
-    merged: dict[float, int] = {}
+def select_volume_map(maps: Iterable[dict[float, int]]) -> dict[float, int]:
+    """The most complete source's assignments, sanitized. Sources are given
+    in priority order; on equal coverage the earlier one wins. Maps are never
+    merged — mixing two sources' volume boundaries produces garbage neither
+    of them claims."""
+    best: dict[float, int] = {}
     for m in maps:
-        for number, volume in m.items():
-            merged.setdefault(number, volume)
-    return merged
+        cleaned = sanitize_volume_map(m)
+        if len(cleaned) > len(best):
+            best = cleaned
+    return best
 
 
 def sanitize_volume_map(mapping: dict[float, int]) -> dict[float, int]:
@@ -63,71 +61,6 @@ def _longest_non_decreasing(values: list[int]) -> set[int]:
         keep.add(i)
         i = prev[i]
     return keep
-
-
-def interpolate_volume_gaps(
-    mapping: dict[float, int], chapter_numbers: Iterable[float]
-) -> dict[float, int]:
-    """Assign unmapped chapters that lie between two known anchors.
-
-    A gap between the last known chapter of volume A and the first known
-    chapter of volume B belongs to volumes A+1..B-1, extended to include B
-    itself when B's own data is sparse (a volume known only from a stray
-    special has its front missing too; a volume with several entered
-    chapters starts where its data says it starts). A's span is complete —
-    aggregate data is entered per released chapter, so it's whole volumes
-    that go missing. The gap is split evenly across the range.
-
-    Chapters before the first anchor get the same treatment against a
-    virtual volume-0 boundary — every series starts at volume 1, so the
-    leading run spans volumes 1..first-anchored-volume.
-    """
-    if not mapping:
-        return dict(mapping)
-    result = dict(mapping)
-    anchor_count: dict[int, int] = {}
-    for vol in mapping.values():
-        anchor_count[vol] = anchor_count.get(vol, 0) + 1
-    gap: list[float] = []  # unmapped chapters since the previous anchor
-    numbers = sorted(set(chapter_numbers) | set(mapping))
-    prev_vol = 0  # virtual boundary: the series starts at volume 1
-    for number in numbers:
-        if number not in mapping:
-            gap.append(number)
-            continue
-        vol = mapping[number]
-        if gap and vol > prev_vol:
-            start = prev_vol + 1
-            end = vol if anchor_count[vol] < 3 else vol - 1
-            if end < start:
-                # adjacent fully-known volumes — stragglers (decimal
-                # extras between them) trail the earlier volume; at the
-                # very front they lead the first volume instead
-                for n in gap:
-                    result[n] = max(prev_vol, 1)
-            else:
-                span = end - start + 1
-                per = len(gap) / span
-                for i, n in enumerate(gap):
-                    result[n] = start + min(int(i / per), span - 1)
-        elif gap:
-            # same volume on both sides — the middle is that volume too
-            for n in gap:
-                result[n] = vol
-        gap = []
-        prev_vol = vol
-    return result
-
-
-def build_volume_map(
-    maps: Iterable[dict[float, int]], chapter_numbers: Iterable[float]
-) -> dict[float, int]:
-    """Merge, sanitize, and gap-fill source volume maps into one
-    chapter→volume assignment covering every chapter it can justify."""
-    merged = sanitize_volume_map(merge_volume_maps(maps))
-    if not merged:
-        return {}
-    return interpolate_volume_gaps(merged, chapter_numbers)
 
 
 def distribute_over_disk_volumes(

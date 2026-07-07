@@ -28,3 +28,25 @@ def test_title_queries_try_primary_then_english_alias():
         "Ijiranaide, Nagatoro-san",
         "Don't Toy With Me, Miss Nagatoro",
     ]
+
+
+def test_title_queries_rank_english_alternates_before_other_languages():
+    # the live failure: the official English title ranked below Polish and
+    # romaji variants and was never used to search sources
+    alt_titles = [
+        "Przeciwieństwa do szaleństwa (Polish)",
+        "Seihantaina Kimi to Boku",
+        "Tentang Kita yang Bertolak Belakang",
+        "The Polar Opposite You And Me",
+        "Trái Dấu Hút Nhau",
+        "Tu y yo somos polos opuestos",
+        "You and I Are Polar Opposites",
+        "ลุ้นรักฉบับคู่ต่างขั้ว (SIC)",
+        "正反対な君と僕",
+        "相反的你和我",
+        "정반대의 너와 나",
+    ]
+    queries = title_queries("Seihantai na Kimi to Boku", alt_titles)
+    # link_sources only tries the first 4 — the official English title must
+    # be among them
+    assert "You and I Are Polar Opposites" in queries[:4]
