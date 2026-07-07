@@ -1,8 +1,6 @@
 services:
   mangarr:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
+    image: kirantheram/mangarr:latest
     container_name: mangarr
     ports:
       - "6996:6996"
