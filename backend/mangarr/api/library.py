@@ -31,6 +31,8 @@ from ..schemas import (
     FileMapRangeOut,
     FilesystemEntryOut,
     FilesystemListOut,
+    FolderPreviewIn,
+    FolderPreviewOut,
     RenameApplyIn,
     RenameItemOut,
     RenameOutcomeOut,
@@ -409,10 +411,8 @@ async def resync_volumes(series_id: int, session: AsyncSession = Depends(get_ses
     volume are re-scanned so file coverage follows the corrected map. No-op
     when no linked source has volume data (so manual mappings on
     metadata-gap series survive)."""
-    from ..jobs.tasks import fetch_volume_map
-    from ..models import SeriesStatus
+    from ..jobs.tasks import fetch_volume_map, refine_volume_map_with_disk
     from ..util import has_chapter_marker, parse_volume_number
-    from ..volumes import distribute_over_disk_volumes
 
     series = await _load(session, series_id)
     values = await registry.apply_settings(session)
@@ -422,26 +422,7 @@ async def resync_volumes(series_id: int, session: AsyncSession = Depends(get_ses
                                repointed=0, cleared=0)
 
     # volume archives on disk anchor the chapters the source can't place
-    disk_volumes: set[int] = set()
-    for folder in _folders_of(series):
-        if not folder.exists():
-            continue
-        for mf in find_media_files(folder):
-            if mf.volume_number is not None and mf.chapter_number is None:
-                disk_volumes.add(mf.volume_number)
-    finished = series.status in (SeriesStatus.FINISHED, SeriesStatus.CANCELLED)
-    complete_set = bool(
-        finished and disk_volumes
-        and series.total_volumes and max(disk_volumes) >= series.total_volumes
-    )
-    fallback_rate = (
-        series.total_chapters / series.total_volumes
-        if series.total_chapters and series.total_volumes else None
-    )
-    volume_map = distribute_over_disk_volumes(
-        volume_map, [c.number for c in series.chapters], disk_volumes,
-        complete=complete_set, fallback_rate=fallback_rate,
-    )
+    volume_map = refine_volume_map_with_disk(series, volume_map)
 
     changed = 0
     for ch in series.chapters:
@@ -486,6 +467,28 @@ async def _scan_now(session: AsyncSession, series: Series) -> int:
     result = scan_series(series, list(series.chapters), _folders_of(series))
     await session.commit()
     return result.matched_chapters
+
+
+@router.post("/library/folder-preview", response_model=FolderPreviewOut)
+async def folder_preview(body: FolderPreviewIn, session: AsyncSession = Depends(get_session)):
+    """Which folder a prospective series would live in: the existing folder
+    under the root whose name matches the title/alt-titles (the same adoption
+    the scanner performs), or the default new folder derived from the title.
+    Lets the add dialog show — and let the user correct — the mapping before
+    the series is created."""
+    from ..util import sanitize_filename
+
+    root = await session.get(RootFolder, body.root_folder_id)
+    if root is None:
+        raise HTTPException(404, "Root folder not found")
+    probe = Series(title=body.title, alt_titles="\n".join(body.alt_titles))
+    found = find_existing_folder(Path(root.path), probe)
+    name = found or sanitize_filename(body.title)
+    resolved = Path(root.path) / name
+    return FolderPreviewOut(
+        folder_name=name, path=str(resolved),
+        exists=resolved.exists(), matched=found is not None,
+    )
 
 
 # ---------------------------------------------------------- filesystem browse

@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import Integer, cast, func, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -9,7 +10,7 @@ from ..db import get_session
 from ..jobs.tasks import refresh_series_full
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
-from ..models import Chapter, Series, SeriesStatus
+from ..models import Chapter, Series, SeriesFolder, SeriesStatus
 from ..schemas import (
     AddSeriesIn,
     ChapterMonitorIn,
@@ -103,14 +104,20 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
         root_folder_id=body.root_folder_id,
         folder_name=sanitize_filename(meta.title),
     )
+    if body.folder_name.strip():
+        series.folder_name = await _normalize_folder_name(session, series, body.folder_name)
     session.add(series)
+    for extra in body.extra_folders:
+        path = await _normalize_folder_name(session, series, extra)
+        if path and path != series.folder_name:
+            series.extra_folders.append(SeriesFolder(path=path))
     await session.commit()
     await session.refresh(series)
-    # link sources + fetch chapters in the background; monitored adds should
-    # immediately queue available direct chapters instead of waiting for the
-    # next scheduled monitor interval.
+    # link sources + fetch chapters in the background; "search now" adds queue
+    # available missing chapters as soon as the library scan and metadata
+    # refresh have run, instead of waiting for the next monitor interval.
     asyncio.get_running_loop().create_task(
-        refresh_series_full(series.id, grab_missing=body.monitored)
+        refresh_series_full(series.id, grab_missing=body.search_now)
     )
     return await get_series(series.id, session)
 
@@ -139,8 +146,17 @@ async def update_series(
     series = await session.get(Series, series_id)
     if series is None:
         raise HTTPException(404, "Series not found")
-    if body.monitored is not None:
+    if body.monitored is not None and body.monitored != series.monitored:
         series.monitored = body.monitored
+        # monitoring a series means wanting all of its missing content, so the
+        # chapter flags follow the toggle (the next monitor pass grabs every
+        # missing chapter, not just ones added while monitored); per-chapter
+        # toggles can then re-exclude individual chapters
+        await session.execute(
+            sa_update(Chapter)
+            .where(Chapter.series_id == series_id)
+            .values(monitored=body.monitored)
+        )
     if body.root_folder_id is not None:
         series.root_folder_id = body.root_folder_id
     if body.folder_name is not None:

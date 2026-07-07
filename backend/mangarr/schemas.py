@@ -40,6 +40,7 @@ class SeriesOut(BaseModel):
     mangaupdates_id: int | None
     title: str
     english_title: str = ""
+    alt_titles: str = ""  # newline-joined; lets the client match any known name
     description: str
     status: str
     year: int | None
@@ -70,6 +71,23 @@ class AddSeriesIn(BaseModel):
     search_now: bool = False
     english_title: str = ""
     alt_titles: list[str] = Field(default_factory=list)
+    # series folder under the root; empty means derive from the title
+    folder_name: str = ""
+    extra_folders: list[str] = Field(default_factory=list)
+
+
+class FolderPreviewIn(BaseModel):
+    """Ask which folder a prospective series would use before adding it."""
+    root_folder_id: int
+    title: str
+    alt_titles: list[str] = Field(default_factory=list)
+
+
+class FolderPreviewOut(BaseModel):
+    folder_name: str
+    path: str
+    exists: bool
+    matched: bool  # an existing folder was adopted (vs a fresh default name)
 
 
 class SeriesUpdateIn(BaseModel):
@@ -123,6 +141,14 @@ class GrabIn(BaseModel):
     series_id: int | None = None
     magnet: str | None = None
     title: str | None = None
+
+
+class QueueRemoveIn(BaseModel):
+    ids: list[int]
+
+
+class QueueRemoveOut(BaseModel):
+    removed: int
 
 
 class QueueItemOut(BaseModel):

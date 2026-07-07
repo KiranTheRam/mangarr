@@ -14,6 +14,7 @@ from ..db import session_scope
 from ..download.direct import download_chapter_to_cbz
 from ..download.qbittorrent import QbtClient
 from ..library.importer import import_torrent_payload
+from ..library.matcher import find_media_files
 from ..library.naming import chapter_path
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
@@ -30,7 +31,7 @@ from ..sources import registry
 from ..sources.base import DirectSource
 from ..titles import split_alt_titles, title_queries
 from ..util import normalize_title
-from ..volumes import build_volume_map
+from ..volumes import build_volume_map, distribute_over_disk_volumes
 
 log = logging.getLogger(__name__)
 
@@ -224,9 +225,13 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
 
     # backfill volume numbers for chapters that came from sources without
     # volume data (e.g. WeebCentral, or MangaDex titles whose chapters are
-    # external and thus never appear in the feed)
+    # external and thus never appear in the feed). Volume archives already
+    # on disk extend the map past the sources' last anchor, so a library
+    # being adopted gets its later volumes mapped on the first pass instead
+    # of needing a manual volume resync.
     if any(c.volume is None for c in existing.values()):
         volume_map = await fetch_volume_map(series, values)
+        volume_map = refine_volume_map_with_disk(series, volume_map)
         for number, ch in existing.items():
             if ch.volume is None and number in volume_map:
                 ch.volume = volume_map[number]
@@ -264,6 +269,62 @@ async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float
     return build_volume_map(maps, [c.number for c in series.chapters])
 
 
+def _series_folders(series: Series) -> list[Path]:
+    """Directories holding the series' files: the primary folder (adopting a
+    matching pre-existing folder when the primary doesn't exist yet) plus any
+    extra folders. Empty when no root folder is configured."""
+    from ..library.scanner import find_existing_folder, resolve_folders
+
+    if series.root_folder is None:
+        return []
+    root = Path(series.root_folder.path)
+    extras = [f.path for f in series.extra_folders]
+    folders = resolve_folders(root, series, extras)
+    if not folders[0].exists() and not extras:
+        found = find_existing_folder(root, series)
+        if found:
+            series.folder_name = found
+            folders = resolve_folders(root, series, extras)
+    return folders
+
+
+def disk_volume_numbers(series: Series) -> set[int]:
+    """Volume numbers of whole-volume archives present in the series' folders."""
+    volumes: set[int] = set()
+    for folder in _series_folders(series):
+        if not folder.exists():
+            continue
+        for mf in find_media_files(folder):
+            if mf.volume_number is not None and mf.chapter_number is None:
+                volumes.add(mf.volume_number)
+    return volumes
+
+
+def refine_volume_map_with_disk(
+    series: Series, volume_map: dict[float, int]
+) -> dict[float, int]:
+    """Extend a source-derived volume map using the volume archives on disk:
+    chapters the sources couldn't place are distributed across the volumes the
+    files prove exist (see mangarr.volumes.distribute_over_disk_volumes)."""
+    if not volume_map:
+        return volume_map
+    disk_volumes = disk_volume_numbers(series)
+    if not disk_volumes:
+        return volume_map
+    finished = series.status in (SeriesStatus.FINISHED, SeriesStatus.CANCELLED)
+    complete = bool(
+        finished and series.total_volumes and max(disk_volumes) >= series.total_volumes
+    )
+    fallback_rate = (
+        series.total_chapters / series.total_volumes
+        if series.total_chapters and series.total_volumes else None
+    )
+    return distribute_over_disk_volumes(
+        volume_map, [c.number for c in series.chapters], disk_volumes,
+        complete=complete, fallback_rate=fallback_rate,
+    )
+
+
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
     """Clear downloaded state for chapters whose recorded media file is gone."""
     missing = 0
@@ -283,18 +344,11 @@ async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> i
 async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     """Adopt existing library folders for the series and mark chapters that are
     already on disk as owned (so they aren't re-downloaded)."""
-    from ..library.scanner import find_existing_folder, resolve_folders, scan_series
+    from ..library.scanner import scan_series
 
-    if series.root_folder is None:
+    folders = _series_folders(series)
+    if not folders:
         return
-    root = Path(series.root_folder.path)
-    extras = [f.path for f in series.extra_folders]
-    folders = resolve_folders(root, series, extras)
-    if not folders[0].exists() and not extras:
-        found = find_existing_folder(root, series)
-        if found:
-            series.folder_name = found
-            folders = resolve_folders(root, series, extras)
     scan_series(series, list(series.chapters), folders)
     await session.commit()
 
@@ -318,8 +372,11 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
             except Exception as exc:
                 log.warning("library scan failed for series %d: %s", series_id, exc)
         await reconcile_downloaded_files(session, series)
-        if grab_missing and series.monitored:
-            await grab_missing_chapters(session, series, values)
+        if grab_missing:
+            # explicit one-time search (e.g. "search for missing" at add time):
+            # runs even for unmonitored series, whose chapters carry
+            # monitored=False — the user asked for the missing content now
+            await grab_missing_chapters(session, series, values, only_monitored=False)
 
 
 async def scan_all_series() -> None:
@@ -610,13 +667,15 @@ async def _import_torrent(
 # ------------------------------------------------------------ monitor loop
 
 async def grab_missing_chapters(
-    session: AsyncSession, series: Series, values: dict[str, str]
+    session: AsyncSession, series: Series, values: dict[str, str],
+    only_monitored: bool = True,
 ) -> int:
     """Queue missing monitored chapters from linked direct sources.
 
     This is used by both the scheduled monitor and the add-time refresh path,
-    so a newly added monitored series starts pulling available chapters as soon
-    as its source links and chapter list have been created.
+    so a newly added series starts pulling available chapters as soon as its
+    source links and chapter list have been created. `only_monitored=False`
+    (explicit user-requested search) also grabs unmonitored missing chapters.
     """
     result = await session.execute(
         select(Download.chapter_id).where(
@@ -638,7 +697,7 @@ async def grab_missing_chapters(
 
     wanted = [
         c for c in series.chapters
-        if c.monitored and not c.downloaded and c.id not in active
+        if (c.monitored or not only_monitored) and not c.downloaded and c.id not in active
     ]
     if not wanted:
         return 0
@@ -693,4 +752,10 @@ async def monitor_all() -> None:
                 continue
             await link_sources(session, series, values)
             await update_chapters(session, series, values)
+            # adopt whatever is on disk before deciding what's missing, so
+            # files that appeared since the last pass aren't re-downloaded
+            try:
+                await scan_series_folder(session, series)
+            except Exception as exc:
+                log.warning("library scan failed for series %d: %s", series_id, exc)
             await grab_missing_chapters(session, series, values)

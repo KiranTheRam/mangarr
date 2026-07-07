@@ -1,12 +1,24 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
+from ..download.qbittorrent import QbtClient
 from ..jobs.tasks import enqueue_direct, enqueue_torrent
-from ..models import Chapter, Download, DownloadStatus, HistoryEvent, Series
-from ..schemas import GrabIn, HistoryOut, QueueItemOut
+from ..models import (
+    Chapter,
+    Download,
+    DownloadKind,
+    DownloadStatus,
+    HistoryEvent,
+    Series,
+)
+from ..schemas import GrabIn, HistoryOut, QueueItemOut, QueueRemoveIn, QueueRemoveOut
 from ..sources import registry
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["queue"])
 
@@ -29,14 +41,55 @@ async def get_queue(session: AsyncSession = Depends(get_session)):
     return items
 
 
+async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
+    """Mark downloads as removed and stop their torrents in qBittorrent.
+
+    Direct downloads that are merely queued never start (the queue worker only
+    picks up QUEUED items); active torrents are also deleted from qBittorrent
+    along with their partial data so 'remove' really stops the transfer."""
+    result = await session.execute(select(Download).where(Download.id.in_(ids)))
+    downloads = result.scalars().all()
+    hashes = [
+        dl.torrent_hash for dl in downloads
+        if dl.kind == DownloadKind.TORRENT and dl.torrent_hash and dl.status in ACTIVE
+    ]
+    for dl in downloads:
+        dl.status = DownloadStatus.FAILED
+        dl.error = "removed by user"
+    await session.commit()
+    if hashes:
+        values = await registry.apply_settings(session)
+        if values["qbittorrent_enabled"] == "true":
+            client = QbtClient(
+                values["qbittorrent_url"], values["qbittorrent_username"],
+                values["qbittorrent_password"],
+            )
+            try:
+                await client.delete_torrents(hashes)
+            except Exception as exc:
+                log.warning("failed to delete %d torrent(s) from qBittorrent: %s",
+                            len(hashes), exc)
+            finally:
+                await client.close()
+    return len(downloads)
+
+
 @router.delete("/queue/{download_id}", status_code=204)
 async def remove_from_queue(download_id: int, session: AsyncSession = Depends(get_session)):
-    dl = await session.get(Download, download_id)
-    if dl is None:
+    removed = await _remove_downloads(session, [download_id])
+    if removed == 0:
         raise HTTPException(404, "Download not found")
-    dl.status = DownloadStatus.FAILED
-    dl.error = "removed by user"
-    await session.commit()
+
+
+@router.post("/queue/remove", response_model=QueueRemoveOut)
+async def remove_many_from_queue(
+    body: QueueRemoveIn, session: AsyncSession = Depends(get_session)
+):
+    """Bulk removal for the queue's multi-select — one call stops and removes
+    every selected download."""
+    if not body.ids:
+        raise HTTPException(422, "No download ids given")
+    return QueueRemoveOut(removed=await _remove_downloads(session, body.ids))
 
 
 @router.post("/queue/grab", response_model=QueueItemOut, status_code=201)

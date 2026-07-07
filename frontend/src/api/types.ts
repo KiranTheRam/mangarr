@@ -27,6 +27,7 @@ export interface Series {
   mangaupdates_id: number | null;
   title: string;
   english_title: string;
+  alt_titles: string;
   description: string;
   status: string;
   year: number | null;
@@ -62,6 +63,13 @@ export interface MetadataResult {
   total_chapters: number | null;
   total_volumes: number | null;
   in_library: boolean;
+}
+
+export interface FolderPreview {
+  folder_name: string;
+  path: string;
+  exists: boolean;
+  matched: boolean;
 }
 
 export interface Release {
