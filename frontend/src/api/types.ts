@@ -26,6 +26,7 @@ export interface Series {
   anilist_id: number | null;
   mangaupdates_id: number | null;
   title: string;
+  english_title: string;
   description: string;
   status: string;
   year: number | null;
@@ -51,6 +52,7 @@ export interface MetadataResult {
   provider: string;
   provider_id: string;
   title: string;
+  english_title: string;
   alt_titles: string[];
   description: string;
   status: string;
@@ -66,6 +68,7 @@ export interface Release {
   kind: "direct" | "torrent";
   source_name: string;
   title: string;
+  chapter_id: number | null;
   chapter_number: number | null;
   external_id: string;
   url: string;

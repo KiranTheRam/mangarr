@@ -17,6 +17,7 @@ from ..schemas import (
     SeriesOut,
     SeriesUpdateIn,
 )
+from ..titles import english_title, split_alt_titles, unique_titles
 from ..util import sanitize_filename
 
 router = APIRouter(prefix="/series", tags=["series"])
@@ -24,6 +25,7 @@ router = APIRouter(prefix="/series", tags=["series"])
 
 def _series_out(series: Series, chapter_count: int, downloaded_count: int) -> SeriesOut:
     out = SeriesOut.model_validate(series)
+    out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
     out.chapter_count = chapter_count
     out.downloaded_count = downloaded_count
     return out
@@ -82,12 +84,13 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
     meta = await provider.get_series(str(provider_id))
     if meta is None:
         raise HTTPException(404, f"{provider.name} series not found")
+    alt_titles = unique_titles([*meta.alt_titles, body.english_title, *body.alt_titles])
     series = Series(
         anilist_id=body.anilist_id,
         mangaupdates_id=body.mangaupdates_id,
         title=meta.title,
         sort_title=meta.title.lower(),
-        alt_titles="\n".join(meta.alt_titles),
+        alt_titles="\n".join(alt_titles),
         description=meta.description,
         status=SeriesStatus(meta.status),
         year=meta.year,
@@ -119,6 +122,7 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     if series is None:
         raise HTTPException(404, "Series not found")
     out = SeriesDetailOut.model_validate(series)
+    out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
     out.chapter_count = len(series.chapters)
     out.downloaded_count = sum(1 for c in series.chapters if c.downloaded)
     return out

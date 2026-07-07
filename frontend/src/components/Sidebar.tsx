@@ -15,7 +15,7 @@ export default function Sidebar() {
   const { data: queue } = useQuery({
     queryKey: ["queue"],
     queryFn: () => api.get<QueueItem[]>("/queue"),
-    refetchInterval: 5000,
+    refetchInterval: 3000,
   });
 
   return (

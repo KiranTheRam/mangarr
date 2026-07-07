@@ -1,8 +1,10 @@
 """Background tasks: series refresh, source linking, grabbing, download
 processing, qBittorrent sync, and the monitor loop."""
 
+import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 
 from sqlalchemy import select
@@ -26,6 +28,7 @@ from ..models import (
 )
 from ..sources import registry
 from ..sources.base import DirectSource
+from ..titles import split_alt_titles, title_queries
 from ..util import normalize_title
 from ..volumes import build_volume_map
 
@@ -105,7 +108,7 @@ async def link_mangaupdates(series: Series) -> bool:
 # ---------------------------------------------------------- source linking
 
 def _titles_of(series: Series) -> list[str]:
-    return [series.title, *[t for t in series.alt_titles.split("\n") if t]]
+    return title_queries(series.title, split_alt_titles(series.alt_titles))
 
 
 async def link_sources(session: AsyncSession, series: Series, values: dict[str, str]) -> None:
@@ -472,8 +475,24 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         chapter.number, chapter.volume, chapter.title,
     )
 
-    def on_progress(done: int, total: int) -> None:
-        dl.progress = done / total
+    progress_lock = asyncio.Lock()
+    last_progress_commit = 0.0
+
+    async def on_progress(done: int, total: int) -> None:
+        nonlocal last_progress_commit
+        progress = done / total
+        now = time.monotonic()
+        if done < total and now - last_progress_commit < 1.0:
+            dl.progress = progress
+            return
+        async with progress_lock:
+            now = time.monotonic()
+            if done < total and now - last_progress_commit < 1.0:
+                dl.progress = progress
+                return
+            dl.progress = progress
+            last_progress_commit = now
+            await session.commit()
 
     try:
         await download_chapter_to_cbz(

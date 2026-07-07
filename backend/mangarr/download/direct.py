@@ -1,7 +1,9 @@
 """Direct (HTTP) chapter downloader: pages → CBZ → library."""
 
 import asyncio
+import inspect
 import logging
+from collections.abc import Awaitable, Callable
 
 import httpx
 
@@ -14,6 +16,8 @@ log = logging.getLogger(__name__)
 
 PAGE_CONCURRENCY = 3
 
+ProgressCallback = Callable[[int, int], None | Awaitable[None]]
+
 
 async def download_chapter_to_cbz(
     source: DirectSource,
@@ -21,7 +25,7 @@ async def download_chapter_to_cbz(
     series: Series,
     chapter: Chapter,
     dest_path,
-    progress_cb=None,
+    progress_cb: ProgressCallback | None = None,
     web_url: str = "",
 ) -> None:
     """Fetches all pages of a chapter and writes the CBZ to dest_path.
@@ -51,7 +55,9 @@ async def download_chapter_to_cbz(
                         await asyncio.sleep(2 * (attempt + 1))
             done += 1
             if progress_cb:
-                progress_cb(done, len(page_urls))
+                result = progress_cb(done, len(page_urls))
+                if inspect.isawaitable(result):
+                    await result
 
         await asyncio.gather(*(fetch(i, u) for i, u in enumerate(page_urls)))
 

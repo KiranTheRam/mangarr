@@ -20,7 +20,7 @@ async def start() -> None:
         id="direct_queue", max_instances=1, coalesce=True,
     )
     scheduler.add_job(
-        sync_qbittorrent, "interval", seconds=20,
+        sync_qbittorrent, "interval", seconds=8,
         id="qbt_sync", max_instances=1, coalesce=True,
     )
     scheduler.add_job(

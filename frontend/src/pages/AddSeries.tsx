@@ -32,6 +32,8 @@ export default function AddSeries() {
         [r.provider === "anilist" ? "anilist_id" : "mangaupdates_id"]: Number(r.provider_id),
         root_folder_id: effectiveRoot,
         monitored,
+        english_title: r.english_title,
+        alt_titles: r.alt_titles,
       }),
     onSuccess: (series) => {
       queryClient.invalidateQueries({ queryKey: ["series"] });
@@ -110,6 +112,9 @@ export default function AddSeries() {
                 <h3>
                   {r.title} {r.year ? <span style={{ color: "var(--text-faint)" }}>({r.year})</span> : null}
                 </h3>
+                {r.english_title && r.english_title !== r.title && (
+                  <div className="alt-title-line">English: {r.english_title}</div>
+                )}
                 <span className={`pill ${statusPill[r.status] ?? "gray"}`}>{r.status}</span>{" "}
                 {r.total_chapters && <span className="tag">{r.total_chapters} chapters</span>}
                 {r.genres.slice(0, 4).map((g) => (

@@ -9,7 +9,7 @@ function Queue() {
   const { data, isLoading } = useQuery({
     queryKey: ["queue"],
     queryFn: () => api.get<QueueItem[]>("/queue"),
-    refetchInterval: 3000,
+    refetchInterval: 2000,
   });
 
   const remove = useMutation({
@@ -56,6 +56,7 @@ function Queue() {
               <button
                 className="btn icon-btn"
                 title="Remove"
+                disabled={remove.isPending}
                 onClick={() => remove.mutate(item.id)}
               >
                 ✕
@@ -72,7 +73,7 @@ function History() {
   const { data, isLoading } = useQuery({
     queryKey: ["history"],
     queryFn: () => api.get<HistoryItem[]>("/history"),
-    refetchInterval: 10000,
+    refetchInterval: 5000,
   });
 
   if (isLoading) return <Spinner />;

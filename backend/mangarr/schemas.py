@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RootFolderOut(BaseModel):
@@ -39,6 +39,7 @@ class SeriesOut(BaseModel):
     anilist_id: int | None
     mangaupdates_id: int | None
     title: str
+    english_title: str = ""
     description: str
     status: str
     year: int | None
@@ -67,6 +68,8 @@ class AddSeriesIn(BaseModel):
     root_folder_id: int
     monitored: bool = True
     search_now: bool = False
+    english_title: str = ""
+    alt_titles: list[str] = Field(default_factory=list)
 
 
 class SeriesUpdateIn(BaseModel):
@@ -84,6 +87,7 @@ class MetadataResult(BaseModel):
     provider: str
     provider_id: str
     title: str
+    english_title: str = ""
     alt_titles: list[str]
     description: str
     status: str
@@ -100,6 +104,7 @@ class ReleaseOut(BaseModel):
     kind: str  # direct | torrent
     source_name: str
     title: str
+    chapter_id: int | None = None
     chapter_number: float | None = None
     external_id: str = ""  # direct: source chapter id
     url: str = ""
