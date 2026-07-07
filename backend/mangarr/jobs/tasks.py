@@ -299,7 +299,7 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     await session.commit()
 
 
-async def refresh_series_full(series_id: int) -> None:
+async def refresh_series_full(series_id: int, grab_missing: bool = False) -> None:
     async with session_scope() as session:
         series = await _load_series(session, series_id)
         if series is None:
@@ -318,6 +318,8 @@ async def refresh_series_full(series_id: int) -> None:
             except Exception as exc:
                 log.warning("library scan failed for series %d: %s", series_id, exc)
         await reconcile_downloaded_files(session, series)
+        if grab_missing and series.monitored:
+            await grab_missing_chapters(session, series, values)
 
 
 async def scan_all_series() -> None:
@@ -607,6 +609,75 @@ async def _import_torrent(
 
 # ------------------------------------------------------------ monitor loop
 
+async def grab_missing_chapters(
+    session: AsyncSession, series: Series, values: dict[str, str]
+) -> int:
+    """Queue missing monitored chapters from linked direct sources.
+
+    This is used by both the scheduled monitor and the add-time refresh path,
+    so a newly added monitored series starts pulling available chapters as soon
+    as its source links and chapter list have been created.
+    """
+    result = await session.execute(
+        select(Download.chapter_id).where(
+            Download.series_id == series.id,
+            Download.status.in_([
+                DownloadStatus.QUEUED,
+                DownloadStatus.DOWNLOADING,
+                DownloadStatus.IMPORTING,
+            ]),
+        )
+    )
+    active = {row[0] for row in result.all()}
+    if None in active:
+        # a series-level download (e.g. a Nyaa volume pack) is in flight — its
+        # chapter coverage is unknown until it imports, so grabbing per-chapter
+        # now would duplicate everything
+        log.info("monitor: %r has a series-level download in flight; skipping grabs", series.title)
+        return 0
+
+    wanted = [
+        c for c in series.chapters
+        if c.monitored and not c.downloaded and c.id not in active
+    ]
+    if not wanted:
+        return 0
+
+    # a chapter that already failed on a source shouldn't be retried there —
+    # fall through to the next source instead.
+    result = await session.execute(
+        select(Download.chapter_id, Download.source_name).where(
+            Download.series_id == series.id,
+            Download.status == DownloadStatus.FAILED,
+            Download.chapter_id.isnot(None),
+        )
+    )
+    failed_pairs = {(cid, name) for cid, name in result.all()}
+
+    queued = 0
+    links = {sl.source_name: sl for sl in series.source_links}
+    remaining = {c.number: c for c in wanted}
+    for src in registry.enabled_direct_sources(values):
+        if not remaining:
+            break
+        link = links.get(src.name)
+        if link is None:
+            continue
+        try:
+            source_chapters = await src.list_chapters(link.external_id)
+        except Exception as exc:
+            log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
+            continue
+        for sc in source_chapters:
+            ch = remaining.get(sc.number)
+            if ch is None or (ch.id, src.name) in failed_pairs:
+                continue
+            remaining.pop(sc.number, None)
+            await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url)
+            queued += 1
+    return queued
+
+
 async def monitor_all() -> None:
     """Refresh monitored series and grab missing monitored chapters."""
     async with session_scope() as session:
@@ -622,59 +693,4 @@ async def monitor_all() -> None:
                 continue
             await link_sources(session, series, values)
             await update_chapters(session, series, values)
-
-            # active downloads for this series → don't double-grab
-            result = await session.execute(
-                select(Download.chapter_id).where(
-                    Download.series_id == series_id,
-                    Download.status.in_([DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING,
-                                         DownloadStatus.IMPORTING]),
-                )
-            )
-            active = {row[0] for row in result.all()}
-            if None in active:
-                # a series-level download (e.g. a Nyaa volume pack) is in
-                # flight — its chapter coverage is unknown until it imports,
-                # so grabbing per-chapter now would duplicate everything
-                log.info("monitor: %r has a series-level download in flight; skipping grabs",
-                         series.title)
-                continue
-            wanted = [
-                c for c in series.chapters
-                if c.monitored and not c.downloaded and c.id not in active
-            ]
-            if not wanted:
-                continue
-
-            # a chapter that already failed on a source shouldn't be retried
-            # there — fall through to the next source instead (handles
-            # subscription-locked MangaPlus chapters, dead links, etc.)
-            result = await session.execute(
-                select(Download.chapter_id, Download.source_name).where(
-                    Download.series_id == series_id,
-                    Download.status == DownloadStatus.FAILED,
-                    Download.chapter_id.isnot(None),
-                )
-            )
-            failed_pairs = {(cid, name) for cid, name in result.all()}
-
-            # one chapter-list fetch per source, then match all wanted numbers
-            links = {sl.source_name: sl for sl in series.source_links}
-            remaining = {c.number: c for c in wanted}
-            for src in registry.enabled_direct_sources(values):
-                if not remaining:
-                    break
-                link = links.get(src.name)
-                if link is None:
-                    continue
-                try:
-                    source_chapters = await src.list_chapters(link.external_id)
-                except Exception as exc:
-                    log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
-                    continue
-                for sc in source_chapters:
-                    ch = remaining.get(sc.number)
-                    if ch is None or (ch.id, src.name) in failed_pairs:
-                        continue  # keep it for a lower-priority source
-                    remaining.pop(sc.number, None)
-                    await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url)
+            await grab_missing_chapters(session, series, values)

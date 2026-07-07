@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
@@ -44,30 +44,102 @@ function InteractiveSearch({
     queryFn: () => api.get<Release[]>(`/search/releases?${params}`),
   });
 
-  const grab = useMutation({
-    mutationFn: (release: Release) => {
-      if (release.kind === "direct") {
-        const directChapterId = release.chapter_id ?? chapterId;
-        if (directChapterId == null) {
-          throw new Error("Direct release is not linked to a local chapter");
-        }
-        return api.post("/queue/grab", {
-          chapter_id: directChapterId,
-          source_name: release.source_name,
-          external_id: release.external_id,
-        });
+  const [activeSource, setActiveSource] = useState("");
+  const [selectedDirect, setSelectedDirect] = useState<Set<string>>(() => new Set());
+  const sourceNames = useMemo(
+    () => [...new Set((data ?? []).map((release) => release.source_name))],
+    [data],
+  );
+  const visibleReleases = useMemo(
+    () => (data ?? []).filter((release) => release.source_name === activeSource),
+    [data, activeSource],
+  );
+  const directReleases = visibleReleases.filter((release) => release.kind === "direct");
+  const directSelectable = directReleases.filter(
+    (release) => (release.chapter_id ?? chapterId) != null,
+  );
+  const releaseKey = (release: Release) =>
+    `${release.source_name}:${release.external_id}:${release.chapter_id ?? chapterId ?? ""}`;
+  const selectedVisibleDirect = directSelectable.filter((release) =>
+    selectedDirect.has(releaseKey(release)),
+  );
+  const allVisibleDirectSelected =
+    directSelectable.length > 0 && selectedVisibleDirect.length === directSelectable.length;
+
+  useEffect(() => {
+    if (!activeSource && sourceNames.length > 0) {
+      setActiveSource(sourceNames[0]);
+    } else if (activeSource && sourceNames.length > 0 && !sourceNames.includes(activeSource)) {
+      setActiveSource(sourceNames[0]);
+    }
+  }, [activeSource, sourceNames]);
+
+  const grabRelease = (release: Release) => {
+    if (release.kind === "direct") {
+      const directChapterId = release.chapter_id ?? chapterId;
+      if (directChapterId == null) {
+        throw new Error("Direct release is not linked to a local chapter");
       }
       return api.post("/queue/grab", {
-        series_id: seriesId,
-        magnet: release.magnet,
-        title: release.title,
+        chapter_id: directChapterId,
+        source_name: release.source_name,
+        external_id: release.external_id,
       });
+    }
+    return api.post("/queue/grab", {
+      series_id: seriesId,
+      magnet: release.magnet,
+      title: release.title,
+    });
+  };
+
+  const grab = useMutation({
+    mutationFn: grabRelease,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["queue"] });
+      onClose();
+    },
+  });
+
+  const grabSelected = useMutation({
+    mutationFn: async (releases: Release[]) => {
+      for (const release of releases) {
+        await grabRelease(release);
+      }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["queue"] });
       onClose();
     },
   });
+
+  const toggleDirect = (release: Release) => {
+    const key = releaseKey(release);
+    setSelectedDirect((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
+  const toggleAllVisibleDirect = () => {
+    setSelectedDirect((current) => {
+      const next = new Set(current);
+      for (const release of directSelectable) {
+        const key = releaseKey(release);
+        if (allVisibleDirectSelected) {
+          next.delete(key);
+        } else {
+          next.add(key);
+        }
+      }
+      return next;
+    });
+  };
 
   return (
     <Modal title={`Search — ${title}`} onClose={onClose}>
@@ -82,10 +154,43 @@ function InteractiveSearch({
       ) : (
         <>
           {grab.isError && <div className="error-banner">{(grab.error as Error).message}</div>}
+          {grabSelected.isError && (
+            <div className="error-banner">{(grabSelected.error as Error).message}</div>
+          )}
+          <div className="source-tabs">
+            {sourceNames.map((source) => {
+              const sourceCount = (data ?? []).filter((release) => release.source_name === source).length;
+              return (
+                <button
+                  className={`source-tab${source === activeSource ? " active" : ""}`}
+                  key={source}
+                  onClick={() => setActiveSource(source)}
+                >
+                  {source}
+                  <span>{sourceCount}</span>
+                </button>
+              );
+            })}
+          </div>
+          {directSelectable.length > 0 && (
+            <div className="release-actions">
+              <button className="btn sm" onClick={toggleAllVisibleDirect}>
+                {allVisibleDirectSelected ? "Clear selected" : "Select all"}
+              </button>
+              <span>{selectedVisibleDirect.length} selected</span>
+              <button
+                className="btn primary sm"
+                disabled={selectedVisibleDirect.length === 0 || grabSelected.isPending}
+                onClick={() => grabSelected.mutate(selectedVisibleDirect)}
+              >
+                {grabSelected.isPending ? "Grabbing…" : "Grab selected"}
+              </button>
+            </div>
+          )}
           <table className="data-table">
             <thead>
               <tr>
-                <th>Source</th>
+                {directSelectable.length > 0 && <th style={{ width: 42 }}></th>}
                 <th>Title</th>
                 <th>Size</th>
                 <th>Peers</th>
@@ -93,13 +198,19 @@ function InteractiveSearch({
               </tr>
             </thead>
             <tbody>
-              {data.map((r, i) => (
-                <tr key={i}>
-                  <td>
-                    <span className={`pill ${r.kind === "torrent" ? "orange" : "blue"}`}>
-                      {r.source_name}
-                    </span>
-                  </td>
+              {visibleReleases.map((r, i) => (
+                <tr key={`${r.source_name}-${r.external_id || r.magnet || i}`}>
+                  {directSelectable.length > 0 && (
+                    <td>
+                      {r.kind === "direct" && (r.chapter_id ?? chapterId) != null && (
+                        <input
+                          type="checkbox"
+                          checked={selectedDirect.has(releaseKey(r))}
+                          onChange={() => toggleDirect(r)}
+                        />
+                      )}
+                    </td>
+                  )}
                   <td>
                     {r.url ? (
                       <a href={r.url} target="_blank" rel="noreferrer" style={{ color: "var(--info)" }}>
@@ -115,7 +226,11 @@ function InteractiveSearch({
                     <button
                       className="btn icon-btn"
                       title="Grab"
-                      disabled={grab.isPending || (r.kind === "direct" && (r.chapter_id ?? chapterId) == null)}
+                      disabled={
+                        grab.isPending ||
+                        grabSelected.isPending ||
+                        (r.kind === "direct" && (r.chapter_id ?? chapterId) == null)
+                      }
                       onClick={() => grab.mutate(r)}
                     >
                       ⇓
@@ -338,7 +453,7 @@ export default function SeriesDetail() {
 
   return (
     <>
-      <Toolbar>
+      <Toolbar className="series-toolbar">
         <button
           className="btn"
           title="Refresh metadata, source links, chapters, and library state"

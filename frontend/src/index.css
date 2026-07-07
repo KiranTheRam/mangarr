@@ -69,6 +69,13 @@ select:focus {
   border-color: var(--accent);
 }
 
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -198,6 +205,11 @@ select:focus {
   border-radius: 4px;
   background: var(--bg);
   white-space: nowrap;
+}
+
+.series-toolbar {
+  justify-content: flex-end;
+  overflow-x: auto;
 }
 
 .content {
@@ -569,6 +581,47 @@ table.data-table {
 .modal-body {
   padding: 20px;
   overflow-y: auto;
+}
+
+.source-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.source-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  color: var(--text-dim);
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+
+.source-tab:hover {
+  color: var(--text);
+}
+
+.source-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.source-tab span {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.release-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  color: var(--text-dim);
+  font-size: 12.5px;
 }
 
 /* ---------- forms / settings ---------- */
