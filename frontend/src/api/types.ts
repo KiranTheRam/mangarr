@@ -37,6 +37,7 @@ export interface Series {
   monitored: boolean;
   root_folder_id: number | null;
   folder_name: string;
+  folder_pinned: boolean;
   total_chapters: number | null;
   total_volumes: number | null;
   added_at: string;
@@ -70,6 +71,7 @@ export interface FolderPreview {
   path: string;
   exists: boolean;
   matched: boolean;
+  default_folder_name: string;
 }
 
 export interface Release {
@@ -145,6 +147,27 @@ export interface VolumeResyncResult {
   changed: number;
   repointed: number;
   cleared: number;
+}
+
+export interface VolumeDiffRow {
+  number: number;
+  old_volume: number | null;
+  new_volume: number | null;
+}
+
+export interface VolumeCandidate {
+  source: string;
+  map_size: number;
+  assigned: number;
+  changed: number;
+  repointed: number;
+  cleared: number;
+  has_changes: boolean;
+  diff: VolumeDiffRow[];
+}
+
+export interface VolumeResyncPreview {
+  candidates: VolumeCandidate[];
 }
 
 export interface RenameItem {

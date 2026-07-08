@@ -50,6 +50,7 @@ class SeriesOut(BaseModel):
     monitored: bool
     root_folder_id: int | None
     folder_name: str
+    folder_pinned: bool
     total_chapters: int | None
     total_volumes: int | None
     added_at: datetime
@@ -73,6 +74,9 @@ class AddSeriesIn(BaseModel):
     alt_titles: list[str] = Field(default_factory=list)
     # series folder under the root; empty means derive from the title
     folder_name: str = ""
+    # the user picked the folder deliberately — scans must not re-adopt a
+    # title-matching existing folder over it
+    folder_pinned: bool = False
     extra_folders: list[str] = Field(default_factory=list)
 
 
@@ -88,12 +92,18 @@ class FolderPreviewOut(BaseModel):
     path: str
     exists: bool
     matched: bool  # an existing folder was adopted (vs a fresh default name)
+    # the title-derived name a fresh folder would get, so the UI can offer
+    # "create a new folder instead" when the match is wrong
+    default_folder_name: str
 
 
 class SeriesUpdateIn(BaseModel):
     monitored: bool | None = None
     root_folder_id: int | None = None
     folder_name: str | None = None
+    # None + a folder_name update pins implicitly (an explicit folder edit is
+    # an explicit choice); pass False to re-enable folder adoption
+    folder_pinned: bool | None = None
 
 
 class ChapterMonitorIn(BaseModel):
@@ -308,12 +318,42 @@ class ResyncOut(BaseModel):
     matched_chapters: int
 
 
+class VolumeResyncIn(BaseModel):
+    """Optional body: apply a specific source's volume map (as offered by the
+    resync preview) instead of the auto-selected most complete one."""
+    source: str | None = None
+
+
 class VolumeResyncOut(BaseModel):
     has_data: bool  # False when no linked source provides volume data
     assigned: int  # chapters with a volume after the resync
     changed: int  # chapters whose volume assignment changed
     repointed: int  # chapters re-covered by a different file on disk
     cleared: int  # chapters no longer backed by any file
+
+
+class VolumeDiffRowOut(BaseModel):
+    number: float
+    old_volume: int | None
+    new_volume: int | None
+
+
+class VolumeCandidateOut(BaseModel):
+    """Dry-run outcome of applying one source's volume map."""
+    source: str
+    map_size: int  # sanitized chapter→volume entries — the ranking key
+    assigned: int
+    changed: int
+    repointed: int
+    cleared: int
+    has_changes: bool  # would touch assignments or file coverage
+    diff: list[VolumeDiffRowOut]
+
+
+class VolumeResyncPreviewOut(BaseModel):
+    # ranked like the resync itself ranks maps: most complete first, so the
+    # first candidate is what an unqualified resync would apply
+    candidates: list[VolumeCandidateOut]
 
 
 class SeriesFolderOut(BaseModel):

@@ -240,13 +240,14 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
     return added
 
 
-async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float, int]:
-    """Chapter→volume assignments for a series: every linked source's volume
-    data is collected, and the single most complete source's assignments are
-    applied verbatim (sanitized of stray mislabeled chapters, never merged or
-    gap-guessed — see mangarr.volumes)."""
+async def collect_volume_maps(
+    series: Series, values: dict[str, str]
+) -> list[tuple[str, dict[float, int]]]:
+    """Every linked source's volume data, labeled by source name, in priority
+    order. MangaUpdates' per-release volume tags compete too — usually sparse,
+    but listed last so structured source data (MangaDex aggregate) wins ties."""
     links = {sl.source_name: sl for sl in series.source_links}
-    maps: list[dict[float, int]] = []
+    maps: list[tuple[str, dict[float, int]]] = []
     for src in registry.enabled_direct_sources(values):
         link = links.get(src.name)
         if link is None:
@@ -257,17 +258,23 @@ async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float
             log.warning("volume map failed on %s for %r: %s", src.name, series.title, exc)
             continue
         if volume_map:
-            maps.append(volume_map)
-    # MangaUpdates per-release volume tags compete too — usually sparse, but
-    # listed last so structured source data (MangaDex aggregate) wins ties
+            maps.append((src.name, volume_map))
     if series.mangaupdates_id is not None:
         try:
             release_data = await mangaupdates.get_release_data(series.mangaupdates_id)
             if release_data.volume_anchors:
-                maps.append(release_data.volume_anchors)
+                maps.append(("mangaupdates", release_data.volume_anchors))
         except Exception as exc:
             log.warning("mangaupdates volume anchors failed for %r: %s", series.title, exc)
-    return select_volume_map(maps)
+    return maps
+
+
+async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float, int]:
+    """Chapter→volume assignments for a series: every linked source's volume
+    data is collected, and the single most complete source's assignments are
+    applied verbatim (sanitized of stray mislabeled chapters, never merged or
+    gap-guessed — see mangarr.volumes)."""
+    return select_volume_map(m for _, m in await collect_volume_maps(series, values))
 
 
 def _series_folders(series: Series) -> list[Path]:
@@ -281,7 +288,7 @@ def _series_folders(series: Series) -> list[Path]:
     root = Path(series.root_folder.path)
     extras = [f.path for f in series.extra_folders]
     folders = resolve_folders(root, series, extras)
-    if not folders[0].exists() and not extras:
+    if not folders[0].exists() and not extras and not series.folder_pinned:
         found = find_existing_folder(root, series)
         if found:
             series.folder_name = found

@@ -103,6 +103,7 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
         monitored=body.monitored,
         root_folder_id=body.root_folder_id,
         folder_name=sanitize_filename(meta.title),
+        folder_pinned=body.folder_pinned,
     )
     if body.folder_name.strip():
         series.folder_name = await _normalize_folder_name(session, series, body.folder_name)
@@ -161,6 +162,12 @@ async def update_series(
         series.root_folder_id = body.root_folder_id
     if body.folder_name is not None:
         series.folder_name = await _normalize_folder_name(session, series, body.folder_name)
+        # an explicit folder edit is an explicit choice — pin it so the next
+        # scan can't re-adopt a title-matching folder over it
+        if body.folder_pinned is None:
+            series.folder_pinned = True
+    if body.folder_pinned is not None:
+        series.folder_pinned = body.folder_pinned
     await session.commit()
     return await get_series(series_id, session)
 
@@ -175,10 +182,17 @@ async def delete_series(series_id: int, session: AsyncSession = Depends(get_sess
 
 
 @router.post("/{series_id}/refresh", status_code=202)
-async def refresh_series(series_id: int, session: AsyncSession = Depends(get_session)):
+async def refresh_series(
+    series_id: int, wait: bool = False, session: AsyncSession = Depends(get_session)
+):
     series = await session.get(Series, series_id)
     if series is None:
         raise HTTPException(404, "Series not found")
+    if wait:
+        # synchronous variant for flows that need the refreshed state next
+        # (e.g. the volume-resync preview right after a refresh)
+        await refresh_series_full(series_id)
+        return {"status": "refreshed"}
     asyncio.get_running_loop().create_task(refresh_series_full(series_id))
     return {"status": "refreshing"}
 

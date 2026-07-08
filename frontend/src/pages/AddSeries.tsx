@@ -52,6 +52,9 @@ function AddSeriesModal({
         english_title: result.english_title,
         alt_titles: result.alt_titles,
         folder_name: folderName.trim(),
+        // an edited/chosen folder is deliberate — pin it so scans can't
+        // re-adopt a title-matching existing folder over it
+        folder_pinned: folderTouched,
         extra_folders: extraFolders,
       }),
     onSuccess: (series) => {
@@ -106,14 +109,45 @@ function AddSeriesModal({
         </div>
       </div>
       <div style={{ color: "var(--text-faint)", fontSize: 13, margin: "-6px 0 12px" }}>
-        {usingDetected
-          ? `Existing folder detected: ${preview!.path}`
-          : folderName.startsWith("/")
-            ? folderName
-            : `${rootPath.replace(/\/$/, "")}/${folderName}` +
-              (preview && !preview.matched && folderName === preview.folder_name
-                ? " (will be created)"
-                : "")}
+        {usingDetected ? (
+          <>
+            {`Existing folder detected: ${preview!.path} — `}
+            <button
+              type="button"
+              style={{ color: "var(--accent)", padding: 0 }}
+              onClick={() => {
+                setFolderName(preview!.default_folder_name);
+                setFolderTouched(true);
+              }}
+            >
+              create a new folder instead
+            </button>
+          </>
+        ) : (
+          <>
+            {folderName.startsWith("/")
+              ? folderName
+              : `${rootPath.replace(/\/$/, "")}/${folderName}` +
+                (preview && (preview.matched ? folderName !== preview.folder_name : folderName === preview.folder_name)
+                  ? " (will be created)"
+                  : "")}
+            {folderTouched && preview?.matched && (
+              <>
+                {" — "}
+                <button
+                  type="button"
+                  style={{ color: "var(--accent)", padding: 0 }}
+                  onClick={() => {
+                    setFolderName(preview.folder_name);
+                    setFolderTouched(false);
+                  }}
+                >
+                  use detected folder
+                </button>
+              </>
+            )}
+          </>
+        )}
       </div>
 
       {extraFolders.map((path, i) => (

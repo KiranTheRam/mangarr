@@ -8,6 +8,7 @@ import type {
   Release,
   ScanResult,
   SeriesDetail as SeriesDetailType,
+  VolumeResyncPreview,
   VolumeResyncResult,
 } from "../api/types";
 import {
@@ -246,6 +247,119 @@ function InteractiveSearch({
   );
 }
 
+function VolumeResyncModal({
+  preview,
+  source,
+  onPick,
+  onApply,
+  applying,
+  onClose,
+}: {
+  preview: VolumeResyncPreview;
+  source: string;
+  onPick: (source: string) => void;
+  onApply: () => void;
+  applying: boolean;
+  onClose: () => void;
+}) {
+  const selected =
+    preview.candidates.find((c) => c.source === source) ?? preview.candidates[0];
+  const vol = (v: number | null) => (v == null ? "—" : `Vol. ${v}`);
+  return (
+    <Modal title="Confirm volume changes" onClose={onClose}>
+      <p style={{ color: "var(--text-dim)", marginBottom: 12 }}>
+        Refresh finished, and source volume data would change this series'
+        chapter–volume assignments or file coverage. Pick which source's
+        mapping to apply, or cancel to keep everything as it is.
+      </p>
+
+      {preview.candidates.map((c, i) => (
+        <label
+          key={c.source}
+          style={{ display: "flex", gap: 8, alignItems: "baseline", padding: "4px 0", cursor: "pointer" }}
+        >
+          <input
+            type="radio"
+            name="resync-source"
+            checked={selected?.source === c.source}
+            onChange={() => onPick(c.source)}
+          />
+          <span>
+            <strong>{c.source}</strong>
+            {i === 0 && (
+              <span className="pill green" style={{ marginLeft: 8 }}>
+                best match
+              </span>
+            )}
+            <span style={{ color: "var(--text-dim)" }}>
+              {" "}
+              — {c.map_size} chapters mapped
+              {c.has_changes
+                ? ` · ${c.changed} change${c.changed === 1 ? "" : "s"}` +
+                  (c.repointed > 0 ? ` · ${c.repointed} re-pointed` : "") +
+                  (c.cleared > 0 ? ` · ${c.cleared} cleared` : "")
+                : " · no changes"}
+            </span>
+          </span>
+        </label>
+      ))}
+
+      {selected && (
+        <>
+          <div style={{ margin: "14px 0 8px", color: "var(--text-dim)", fontSize: 13 }}>
+            Applying <strong>{selected.source}</strong> leaves {selected.assigned} chapter
+            {selected.assigned === 1 ? "" : "s"} assigned to volumes, changes{" "}
+            {selected.changed} assignment{selected.changed === 1 ? "" : "s"}
+            {selected.repointed > 0 &&
+              `, re-points ${selected.repointed} chapter${selected.repointed === 1 ? "" : "s"} to a different file`}
+            {selected.cleared > 0 &&
+              `, leaves ${selected.cleared} chapter${selected.cleared === 1 ? "" : "s"} no longer backed by a file`}
+            .
+          </div>
+          {selected.diff.length > 0 && (
+            <div
+              style={{
+                maxHeight: 280,
+                overflowY: "auto",
+                border: "1px solid var(--border)",
+                borderRadius: 6,
+              }}
+            >
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: "left" }}>Chapter</th>
+                    <th style={{ textAlign: "left" }}>Current</th>
+                    <th style={{ textAlign: "left" }}>New</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selected.diff.map((row) => (
+                    <tr key={row.number}>
+                      <td>{chapterLabel(row.number)}</td>
+                      <td>{vol(row.old_volume)}</td>
+                      <td>{vol(row.new_volume)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+        <button className="btn" onClick={onClose}>
+          Keep current volumes
+        </button>
+        <button className="btn primary" disabled={applying || !selected} onClick={onApply}>
+          {applying ? "Applying…" : `Apply ${selected?.source ?? ""} volumes`}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: Chapter[] }[] {
   const byVolume = new Map<number | null, Chapter[]>();
   for (const ch of chapters) {
@@ -275,6 +389,8 @@ export default function SeriesDetail() {
   const [showCleanup, setShowCleanup] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [volumeResult, setVolumeResult] = useState<VolumeResyncResult | null>(null);
+  const [resyncPreview, setResyncPreview] = useState<VolumeResyncPreview | null>(null);
+  const [resyncSource, setResyncSource] = useState("");
   const [workNotice, setWorkNotice] = useState<string | null>(null);
 
   const showWorkNotice = (message: string, timeout = 9000) => {
@@ -305,10 +421,21 @@ export default function SeriesDetail() {
   });
 
   const refresh = useMutation({
-    mutationFn: () => api.post(`/series/${seriesId}/refresh`),
-    onSuccess: () => {
-      showWorkNotice("Refreshing metadata, source links, and chapters…");
-      setTimeout(invalidate, 4000);
+    mutationFn: async () => {
+      // refresh synchronously, then dry-run the volume resync to learn
+      // whether applying it would change anything worth confirming
+      await api.post(`/series/${seriesId}/refresh?wait=true`);
+      return api.get<VolumeResyncPreview>(`/series/${seriesId}/volumes/resync-preview`);
+    },
+    onSuccess: (preview) => {
+      invalidate();
+      const best = preview.candidates[0];
+      if (best?.has_changes) {
+        setResyncSource(best.source);
+        setResyncPreview(preview);
+      } else {
+        showWorkNotice("Refresh complete — volume assignments already match the best source.");
+      }
     },
   });
 
@@ -321,10 +448,12 @@ export default function SeriesDetail() {
   });
 
 
-  const resyncVolumes = useMutation({
-    mutationFn: () => api.post<VolumeResyncResult>(`/series/${seriesId}/volumes/resync`),
+  const applyResync = useMutation({
+    mutationFn: (source: string) =>
+      api.post<VolumeResyncResult>(`/series/${seriesId}/volumes/resync`, { source }),
     onSuccess: (res) => {
       setVolumeResult(res);
+      setResyncPreview(null);
       invalidate();
     },
   });
@@ -370,8 +499,8 @@ export default function SeriesDetail() {
   const activeDownloads = (queue ?? []).filter((item) => item.series_id === seriesId);
   const toolbarStatus =
     scan.isPending ? "Scanning disk" :
-    resyncVolumes.isPending ? "Resyncing volumes" :
-    refresh.isPending ? "Starting refresh" :
+    applyResync.isPending ? "Applying volume resync" :
+    refresh.isPending ? "Refreshing" :
     deleteSeries.isPending ? "Removing series" :
     toggleMonitor.isPending ? "Updating monitoring" :
     workNotice;
@@ -456,11 +585,11 @@ export default function SeriesDetail() {
       <Toolbar className="series-toolbar">
         <button
           className="btn"
-          title="Refresh metadata, source links, chapters, and library state"
+          title="Refresh metadata, source links, chapters, and library state; volume changes ask for confirmation"
           onClick={() => refresh.mutate()}
           disabled={refresh.isPending}
         >
-          ⟳ Refresh
+          {refresh.isPending ? "Refreshing…" : "⟳ Refresh"}
         </button>
         <button
           className="btn"
@@ -490,14 +619,6 @@ export default function SeriesDetail() {
           onClick={() => setShowCleanup(true)}
         >
           🧹 Clean up
-        </button>
-        <button
-          className="btn"
-          title="Rebuild chapter→volume assignments from source metadata"
-          onClick={() => resyncVolumes.mutate()}
-          disabled={resyncVolumes.isPending}
-        >
-          {resyncVolumes.isPending ? "Resyncing…" : "📚 Resync Volumes"}
         </button>
         <button
           className="btn"
@@ -711,6 +832,16 @@ export default function SeriesDetail() {
           chapterId={search.chapterId}
           title={search.title}
           onClose={() => setSearch(null)}
+        />
+      )}
+      {resyncPreview && (
+        <VolumeResyncModal
+          preview={resyncPreview}
+          source={resyncSource}
+          onPick={setResyncSource}
+          onApply={() => applyResync.mutate(resyncSource)}
+          applying={applyResync.isPending}
+          onClose={() => setResyncPreview(null)}
         />
       )}
       {showRename && (

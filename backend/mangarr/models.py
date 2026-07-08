@@ -67,6 +67,9 @@ class Series(Base):
     monitored: Mapped[bool] = mapped_column(Boolean, default=True)
     root_folder_id: Mapped[int | None] = mapped_column(ForeignKey("root_folders.id"), nullable=True)
     folder_name: Mapped[str] = mapped_column(String, default="")
+    # the folder was chosen explicitly by the user — scans must not re-adopt
+    # a title-matching existing folder over it
+    folder_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     root_folder: Mapped[RootFolder | None] = relationship(back_populates="series")
