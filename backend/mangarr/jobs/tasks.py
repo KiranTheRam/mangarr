@@ -223,20 +223,64 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
                 elif ch.released_at is None and released_at is not None:
                     ch.released_at = released_at
 
-    # backfill volume numbers for chapters that came from sources without
-    # volume data (e.g. WeebCentral, or MangaDex titles whose chapters are
-    # external and thus never appear in the feed). Volume archives already
-    # on disk extend the map past the sources' last anchor, so a library
-    # being adopted gets its later volumes mapped on the first pass instead
-    # of needing a manual volume resync.
-    if any(c.volume is None for c in existing.values()):
+    # Backfill volume numbers for chapters that came from sources without
+    # volume data, and add placeholder chapter rows for explicit volume-map
+    # chapters that fill gaps between known chapters. This covers licensed
+    # series where MangaDex aggregate knows chapter numbers/volumes, but the
+    # feed has no readable entries because chapters are external or removed.
+    needs_volume_map = (
+        added
+        or any(c.volume is None for c in existing.values())
+        or _has_internal_number_gap(existing)
+    )
+    if needs_volume_map:
         volume_map = await fetch_volume_map(series, values)
+        added += _add_volume_map_gap_chapters(series, existing, volume_map)
         volume_map = refine_volume_map_with_disk(series, volume_map)
         for number, ch in existing.items():
             if ch.volume is None and number in volume_map:
                 ch.volume = volume_map[number]
 
     await session.commit()
+    return added
+
+
+def _has_internal_number_gap(chapters: dict[float, Chapter], threshold: int = 3) -> bool:
+    """Whether known integer chapters have a meaningful internal gap.
+
+    Small holes are common for extras/decimal chapters; a larger gap is a
+    signal to consult explicit volume-map metadata for missing chapter rows.
+    """
+    numbers = sorted(
+        int(number) for number in chapters
+        if number > 0 and number == int(number)
+    )
+    return any(b - a > threshold for a, b in zip(numbers, numbers[1:]))
+
+
+def _add_volume_map_gap_chapters(
+    series: Series,
+    existing: dict[float, Chapter],
+    volume_map: dict[float, int],
+) -> int:
+    """Create missing chapters explicitly named by a selected volume map.
+
+    The map is not used to extend a series beyond the observed chapter span:
+    it only fills holes between chapters already seen from a chapter/release
+    source. That keeps MangaDex's all-language aggregate useful for licensed
+    gaps without turning it into a speculative chapter generator.
+    """
+    if not existing or not volume_map:
+        return 0
+    low, high = min(existing), max(existing)
+    added = 0
+    for number, volume in sorted(volume_map.items()):
+        if number in existing or number < low or number > high or number <= 0:
+            continue
+        ch = Chapter(number=number, volume=volume, monitored=series.monitored)
+        series.chapters.append(ch)
+        existing[number] = ch
+        added += 1
     return added
 
 
@@ -363,30 +407,41 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     await session.commit()
 
 
+# series ids with a full refresh in flight, so the UI can show what's
+# happening on an otherwise-empty freshly added series page. Endpoints that
+# spawn the task pre-mark the id (create_task doesn't start synchronously);
+# the task itself clears it.
+REFRESHING: set[int] = set()
+
+
 async def refresh_series_full(series_id: int, grab_missing: bool = False) -> None:
-    async with session_scope() as session:
-        series = await _load_series(session, series_id)
-        if series is None:
-            return
-        values = await registry.apply_settings(session)
-        try:
-            await refresh_series_metadata(session, series)
-        except Exception as exc:
-            log.warning("metadata refresh failed for series %d: %s", series_id, exc)
-        await link_sources(session, series, values)
-        await update_chapters(session, series, values)
-        # adopt existing on-disk files before the monitor considers grabbing
-        if values.get("library_scan_on_add", "true") == "true":
+    REFRESHING.add(series_id)
+    try:
+        async with session_scope() as session:
+            series = await _load_series(session, series_id)
+            if series is None:
+                return
+            values = await registry.apply_settings(session)
             try:
-                await scan_series_folder(session, series)
+                await refresh_series_metadata(session, series)
             except Exception as exc:
-                log.warning("library scan failed for series %d: %s", series_id, exc)
-        await reconcile_downloaded_files(session, series)
-        if grab_missing:
-            # explicit one-time search (e.g. "search for missing" at add time):
-            # runs even for unmonitored series, whose chapters carry
-            # monitored=False — the user asked for the missing content now
-            await grab_missing_chapters(session, series, values, only_monitored=False)
+                log.warning("metadata refresh failed for series %d: %s", series_id, exc)
+            await link_sources(session, series, values)
+            await update_chapters(session, series, values)
+            # adopt existing on-disk files before the monitor considers grabbing
+            if values.get("library_scan_on_add", "true") == "true":
+                try:
+                    await scan_series_folder(session, series)
+                except Exception as exc:
+                    log.warning("library scan failed for series %d: %s", series_id, exc)
+            await reconcile_downloaded_files(session, series)
+            if grab_missing:
+                # explicit one-time search (e.g. "search for missing" at add
+                # time): runs even for unmonitored series, whose chapters carry
+                # monitored=False — the user asked for the missing content now
+                await grab_missing_chapters(session, series, values, only_monitored=False)
+    finally:
+        REFRESHING.discard(series_id)
 
 
 async def scan_all_series() -> None:

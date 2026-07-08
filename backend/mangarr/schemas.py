@@ -61,6 +61,7 @@ class SeriesOut(BaseModel):
 class SeriesDetailOut(SeriesOut):
     chapters: list[ChapterOut] = []
     source_links: list[SourceLinkOut] = []
+    refreshing: bool = False  # a full refresh is running in the background
 
 
 class AddSeriesIn(BaseModel):

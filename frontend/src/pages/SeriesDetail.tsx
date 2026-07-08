@@ -265,12 +265,17 @@ function VolumeResyncModal({
   const selected =
     preview.candidates.find((c) => c.source === source) ?? preview.candidates[0];
   const vol = (v: number | null) => (v == null ? "—" : `Vol. ${v}`);
+  const bestHasChanges = preview.candidates[0]?.has_changes;
   return (
-    <Modal title="Confirm volume changes" onClose={onClose}>
+    <Modal title="Volume mappings" onClose={onClose}>
       <p style={{ color: "var(--text-dim)", marginBottom: 12 }}>
-        Refresh finished, and source volume data would change this series'
-        chapter–volume assignments or file coverage. Pick which source's
-        mapping to apply, or cancel to keep everything as it is.
+        {bestHasChanges
+          ? "Refresh finished, and source volume data would change this series' " +
+            "chapter–volume assignments or file coverage. Pick which source's " +
+            "mapping to apply, or cancel to keep everything as it is."
+          : "Refresh finished. Current volume assignments already match the best " +
+            "source, but you can still apply a different source's mapping below, " +
+            "or close to keep everything as it is."}
       </p>
 
       {preview.candidates.map((c, i) => (
@@ -401,7 +406,9 @@ export default function SeriesDetail() {
   const { data: series, isLoading } = useQuery({
     queryKey: ["series", seriesId],
     queryFn: () => api.get<SeriesDetailType>(`/series/${seriesId}`),
-    refetchInterval: 10000,
+    // poll fast while a background refresh is populating the page (e.g.
+    // right after adding the series), lazily otherwise
+    refetchInterval: (query) => (query.state.data?.refreshing ? 2000 : 10000),
   });
 
   const { data: queue } = useQuery({
@@ -429,12 +436,13 @@ export default function SeriesDetail() {
     },
     onSuccess: (preview) => {
       invalidate();
-      const best = preview.candidates[0];
-      if (best?.has_changes) {
-        setResyncSource(best.source);
+      // always offer the source options when any exist, so a resync can be
+      // triggered even when the current mapping already matches the best one
+      if (preview.candidates.length > 0) {
+        setResyncSource(preview.candidates[0].source);
         setResyncPreview(preview);
       } else {
-        showWorkNotice("Refresh complete — volume assignments already match the best source.");
+        showWorkNotice("Refresh complete — no linked source provides volume data.");
       }
     },
   });
@@ -497,15 +505,17 @@ export default function SeriesDetail() {
   }
   const isVolumeArchive = (path: string) => (fileCounts[path] ?? 0) > 1;
   const activeDownloads = (queue ?? []).filter((item) => item.series_id === seriesId);
-  const toolbarStatus =
-    scan.isPending ? "Scanning disk" :
-    applyResync.isPending ? "Applying volume resync" :
-    refresh.isPending ? "Refreshing" :
-    deleteSeries.isPending ? "Removing series" :
-    toggleMonitor.isPending ? "Updating monitoring" :
+  const busyNotice =
+    scan.isPending ? "Scanning disk and matching files…" :
+    applyResync.isPending ? "Applying volume resync…" :
+    refresh.isPending ? "Refreshing metadata, source links, and chapters…" :
+    deleteSeries.isPending ? "Removing series…" :
+    toggleMonitor.isPending ? "Updating monitoring…" :
+    series?.refreshing
+      ? "Setting up — fetching metadata, linking sources, and syncing chapters…" :
     workNotice;
   const hasTopBanners =
-    Boolean(workNotice || scanResult || volumeResult) || activeDownloads.length > 0;
+    Boolean(busyNotice || scanResult || volumeResult) || activeDownloads.length > 0;
 
   const chapterRows = (chapters: Chapter[]) => (
     <table className="data-table">
@@ -635,12 +645,6 @@ export default function SeriesDetail() {
         >
           {series.monitored ? "🔖 Monitored" : "◻ Unmonitored"}
         </button>
-        {toolbarStatus && (
-          <span className="toolbar-activity" title={toolbarStatus}>
-            <span className="mini-spinner" />
-            {toolbarStatus}
-          </span>
-        )}
         <button
           className="btn danger"
           title="Remove this series from Mangarr without deleting files"
@@ -654,11 +658,11 @@ export default function SeriesDetail() {
         </button>
       </Toolbar>
       <div className="content">
-        {workNotice && (
+        {busyNotice && (
           <div className="activity-banner">
             <span className="mini-spinner" />
             <strong>Working.</strong>
-            <span>{workNotice}</span>
+            <span>{busyNotice}</span>
           </div>
         )}
         {activeDownloads.length > 0 && (

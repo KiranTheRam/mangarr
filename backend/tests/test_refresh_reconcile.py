@@ -1,6 +1,8 @@
 import pytest
 
 from mangarr.jobs.tasks import (
+    _add_volume_map_gap_chapters,
+    _has_internal_number_gap,
     disk_volume_numbers,
     reconcile_downloaded_files,
     refine_volume_map_with_disk,
@@ -101,3 +103,46 @@ def test_refine_volume_map_without_disk_volumes_is_unchanged(tmp_path):
     series.chapters = [Chapter(id=1, series_id=1, number=1.0)]
     source_map = {1.0: 1}
     assert refine_volume_map_with_disk(series, source_map) == source_map
+
+
+def test_has_internal_number_gap_ignores_small_holes_and_decimals():
+    small_gap = {
+        1.0: Chapter(number=1.0),
+        1.5: Chapter(number=1.5),
+        3.0: Chapter(number=3.0),
+    }
+    large_gap = {
+        369.0: Chapter(number=369.0),
+        453.0: Chapter(number=453.0),
+    }
+
+    assert not _has_internal_number_gap(small_gap)
+    assert _has_internal_number_gap(large_gap)
+
+
+def test_add_volume_map_gap_chapters_only_inside_observed_span():
+    series = Series(id=1, title="Dragon Ball", monitored=True)
+    series.chapters = [
+        Chapter(id=1, series_id=1, number=369.0, volume=31),
+        Chapter(id=2, series_id=1, number=453.0, volume=38),
+    ]
+    existing = {c.number: c for c in series.chapters}
+    volume_map = {
+        100.0: 9,    # outside the observed span: do not invent it
+        369.0: 31,   # already exists
+        370.0: 31,
+        371.0: 32,
+        452.0: 38,
+        600.0: 50,   # outside the observed span: do not extend the series
+    }
+
+    added = _add_volume_map_gap_chapters(series, existing, volume_map)
+
+    assert added == 3
+    assert {370.0, 371.0, 452.0} <= set(existing)
+    assert existing[370.0].volume == 31
+    assert existing[371.0].volume == 32
+    assert existing[452.0].volume == 38
+    assert all(existing[n].monitored for n in (370.0, 371.0, 452.0))
+    assert 100.0 not in existing
+    assert 600.0 not in existing

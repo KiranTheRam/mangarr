@@ -48,6 +48,7 @@ export interface Series {
 export interface SeriesDetail extends Series {
   chapters: Chapter[];
   source_links: SourceLink[];
+  refreshing: boolean;
 }
 
 export interface MetadataResult {

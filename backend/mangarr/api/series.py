@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..db import get_session
-from ..jobs.tasks import refresh_series_full
+from ..jobs.tasks import REFRESHING, refresh_series_full
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
 from ..models import Chapter, Series, SeriesFolder, SeriesStatus
@@ -117,6 +117,9 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
     # link sources + fetch chapters in the background; "search now" adds queue
     # available missing chapters as soon as the library scan and metadata
     # refresh have run, instead of waiting for the next monitor interval.
+    # Pre-mark so the series page the UI jumps to shows the work in progress
+    # even before the task's first tick.
+    REFRESHING.add(series.id)
     asyncio.get_running_loop().create_task(
         refresh_series_full(series.id, grab_missing=body.search_now)
     )
@@ -137,6 +140,7 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
     out.chapter_count = len(series.chapters)
     out.downloaded_count = sum(1 for c in series.chapters if c.downloaded)
+    out.refreshing = series_id in REFRESHING
     return out
 
 
@@ -193,6 +197,7 @@ async def refresh_series(
         # (e.g. the volume-resync preview right after a refresh)
         await refresh_series_full(series_id)
         return {"status": "refreshed"}
+    REFRESHING.add(series_id)
     asyncio.get_running_loop().create_task(refresh_series_full(series_id))
     return {"status": "refreshing"}
 

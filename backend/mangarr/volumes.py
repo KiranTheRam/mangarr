@@ -2,12 +2,13 @@
 
 Volume→chapter data (MangaDex /aggregate is the only structured source;
 MangaUpdates contributes sparse per-release volume tags) is community-entered
-and varies wildly in completeness per source. mangarr does not guess: each
-source's map is sanitized (a lone mislabeled chapter — e.g. one scanlation
-tagging chapter 232 as volume 1 — breaks volume monotonicity in chapter order
-and is dropped), and then the single most complete source's assignments are
-applied verbatim. Chapters no source can place stay unassigned rather than
-being distributed by heuristics.
+and varies wildly in completeness per source. mangarr does not guess ranges:
+each source's map is sanitized (a lone mislabeled chapter — e.g. one
+scanlation tagging chapter 232 as volume 1 — breaks volume monotonicity in
+chapter order and is dropped), and then the single most complete source's
+assignments are applied verbatim. Explicit chapter numbers from that map may
+fill gaps between chapters seen from chapter/release sources; chapters no
+source can name stay unassigned rather than being distributed by heuristics.
 
 The one exception is the user's own files: volume archives already on disk
 prove those volumes exist, and distribute_over_disk_volumes() uses their
