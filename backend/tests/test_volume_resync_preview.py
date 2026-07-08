@@ -47,6 +47,20 @@ def test_run_resync_counts_and_diff(tmp_path):
     assert chapters[1].volume == 2
 
 
+def test_dry_run_copies_carry_the_full_resulting_mapping(tmp_path):
+    """The preview's full-mapping view is read off the dry-run copies after
+    _run_resync — they must hold every chapter's post-apply volume, including
+    ones the map doesn't place (shown as unassigned)."""
+    series, chapters = make_series(tmp_path)
+    new_map = {1.0: 1, 2.0: 2}  # ch3 deliberately unplaced
+
+    copies = _chapter_copies(chapters)
+    _run_resync(series, copies, new_map)
+
+    mapping = sorted((c.number, c.volume) for c in copies)
+    assert mapping == [(1.0, 1), (2.0, 2), (3.0, None)]
+
+
 def test_dry_run_on_copies_leaves_real_chapters_untouched(tmp_path):
     series, chapters = make_series(tmp_path)
     new_map = {1.0: 1, 2.0: 2, 3.0: 2}

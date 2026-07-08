@@ -339,6 +339,12 @@ class VolumeDiffRowOut(BaseModel):
     new_volume: int | None
 
 
+class VolumeMappingRowOut(BaseModel):
+    """One chapter's volume assignment as it would stand after the resync."""
+    number: float
+    volume: int | None
+
+
 class VolumeCandidateOut(BaseModel):
     """Dry-run outcome of applying one source's volume map."""
     source: str
@@ -349,6 +355,9 @@ class VolumeCandidateOut(BaseModel):
     cleared: int
     has_changes: bool  # would touch assignments or file coverage
     diff: list[VolumeDiffRowOut]
+    # the complete resulting chapter→volume picture (every chapter, in
+    # order), so the preview can show the whole mapping, not just the diff
+    mapping: list[VolumeMappingRowOut]
 
 
 class VolumeResyncPreviewOut(BaseModel):

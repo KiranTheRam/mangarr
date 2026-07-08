@@ -8,6 +8,7 @@ import type {
   Release,
   ScanResult,
   SeriesDetail as SeriesDetailType,
+  VolumeMappingRow,
   VolumeResyncPreview,
   VolumeResyncResult,
 } from "../api/types";
@@ -248,6 +249,26 @@ function InteractiveSearch({
   );
 }
 
+function chapterNumberLabel(n: number): string {
+  return Number.isInteger(n) ? n.toString() : n.toFixed(1);
+}
+
+// contiguous chapter runs sharing a volume, in chapter order — the compact
+// form of a full chapter→volume mapping ("Vol. 2 · Ch. 11–18")
+function mappingRuns(mapping: VolumeMappingRow[]) {
+  const runs: { volume: number | null; start: number; end: number; count: number }[] = [];
+  for (const row of [...mapping].sort((a, b) => a.number - b.number)) {
+    const last = runs[runs.length - 1];
+    if (last && last.volume === row.volume) {
+      last.end = row.number;
+      last.count += 1;
+    } else {
+      runs.push({ volume: row.volume, start: row.number, end: row.number, count: 1 });
+    }
+  }
+  return runs;
+}
+
 function VolumeResyncModal({
   preview,
   source,
@@ -267,6 +288,10 @@ function VolumeResyncModal({
     preview.candidates.find((c) => c.source === source) ?? preview.candidates[0];
   const vol = (v: number | null) => (v == null ? "—" : `Vol. ${v}`);
   const bestHasChanges = preview.candidates[0]?.has_changes;
+  // when nothing would change, the interesting view is the mapping itself
+  const [view, setView] = useState<"changes" | "mapping">(
+    bestHasChanges ? "changes" : "mapping",
+  );
   return (
     <Modal title="Volume mappings" onClose={onClose}>
       <p style={{ color: "var(--text-dim)", marginBottom: 12 }}>
@@ -322,7 +347,56 @@ function VolumeResyncModal({
               `, leaves ${selected.cleared} chapter${selected.cleared === 1 ? "" : "s"} no longer backed by a file`}
             .
           </div>
-          {selected.diff.length > 0 && (
+          <div style={{ display: "flex", gap: 8, margin: "10px 0 8px" }}>
+            <button
+              className={`btn sm${view === "changes" ? " primary" : ""}`}
+              onClick={() => setView("changes")}
+            >
+              Changes ({selected.diff.length})
+            </button>
+            <button
+              className={`btn sm${view === "mapping" ? " primary" : ""}`}
+              onClick={() => setView("mapping")}
+            >
+              Full mapping ({selected.mapping.length} chapters)
+            </button>
+          </div>
+          {view === "changes" ? (
+            selected.diff.length > 0 ? (
+              <div
+                style={{
+                  maxHeight: 280,
+                  overflowY: "auto",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                }}
+              >
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: "left" }}>Chapter</th>
+                      <th style={{ textAlign: "left" }}>Current</th>
+                      <th style={{ textAlign: "left" }}>New</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selected.diff.map((row) => (
+                      <tr key={row.number}>
+                        <td>{chapterLabel(row.number)}</td>
+                        <td>{vol(row.old_volume)}</td>
+                        <td>{vol(row.new_volume)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p style={{ color: "var(--text-dim)" }}>
+                No changes — {selected.source}'s mapping matches the current volume
+                assignments.
+              </p>
+            )
+          ) : (
             <div
               style={{
                 maxHeight: 280,
@@ -334,17 +408,29 @@ function VolumeResyncModal({
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th style={{ textAlign: "left" }}>Chapter</th>
-                    <th style={{ textAlign: "left" }}>Current</th>
-                    <th style={{ textAlign: "left" }}>New</th>
+                    <th style={{ textAlign: "left", width: 120 }}>Volume</th>
+                    <th style={{ textAlign: "left" }}>Chapters</th>
+                    <th style={{ textAlign: "left", width: 120 }}></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {selected.diff.map((row) => (
-                    <tr key={row.number}>
-                      <td>{chapterLabel(row.number)}</td>
-                      <td>{vol(row.old_volume)}</td>
-                      <td>{vol(row.new_volume)}</td>
+                  {mappingRuns(selected.mapping).map((run, i) => (
+                    <tr key={i}>
+                      <td>
+                        {run.volume == null ? (
+                          <span style={{ color: "var(--text-faint)" }}>Unassigned</span>
+                        ) : (
+                          `Vol. ${run.volume}`
+                        )}
+                      </td>
+                      <td>
+                        {run.start === run.end
+                          ? `Ch. ${chapterNumberLabel(run.start)}`
+                          : `Ch. ${chapterNumberLabel(run.start)}–${chapterNumberLabel(run.end)}`}
+                      </td>
+                      <td style={{ color: "var(--text-dim)" }}>
+                        {run.count} chapter{run.count === 1 ? "" : "s"}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -520,6 +606,12 @@ export default function SeriesDetail() {
   const groups = hasVolumes
     ? groupByVolume(series.chapters)
     : [{ volume: null, chapters: [...series.chapters].sort((a, b) => b.number - a.number) }];
+
+  const groupKey = (volume: number | null) => (volume === null ? "none" : String(volume));
+  const allCollapsed =
+    hasVolumes && groups.every(({ volume }) => collapsed[groupKey(volume)] ?? false);
+  const setAllCollapsed = (value: boolean) =>
+    setCollapsed(Object.fromEntries(groups.map(({ volume }) => [groupKey(volume), value])));
 
   // how many chapters share each file — a file used by >1 chapter is a
   // whole-volume archive (those chapters have no individual file of their own)
@@ -796,8 +888,18 @@ export default function SeriesDetail() {
         ) : !hasVolumes ? (
           chapterRows(groups[0].chapters)
         ) : (
-          groups.map(({ volume, chapters }) => {
-            const key = volume === null ? "none" : String(volume);
+          <>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
+            <button
+              className="btn sm"
+              title={allCollapsed ? "Expand every volume section" : "Collapse every volume section"}
+              onClick={() => setAllCollapsed(!allCollapsed)}
+            >
+              {allCollapsed ? "▸ Expand all" : "▾ Collapse all"}
+            </button>
+          </div>
+          {groups.map(({ volume, chapters }) => {
+            const key = groupKey(volume);
             const isCollapsed = collapsed[key] ?? false;
             const downloaded = chapters.filter((c) => c.downloaded).length;
             const allMonitored = chapters.every((c) => c.monitored);
@@ -853,7 +955,8 @@ export default function SeriesDetail() {
                 {!isCollapsed && chapterRows(chapters)}
               </div>
             );
-          })
+          })}
+          </>
         )}
       </div>
 

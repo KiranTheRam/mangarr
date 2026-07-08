@@ -46,6 +46,7 @@ from ..schemas import (
     SourceLinkOut,
     VolumeCandidateOut,
     VolumeDiffRowOut,
+    VolumeMappingRowOut,
     VolumeResyncIn,
     VolumeResyncOut,
     VolumeResyncPreviewOut,
@@ -528,15 +529,18 @@ async def resync_volumes_preview(series_id: int, session: AsyncSession = Depends
         if not cleaned:
             continue
         refined = refine_volume_map_with_disk(series, cleaned)
-        assigned, changed, repointed, cleared, diff = _run_resync(
-            series, _chapter_copies(series.chapters), refined
-        )
+        copies = _chapter_copies(series.chapters)
+        assigned, changed, repointed, cleared, diff = _run_resync(series, copies, refined)
         candidates.append(VolumeCandidateOut(
             source=name, map_size=len(cleaned),
             assigned=assigned, changed=changed, repointed=repointed, cleared=cleared,
             has_changes=bool(changed or repointed or cleared),
             diff=[VolumeDiffRowOut(number=n, old_volume=old, new_volume=new)
                   for n, old, new in diff],
+            # the dry-run copies now hold the post-apply state — that, not the
+            # raw source map, is the full mapping the user would end up with
+            mapping=[VolumeMappingRowOut(number=c.number, volume=c.volume)
+                     for c in sorted(copies, key=lambda c: c.number)],
         ))
     return VolumeResyncPreviewOut(candidates=candidates)
 

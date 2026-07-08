@@ -156,6 +156,11 @@ export interface VolumeDiffRow {
   new_volume: number | null;
 }
 
+export interface VolumeMappingRow {
+  number: number;
+  volume: number | null;
+}
+
 export interface VolumeCandidate {
   source: string;
   map_size: number;
@@ -165,6 +170,7 @@ export interface VolumeCandidate {
   cleared: number;
   has_changes: boolean;
   diff: VolumeDiffRow[];
+  mapping: VolumeMappingRow[];
 }
 
 export interface VolumeResyncPreview {
