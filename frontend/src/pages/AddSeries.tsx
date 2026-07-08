@@ -5,6 +5,7 @@ import { api } from "../api/client";
 import type { FolderPreview, MetadataResult, RootFolder } from "../api/types";
 import { FolderBrowser } from "../components/FolderBrowser";
 import { EmptyState, Modal, Spinner, Toggle, Toolbar, statusPill } from "../components/common";
+import { sanitizeDescription } from "../sanitize";
 
 function AddSeriesModal({
   result,
@@ -301,7 +302,10 @@ export default function AddSeries() {
                       {g}
                     </span>
                   ))}
-                  <div className="desc" dangerouslySetInnerHTML={{ __html: r.description }} />
+                  <div
+                    className="desc"
+                    dangerouslySetInnerHTML={{ __html: sanitizeDescription(r.description) }}
+                  />
                 </div>
                 {r.in_library && (
                   <div style={{ alignSelf: "center" }}>

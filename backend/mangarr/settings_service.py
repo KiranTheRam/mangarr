@@ -53,6 +53,35 @@ DEFAULTS: dict[str, str] = {
 SECRET_KEYS = {"mangadex_client_secret", "mangadex_password", "qbittorrent_password"}
 
 
+def validate(values: dict[str, str]) -> None:
+    """Reject values that would break things later if stored: a bad naming
+    template fails every download at rename time, and a non-numeric monitor
+    interval would abort scheduler startup. Raises ValueError."""
+    from .library.naming import chapter_filename
+
+    for key in ("naming_template", "naming_template_no_volume"):
+        if key not in values:
+            continue
+        template = values[key]
+        try:
+            # render with and without a volume — both paths must work
+            chapter_filename(template, template, "Sample Series", 12.5, 3, "Title")
+            chapter_filename(template, template, "Sample Series", 12.5, None, "Title")
+        except (KeyError, ValueError, IndexError) as exc:
+            raise ValueError(
+                f"{key} is not a valid template (use {{series}}, {{volume}}, "
+                f"{{chapter}}, {{title}}): {exc}"
+            ) from exc
+    if "monitor_interval_minutes" in values:
+        raw = values["monitor_interval_minutes"]
+        try:
+            minutes = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError("monitor_interval_minutes must be a whole number") from None
+        if minutes < 1:
+            raise ValueError("monitor_interval_minutes must be at least 1")
+
+
 async def get_all(session: AsyncSession) -> dict[str, str]:
     rows = (await session.execute(select(Setting))).scalars().all()
     values = dict(DEFAULTS)

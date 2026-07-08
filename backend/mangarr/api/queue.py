@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
 from ..download.qbittorrent import QbtClient
-from ..jobs.tasks import enqueue_direct, enqueue_torrent
+from ..jobs.tasks import REMOVED_BY_USER, enqueue_direct, enqueue_torrent
 from ..models import (
     Chapter,
     Download,
@@ -46,16 +46,22 @@ async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
 
     Direct downloads that are merely queued never start (the queue worker only
     picks up QUEUED items); active torrents are also deleted from qBittorrent
-    along with their partial data so 'remove' really stops the transfer."""
-    result = await session.execute(select(Download).where(Download.id.in_(ids)))
+    along with their partial data so 'remove' really stops the transfer.
+
+    The REMOVED_BY_USER error text is significant: the monitor's retry logic
+    ignores it, so cancelling a queued grab doesn't blacklist that source for
+    the chapter the way a real download failure does."""
+    result = await session.execute(
+        select(Download).where(Download.id.in_(ids), Download.status.in_(ACTIVE))
+    )
     downloads = result.scalars().all()
     hashes = [
         dl.torrent_hash for dl in downloads
-        if dl.kind == DownloadKind.TORRENT and dl.torrent_hash and dl.status in ACTIVE
+        if dl.kind == DownloadKind.TORRENT and dl.torrent_hash
     ]
     for dl in downloads:
         dl.status = DownloadStatus.FAILED
-        dl.error = "removed by user"
+        dl.error = REMOVED_BY_USER
     await session.commit()
     if hashes:
         values = await registry.apply_settings(session)

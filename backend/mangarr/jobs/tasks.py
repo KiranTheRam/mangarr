@@ -2,9 +2,12 @@
 processing, qBittorrent sync, and the monitor loop."""
 
 import asyncio
+import base64
+import binascii
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -28,14 +31,43 @@ from ..models import (
     SeriesStatus,
 )
 from ..sources import registry
-from ..sources.base import DirectSource
-from ..titles import split_alt_titles, title_queries
+from ..sources.base import DirectSource, SourceChapter
+from ..titles import plausible_title_match, split_alt_titles, title_queries
 from ..util import normalize_title
 from ..volumes import distribute_over_disk_volumes, select_volume_map
 
 log = logging.getLogger(__name__)
 
 BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
+
+# error text marking a download the user cancelled — it must not count as a
+# source failure (which would stop the monitor from ever retrying that
+# chapter on that source)
+REMOVED_BY_USER = "removed by user"
+
+# a failed grab blocks that (chapter, source) pair, but not forever — sources
+# fix broken chapters, so retry after a while (one request per window is cheap)
+FAILED_GRAB_RETRY_AFTER = timedelta(days=7)
+
+# metadata (status, chapter/volume totals) goes stale without this; refreshed
+# lazily during monitor passes rather than all at once
+METADATA_REFRESH_AFTER = timedelta(days=7)
+
+# one monitor/refresh pass fetches each source's chapter list once and shares
+# it between update_chapters() and grab_missing_chapters()
+ChapterListCache = dict[tuple[str, str], list[SourceChapter]]
+
+
+async def _list_chapters_cached(
+    src: DirectSource, external_id: str, cache: ChapterListCache | None
+) -> list[SourceChapter]:
+    key = (src.name, external_id)
+    if cache is not None and key in cache:
+        return cache[key]
+    chapters = await src.list_chapters(external_id)
+    if cache is not None:
+        cache[key] = chapters
+    return chapters
 
 
 # ---------------------------------------------------------------- metadata
@@ -83,7 +115,17 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
             known = set(series.alt_titles.split("\n"))
             extra = [t for t in mu_meta.alt_titles if t and t not in known]
             series.alt_titles = "\n".join(filter(None, [series.alt_titles, *extra]))
+    series.metadata_refreshed_at = datetime.now(timezone.utc)
     await session.commit()
+
+
+def _metadata_is_stale(series: Series) -> bool:
+    if series.metadata_refreshed_at is None:
+        return True
+    refreshed = series.metadata_refreshed_at
+    if refreshed.tzinfo is None:  # SQLite returns naive datetimes
+        refreshed = refreshed.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - refreshed > METADATA_REFRESH_AFTER
 
 
 async def link_mangaupdates(series: Series) -> bool:
@@ -112,8 +154,22 @@ def _titles_of(series: Series) -> list[str]:
     return title_queries(series.title, split_alt_titles(series.alt_titles))
 
 
-async def link_sources(session: AsyncSession, series: Series, values: dict[str, str]) -> None:
-    """Auto-match the series on every enabled direct source it isn't linked to."""
+# (series_id, source_name) → monotonic time before which auto-linking should
+# not retry a source that yielded no match. Searching every source for every
+# unlinkable series each monitor cycle is pure waste; the map is in-memory,
+# so a restart (or an explicit user refresh, which bypasses it) retries.
+LINK_RETRY_AFTER_SECONDS = 24 * 3600.0
+_link_retry_at: dict[tuple[int, str], float] = {}
+
+
+async def link_sources(
+    session: AsyncSession, series: Series, values: dict[str, str],
+    respect_backoff: bool = False,
+) -> None:
+    """Auto-match the series on every enabled direct source it isn't linked to.
+
+    `respect_backoff=True` (the scheduled monitor) skips sources that recently
+    yielded no match; user-driven refreshes pass False to always retry."""
     linked = {sl.source_name for sl in series.source_links}
     titles = _titles_of(series)
     # normalized titles that are empty (e.g. a title written only in CJK) must
@@ -123,7 +179,11 @@ async def link_sources(session: AsyncSession, series: Series, values: dict[str, 
     for src in registry.enabled_direct_sources(values):
         if src.name in linked:
             continue
+        backoff_key = (series.id, src.name)
+        if respect_backoff and time.monotonic() < _link_retry_at.get(backoff_key, 0.0):
+            continue
         match = None
+        searched = False
         # try each known title variant until the source yields a match
         for query in titles[:4]:
             nq = normalize_title(query)
@@ -134,20 +194,25 @@ async def link_sources(session: AsyncSession, series: Series, values: dict[str, 
             except Exception as exc:
                 log.warning("source %s search failed for %r: %s", src.name, query, exc)
                 break
+            searched = True
             for cand in candidates:
                 cand_titles = {n for t in [cand.title, *cand.alt_titles] if (n := normalize_title(t))}
                 if wanted & cand_titles:
                     match = cand
                     break
-            if match is None and candidates and len(nq) >= 4:
-                # fall back to the top result only if it shares a real title
-                # prefix (guard the length so short/empty queries can't match)
+            if match is None and candidates:
+                # fall back to the top result only when its title plausibly IS
+                # this series (spacing variants etc.) — a bare shared prefix
+                # must not link "Berserk" to "Berserk of Gluttony"
                 top = candidates[0]
-                if normalize_title(top.title).startswith(nq[:12]):
+                if plausible_title_match(top.title, query):
                     match = top
             if match:
                 break
+        if match is None and searched:
+            _link_retry_at[backoff_key] = time.monotonic() + LINK_RETRY_AFTER_SECONDS
         if match:
+            _link_retry_at.pop(backoff_key, None)
             from ..models import SeriesSourceLink
 
             # append via the relationship so the in-memory collection is
@@ -166,7 +231,10 @@ async def link_sources(session: AsyncSession, series: Series, values: dict[str, 
 
 # ------------------------------------------------------------- chapter sync
 
-async def update_chapters(session: AsyncSession, series: Series, values: dict[str, str]) -> int:
+async def update_chapters(
+    session: AsyncSession, series: Series, values: dict[str, str],
+    chapter_cache: ChapterListCache | None = None,
+) -> int:
     """Union chapter lists from linked sources into the DB. Returns # new."""
     existing = {c.number: c for c in series.chapters}
     added = 0
@@ -176,7 +244,7 @@ async def update_chapters(session: AsyncSession, series: Series, values: dict[st
         if link is None:
             continue
         try:
-            source_chapters = await src.list_chapters(link.external_id)
+            source_chapters = await _list_chapters_cached(src, link.external_id, chapter_cache)
         except Exception as exc:
             log.warning("chapter list failed on %s for %r: %s", src.name, series.title, exc)
             continue
@@ -426,8 +494,12 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
                 await refresh_series_metadata(session, series)
             except Exception as exc:
                 log.warning("metadata refresh failed for series %d: %s", series_id, exc)
+                # a failed commit (e.g. a duplicate mangaupdates id hitting the
+                # unique index) leaves the session unusable until rolled back
+                await session.rollback()
+            chapter_cache: ChapterListCache = {}
             await link_sources(session, series, values)
-            await update_chapters(session, series, values)
+            await update_chapters(session, series, values, chapter_cache)
             # adopt existing on-disk files before the monitor considers grabbing
             if values.get("library_scan_on_add", "true") == "true":
                 try:
@@ -439,7 +511,14 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
                 # explicit one-time search (e.g. "search for missing" at add
                 # time): runs even for unmonitored series, whose chapters carry
                 # monitored=False — the user asked for the missing content now
-                await grab_missing_chapters(session, series, values, only_monitored=False)
+                await grab_missing_chapters(
+                    session, series, values, only_monitored=False,
+                    chapter_cache=chapter_cache,
+                )
+    except Exception:
+        # this runs as a fire-and-forget task: without this, the exception
+        # would only surface when the task object is garbage-collected
+        log.exception("full refresh of series %d failed", series_id)
     finally:
         REFRESHING.discard(series_id)
 
@@ -472,30 +551,13 @@ async def _load_series(session: AsyncSession, series_id: int) -> Series | None:
 
 # ------------------------------------------------------------------- grabs
 
-async def find_release_for_chapter(
-    series: Series, chapter: Chapter, values: dict[str, str]
-) -> tuple[DirectSource, str, str] | None:
-    """Best direct release: (source, chapter_external_id, url), by priority."""
-    links = {sl.source_name: sl for sl in series.source_links}
-    for src in registry.enabled_direct_sources(values):
-        link = links.get(src.name)
-        if link is None:
-            continue
-        try:
-            source_chapters = await src.list_chapters(link.external_id)
-        except Exception as exc:
-            log.warning("list_chapters failed on %s: %s", src.name, exc)
-            continue
-        for sc in source_chapters:
-            if sc.number == chapter.number:
-                return src, sc.external_id, sc.url
-    return None
-
-
 async def enqueue_direct(
     session: AsyncSession, series: Series, chapter: Chapter,
     source_name: str, external_id: str, url: str = "",
+    commit: bool = True,
 ) -> Download:
+    """Queue a direct download. `commit=False` lets bulk callers (the monitor)
+    batch many grabs into one commit."""
     dl = Download(
         series_id=series.id,
         chapter_id=chapter.id,
@@ -510,15 +572,31 @@ async def enqueue_direct(
         series_id=series.id, chapter_id=chapter.id, event="grabbed",
         source_name=source_name, detail=url or external_id,
     ))
-    await session.commit()
+    if commit:
+        await session.commit()
     return dl
+
+
+def magnet_btih_hex(magnet: str) -> str:
+    """The magnet's info-hash in the lowercase hex form qBittorrent reports.
+    Base32 hashes (older magnet links) are converted — matching against
+    qBittorrent by their raw form would never succeed."""
+    m = BTIH_RE.search(magnet)
+    if not m:
+        return ""
+    raw = m.group(1)
+    if len(raw) == 40:
+        return raw.lower()
+    try:
+        return base64.b32decode(raw).hex()
+    except (binascii.Error, ValueError):
+        return ""
 
 
 async def enqueue_torrent(
     session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
 ) -> Download:
-    m = BTIH_RE.search(magnet)
-    torrent_hash = m.group(1).lower() if m else ""
+    torrent_hash = magnet_btih_hex(magnet)
     client = QbtClient(
         values["qbittorrent_url"], values["qbittorrent_username"], values["qbittorrent_password"]
     )
@@ -592,13 +670,6 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     dl.status = DownloadStatus.DOWNLOADING
     await session.commit()
 
-    dest = chapter_path(
-        Path(root),
-        values["naming_template"], values["naming_template_no_volume"],
-        series.title, series.folder_name,
-        chapter.number, chapter.volume, chapter.title,
-    )
-
     progress_lock = asyncio.Lock()
     last_progress_commit = 0.0
 
@@ -619,12 +690,24 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             await session.commit()
 
     try:
+        # inside the try: a broken naming template must fail THIS download
+        # (visibly, with an error) instead of crashing the queue worker and
+        # leaving the row stuck in "downloading"
+        dest = chapter_path(
+            Path(root),
+            values["naming_template"], values["naming_template_no_volume"],
+            series.title, series.folder_name,
+            chapter.number, chapter.volume, chapter.title,
+        )
         await download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
             progress_cb=on_progress, web_url="",
         )
     except Exception as exc:
         log.exception("direct download %d failed", dl.id)
+        # a progress commit may have been cancelled mid-flight when the page
+        # fetches were torn down; reset the session before recording failure
+        await session.rollback()
         dl.status = DownloadStatus.FAILED
         dl.error = str(exc)[:500]
         session.add(HistoryEvent(
@@ -646,6 +729,20 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
 
 
 # --------------------------------------------------------------- qbt sync
+
+# a torrent this long gone from qBittorrent (deleted there, or an add that
+# never registered) will not come back; without a limit the download would sit
+# in "downloading" forever — and a series-level zombie blocks all grabs for
+# its series. Counters are in-memory: a restart just re-counts from zero.
+TORRENT_MISSING_LIMIT = 8  # consecutive sync passes (~1 min at 8s intervals)
+_torrent_missing_counts: dict[int, int] = {}
+
+# completed torrents whose content path isn't visible from this container may
+# just be a slow mount — but after this many passes it's a config problem, so
+# fail with the path in the error instead of retrying silently forever
+IMPORT_PATH_MISSING_LIMIT = 40  # ~5 min at 8s intervals
+_import_path_missing_counts: dict[int, int] = {}
+
 
 async def sync_qbittorrent() -> None:
     async with session_scope() as session:
@@ -672,7 +769,17 @@ async def sync_qbittorrent() -> None:
                     continue
                 torrent = await client.get_torrent(dl.torrent_hash)
                 if torrent is None:
+                    misses = _torrent_missing_counts.get(dl.id, 0) + 1
+                    _torrent_missing_counts[dl.id] = misses
+                    if misses >= TORRENT_MISSING_LIMIT:
+                        _torrent_missing_counts.pop(dl.id, None)
+                        dl.status = DownloadStatus.FAILED
+                        dl.error = "torrent not found in qBittorrent (removed externally?)"
+                        log.warning("torrent download %d (%r) vanished from qBittorrent; "
+                                    "marking failed", dl.id, dl.title)
+                        await session.commit()
                     continue
+                _torrent_missing_counts.pop(dl.id, None)
                 dl.progress = torrent.progress
                 if torrent.is_complete and torrent.content_path:
                     dl.status = DownloadStatus.IMPORTING
@@ -694,10 +801,20 @@ async def _import_torrent(
         await session.commit()
         return
     if not content_path.exists():
-        # path as seen by qBittorrent may not be mounted here yet
-        dl.error = f"content path not found: {content_path}"
+        # path as seen by qBittorrent may not be mounted here yet — retry a
+        # while, then fail visibly (a path mapping problem never resolves)
+        misses = _import_path_missing_counts.get(dl.id, 0) + 1
+        _import_path_missing_counts[dl.id] = misses
+        if misses >= IMPORT_PATH_MISSING_LIMIT:
+            _import_path_missing_counts.pop(dl.id, None)
+            dl.status = DownloadStatus.FAILED
+            dl.error = (f"content path not visible from mangarr: {content_path} — "
+                        "check that qBittorrent's download path is mounted here")
+        else:
+            dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
+    _import_path_missing_counts.pop(dl.id, None)
     try:
         imported = import_torrent_payload(
             content_path, series, list(series.chapters), Path(series.root_folder.path),
@@ -734,6 +851,7 @@ async def _import_torrent(
 async def grab_missing_chapters(
     session: AsyncSession, series: Series, values: dict[str, str],
     only_monitored: bool = True,
+    chapter_cache: ChapterListCache | None = None,
 ) -> int:
     """Queue missing monitored chapters from linked direct sources.
 
@@ -767,13 +885,17 @@ async def grab_missing_chapters(
     if not wanted:
         return 0
 
-    # a chapter that already failed on a source shouldn't be retried there —
-    # fall through to the next source instead.
+    # a chapter that recently failed on a source shouldn't be retried there —
+    # fall through to the next source instead. Old failures expire (sources
+    # fix broken chapters), and user cancellations don't count as failures.
+    retry_cutoff = datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER
     result = await session.execute(
         select(Download.chapter_id, Download.source_name).where(
             Download.series_id == series.id,
             Download.status == DownloadStatus.FAILED,
             Download.chapter_id.isnot(None),
+            Download.error != REMOVED_BY_USER,
+            Download.updated_at >= retry_cutoff,
         )
     )
     failed_pairs = {(cid, name) for cid, name in result.all()}
@@ -788,7 +910,7 @@ async def grab_missing_chapters(
         if link is None:
             continue
         try:
-            source_chapters = await src.list_chapters(link.external_id)
+            source_chapters = await _list_chapters_cached(src, link.external_id, chapter_cache)
         except Exception as exc:
             log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
             continue
@@ -797,9 +919,12 @@ async def grab_missing_chapters(
             if ch is None or (ch.id, src.name) in failed_pairs:
                 continue
             remaining.pop(sc.number, None)
-            await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url)
+            await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url,
+                                 commit=False)
             queued += 1
-    if queued == 0:
+    if queued:
+        await session.commit()
+    else:
         # e.g. only MangaDex is linked but its chapters are all external —
         # say so instead of failing silently
         log.info("monitor: no linked source serves any of the %d missing chapter(s) of %r",
@@ -807,25 +932,56 @@ async def grab_missing_chapters(
     return queued
 
 
+async def recover_interrupted_downloads() -> None:
+    """Startup pass: direct downloads left mid-flight by a crash/restart go
+    back to queued (the worker only picks up QUEUED, so they would otherwise
+    sit in 'downloading' forever — and block re-grabs of their chapters)."""
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Download).where(
+                Download.kind == DownloadKind.DIRECT,
+                Download.status == DownloadStatus.DOWNLOADING,
+            )
+        )
+        stuck = result.scalars().all()
+        for dl in stuck:
+            dl.status = DownloadStatus.QUEUED
+            dl.progress = 0.0
+        if stuck:
+            await session.commit()
+            log.info("Requeued %d direct download(s) interrupted by restart", len(stuck))
+
+
 async def monitor_all() -> None:
     """Refresh monitored series and grab missing monitored chapters."""
     async with session_scope() as session:
-        values = await registry.apply_settings(session)
         result = await session.execute(select(Series.id).where(Series.monitored == True))  # noqa: E712
         series_ids = [row[0] for row in result.all()]
 
     for series_id in series_ids:
-        async with session_scope() as session:
-            values = await registry.apply_settings(session)
-            series = await _load_series(session, series_id)
-            if series is None:
-                continue
-            await link_sources(session, series, values)
-            await update_chapters(session, series, values)
-            # adopt whatever is on disk before deciding what's missing, so
-            # files that appeared since the last pass aren't re-downloaded
-            try:
-                await scan_series_folder(session, series)
-            except Exception as exc:
-                log.warning("library scan failed for series %d: %s", series_id, exc)
-            await grab_missing_chapters(session, series, values)
+        try:
+            async with session_scope() as session:
+                values = await registry.apply_settings(session)
+                series = await _load_series(session, series_id)
+                if series is None:
+                    continue
+                if _metadata_is_stale(series):
+                    try:
+                        await refresh_series_metadata(session, series)
+                    except Exception as exc:
+                        log.warning("metadata refresh failed for series %d: %s", series_id, exc)
+                        await session.rollback()
+                chapter_cache: ChapterListCache = {}
+                await link_sources(session, series, values, respect_backoff=True)
+                await update_chapters(session, series, values, chapter_cache)
+                # adopt whatever is on disk before deciding what's missing, so
+                # files that appeared since the last pass aren't re-downloaded
+                try:
+                    await scan_series_folder(session, series)
+                except Exception as exc:
+                    log.warning("library scan failed for series %d: %s", series_id, exc)
+                await grab_missing_chapters(session, series, values,
+                                            chapter_cache=chapter_cache)
+        except Exception:
+            # one broken series must not abort the whole monitor pass
+            log.exception("monitor pass failed for series %d", series_id)

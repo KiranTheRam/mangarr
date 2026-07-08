@@ -13,6 +13,10 @@ AUTH_URL = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/to
 _api_limiter = RateLimiter(rate=4, per_seconds=1)
 _athome_limiter = RateLimiter(rate=35, per_seconds=60)
 
+# volume assignments change rarely; update_chapters() asks for them every
+# monitor cycle, so cache like the other volume-map sources do
+VOLUME_MAP_CACHE_TTL = 6 * 3600.0
+
 
 class MangaDexSource(DirectSource):
     name = "mangadex"
@@ -29,19 +33,29 @@ class MangaDexSource(DirectSource):
         self._client = client or httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT}, timeout=60, follow_redirects=True
         )
+        self._access_token: str | None = None
+        self._refresh_token: str | None = None
+        self._token_expires_at = 0.0
+        self._map_cache: dict[str, tuple[float, dict[float, int]]] = {}
         self.configure(client_id, client_secret, username, password, language)
 
     def configure(
         self, client_id: str, client_secret: str, username: str, password: str, language: str = "en"
     ) -> None:
+        # configure() runs on every settings read (each request/job), so it
+        # must not discard a live session unless the credentials changed —
+        # otherwise every call re-does a password grant against the auth API
+        creds = (client_id, client_secret, username, password)
+        if creds != getattr(self, "_creds", None):
+            self._creds = creds
+            self._access_token = None
+            self._refresh_token = None
+            self._token_expires_at = 0.0
         self._client_id = client_id
         self._client_secret = client_secret
         self._username = username
         self._password = password
         self._language = language or "en"
-        self._access_token: str | None = None
-        self._refresh_token: str | None = None
-        self._token_expires_at = 0.0
 
     @property
     def has_credentials(self) -> bool:
@@ -179,6 +193,9 @@ class MangaDexSource(DirectSource):
         """Volume assignments from the aggregate endpoint, across all
         languages — it covers chapters the feed can't serve (e.g. titles
         whose English chapters are external MangaPlus links)."""
+        cached = self._map_cache.get(external_id)
+        if cached and cached[0] > time.monotonic():
+            return dict(cached[1])
         data = await self._get(f"/manga/{external_id}/aggregate")
         volumes = data.get("volumes")
         if not isinstance(volumes, dict):
@@ -198,7 +215,8 @@ class MangaDexSource(DirectSource):
                 number = parse_chapter_number(ch_key or "")
                 if number is not None:
                     mapping[number] = vol_num
-        return mapping
+        self._map_cache[external_id] = (time.monotonic() + VOLUME_MAP_CACHE_TTL, mapping)
+        return dict(mapping)
 
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         data = await self._get(f"/at-home/server/{chapter_external_id}", athome=True)

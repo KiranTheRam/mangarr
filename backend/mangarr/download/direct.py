@@ -45,11 +45,15 @@ async def download_chapter_to_cbz(
         async def fetch(i: int, url: str) -> None:
             nonlocal done
             async with sem:
+                # retry any per-page error, not just httpx's: source
+                # download_page overrides can fail in their own ways
+                # (decryption, unexpected payloads) and deserve the same
+                # second chance as a network blip
                 for attempt in range(3):
                     try:
                         pages[i] = await source.download_page(client, url)
                         break
-                    except httpx.HTTPError as exc:
+                    except Exception as exc:
                         if attempt == 2:
                             raise RuntimeError(f"page {i + 1} failed: {exc}") from exc
                         await asyncio.sleep(2 * (attempt + 1))
@@ -59,7 +63,14 @@ async def download_chapter_to_cbz(
                 if inspect.isawaitable(result):
                     await result
 
-        await asyncio.gather(*(fetch(i, u) for i, u in enumerate(page_urls)))
+        # TaskGroup cancels the remaining fetches when one fails permanently —
+        # gather() would leave them running against a client being closed
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for i, u in enumerate(page_urls):
+                    tg.create_task(fetch(i, u))
+        except* Exception as group:
+            raise group.exceptions[0] from None
 
     if any(p is None for p in pages):
         raise RuntimeError("some pages failed to download")

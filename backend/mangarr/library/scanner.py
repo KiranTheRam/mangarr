@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..models import Chapter, Series
-from ..util import normalize_title
+from ..util import BRACKET_GROUPS, normalize_title
 from .matcher import MediaFile, find_media_files, match_files
 from .naming import series_folder
 
@@ -56,6 +56,30 @@ def resolve_folders(root: Path, series: Series, extra_paths: list[str]) -> list[
     return folders
 
 
+def _folder_match_titles(name: str) -> set[str]:
+    """Normalized forms a folder name can match under: as-is, and with
+    bracketed decorations stripped ("Berserk (1989)" also counts as
+    "Berserk")."""
+    forms = {normalize_title(name)}
+    stripped = BRACKET_GROUPS.sub(" ", name)
+    forms.add(normalize_title(stripped))
+    forms.discard("")
+    return forms
+
+
+def _loose_folder_match(folder_norms: set[str], wanted: set[str]) -> bool:
+    """Containment fallback for folders that add more than bracket junk —
+    but only when the names are mostly the same text: a short title being a
+    substring of a much longer folder name ("Monster" in "Monster Musume…")
+    is a different series, not a naming variant."""
+    for nn in folder_norms:
+        for w in wanted:
+            shorter, longer = sorted((nn, w), key=len)
+            if shorter and shorter in longer and len(shorter) / len(longer) >= 0.6:
+                return True
+    return False
+
+
 def find_existing_folder(root: Path, series: Series) -> str | None:
     """Return the sub-directory name of `root` whose normalized name matches
     the series title or an alt title, so mangarr can adopt a pre-existing
@@ -70,10 +94,10 @@ def find_existing_folder(root: Path, series: Series) -> str | None:
     for child in sorted(root.iterdir()):
         if not child.is_dir():
             continue
-        nn = normalize_title(child.name)
-        if nn in wanted:
+        folder_norms = _folder_match_titles(child.name)
+        if folder_norms & wanted:
             return child.name  # exact normalized match wins immediately
-        if best is None and nn and any(nn in w or w in nn for w in wanted):
+        if best is None and _loose_folder_match(folder_norms, wanted):
             best = child.name
     return best
 

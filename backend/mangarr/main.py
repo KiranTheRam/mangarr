@@ -43,8 +43,10 @@ app.mount("/api/v1", api)
 
 @app.get("/initialize.json")
 async def initialize():
-    """Bootstrap info for the web UI (same-origin only), mirroring how the
-    *arr apps hand their UI the API key."""
+    """Bootstrap info for the web UI, mirroring how the *arr apps hand their
+    UI the API key. NOTE: this is readable by anyone who can reach the port —
+    the API key gates scripted access, not the trusted LAN. Put a reverse
+    proxy with auth in front if the network isn't trusted."""
     return {"apiKey": get_api_key(), "version": __version__, "urlBase": ""}
 
 
@@ -55,9 +57,12 @@ if STATIC_DIR.is_dir():
 
     @app.get("/{full_path:path}")
     async def spa(full_path: str):
-        candidate = STATIC_DIR / full_path
-        if full_path and candidate.is_file():
-            return FileResponse(candidate)
+        if full_path:
+            # resolve + containment check: the route param is percent-decoded,
+            # so "..%2f" sequences would otherwise escape the static dir
+            candidate = (STATIC_DIR / full_path).resolve()
+            if candidate.is_relative_to(STATIC_DIR) and candidate.is_file():
+                return FileResponse(candidate)
         return FileResponse(STATIC_DIR / "index.html")
 else:
 

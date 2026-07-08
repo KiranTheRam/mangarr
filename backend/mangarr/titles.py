@@ -176,6 +176,24 @@ def english_title(primary: str, alt_titles: list[str], query: str | None = None)
     return ""
 
 
+def plausible_title_match(candidate: str, query: str) -> bool:
+    """Whether a search result's title plausibly IS the queried series, for
+    the fallback when no known alt title matched exactly.
+
+    Spacing/punctuation variants ("Kagura Bachi" vs "Kagurabachi") count as
+    equal; beyond that one title may only extend the other by a little —
+    a bare prefix match must not link "Berserk" to "Berserk of Gluttony",
+    which is a different series that merely shares the opening word."""
+    nc = normalize_title(candidate).replace(" ", "")
+    nq = normalize_title(query).replace(" ", "")
+    if not nc or not nq or len(nq) < 4:
+        return False
+    if nc == nq:
+        return True
+    shorter, longer = sorted((nc, nq), key=len)
+    return longer.startswith(shorter) and len(shorter) / len(longer) >= 0.8
+
+
 def title_queries(primary: str, alt_titles: list[str], limit: int = 6) -> list[str]:
     """Search queries ordered by value: canonical title, likely English title,
     then other alternates with English-looking ones first — sources index

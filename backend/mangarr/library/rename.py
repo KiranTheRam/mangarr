@@ -89,10 +89,23 @@ def plan_renames(
                 new_path=str(new_path),
                 # a different file already occupies the target — rename would
                 # be skipped (never overwrites); flag it so the preview is honest
-                conflict=new_path.exists() and new_path != current_path,
+                conflict=_is_other_file(current_path, new_path),
             )))
     keyed.sort(key=lambda kv: kv[0])
     return [item for _, item in keyed]
+
+
+def _is_other_file(src: Path, dst: Path) -> bool:
+    """Whether dst is occupied by a file that isn't src itself. On a
+    case-insensitive filesystem a case-only rename makes dst "exist" while
+    being the same file — that must not count as a collision, or the rename
+    would be skipped forever."""
+    if not dst.exists() or dst == src:
+        return False
+    try:
+        return not dst.samefile(src)
+    except OSError:
+        return True
 
 
 @dataclass
@@ -112,7 +125,7 @@ def apply_renames(items: list[RenameItem], chapter_by_id: dict[int, Chapter]) ->
         if not src.exists():
             outcomes.append(RenameOutcome(item, "skipped-missing"))
             continue
-        if dst.exists() and dst != src:
+        if _is_other_file(src, dst):
             outcomes.append(RenameOutcome(item, "skipped-collision", str(dst)))
             continue
         try:

@@ -10,7 +10,6 @@ EXT_BY_SIGNATURE = {
     b"\xff\xd8\xff": ".jpg",
     b"\x89PNG": ".png",
     b"GIF8": ".gif",
-    b"RIFF": ".webp",
 }
 
 
@@ -18,6 +17,12 @@ def guess_extension(data: bytes, fallback: str = ".jpg") -> str:
     for sig, ext in EXT_BY_SIGNATURE.items():
         if data.startswith(sig):
             return ext
+    # RIFF alone is any RIFF container (wav/avi/…); webp is RIFF????WEBP
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    # ISO-BMFF: size + "ftyp" + brand; avif/avis are the AVIF brands
+    if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+        return ".avif"
     return fallback
 
 

@@ -26,6 +26,7 @@ import {
   RenameModal,
   SourcesModal,
 } from "../components/LibraryTools";
+import { sanitizeDescription } from "../sanitize";
 
 function InteractiveSearch({
   seriesId,
@@ -747,7 +748,10 @@ export default function SeriesDetail() {
                   </span>
                 ))}
             </div>
-            <div className="series-desc" dangerouslySetInnerHTML={{ __html: series.description }} />
+            <div
+              className="series-desc"
+              dangerouslySetInnerHTML={{ __html: sanitizeDescription(series.description) }}
+            />
             <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               {series.source_links.map((sl) => (
                 <span className="tag" key={sl.id} title={sl.external_title}>

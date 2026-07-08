@@ -386,15 +386,24 @@ async def delete_source_link(
 async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_session)):
     """Rebuild the chapter list from the current source links (use after fixing
     a wrong link). Clears existing chapters + this series' download records,
-    re-syncs from the corrected links, then re-adopts files from disk."""
-    from sqlalchemy import delete as sa_delete
+    re-syncs from the corrected links, then re-adopts files from disk.
+
+    In-flight torrents survive: they're series-level (no chapter reference),
+    qBittorrent keeps transferring them regardless, and their import matches
+    files against whatever chapter list exists at completion time — deleting
+    their records would just orphan the transfer."""
+    from sqlalchemy import delete as sa_delete, or_
 
     from ..jobs.tasks import scan_series_folder, update_chapters
-    from ..models import Download, HistoryEvent
+    from ..models import Download, DownloadStatus, HistoryEvent
 
+    active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
     series = await _load(session, series_id)
     values = await registry.apply_settings(session)
-    await session.execute(sa_delete(Download).where(Download.series_id == series_id))
+    await session.execute(sa_delete(Download).where(
+        Download.series_id == series_id,
+        or_(Download.chapter_id.isnot(None), Download.status.notin_(active)),
+    ))
     await session.execute(sa_delete(HistoryEvent).where(HistoryEvent.series_id == series_id))
     for ch in list(series.chapters):
         await session.delete(ch)

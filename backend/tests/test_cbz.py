@@ -14,6 +14,14 @@ class TestGuessExtension:
     def test_jpg(self):
         assert guess_extension(JPG) == ".jpg"
 
+    def test_webp_needs_the_webp_fourcc(self):
+        assert guess_extension(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == ".webp"
+        # a RIFF container that isn't webp (e.g. wav) must not be labeled .webp
+        assert guess_extension(b"RIFF\x00\x00\x00\x00WAVEfmt ") == ".jpg"
+
+    def test_avif(self):
+        assert guess_extension(b"\x00\x00\x00\x20ftypavif" + b"\x00" * 8) == ".avif"
+
     def test_fallback(self):
         assert guess_extension(b"unknown-format") == ".jpg"
 

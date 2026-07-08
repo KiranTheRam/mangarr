@@ -130,3 +130,20 @@ class TestFindExistingFolder:
         (tmp_path / "Totally Different").mkdir()
         s = Series(id=1, title="Berserk", alt_titles="")
         assert find_existing_folder(tmp_path, s) is None
+
+    def test_bracketed_decorations_count_as_exact(self, tmp_path):
+        (tmp_path / "Berserk (1989)").mkdir()
+        s = Series(id=1, title="Berserk", alt_titles="")
+        assert find_existing_folder(tmp_path, s) == "Berserk (1989)"
+
+    def test_short_title_does_not_adopt_longer_different_series(self, tmp_path):
+        # "Monster" must not adopt another series' folder that merely
+        # contains the word — that would mark the wrong files as owned
+        (tmp_path / "Monster Musume no Iru Nichijou").mkdir()
+        s = Series(id=1, title="Monster", alt_titles="")
+        assert find_existing_folder(tmp_path, s) is None
+
+    def test_mostly_same_name_still_loose_matches(self, tmp_path):
+        (tmp_path / "One Piece Manga").mkdir()
+        s = Series(id=1, title="One Piece", alt_titles="")
+        assert find_existing_folder(tmp_path, s) == "One Piece Manga"

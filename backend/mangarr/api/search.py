@@ -10,7 +10,7 @@ from ..models import Chapter, Series
 from ..schemas import MetadataResult, ReleaseOut
 from ..sources import registry
 from ..sources.base import DirectSource
-from ..titles import english_title, split_alt_titles, title_queries
+from ..titles import english_title, plausible_title_match, split_alt_titles, title_queries
 from ..util import normalize_title
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -69,7 +69,6 @@ async def _find_direct_source_ids(
             candidates = await src.search_series(query)
         except Exception:
             return matches
-        nq = normalize_title(query)
         for cand in candidates:
             if cand.external_id in seen:
                 continue
@@ -79,9 +78,11 @@ async def _find_direct_source_ids(
                 seen.add(cand.external_id)
         if matches:
             continue
-        if nq and len(nq) >= 4 and candidates:
+        if candidates:
+            # same guarded fallback as auto-linking: the top result counts
+            # only when its title plausibly IS the queried series
             top = candidates[0]
-            if top.external_id not in seen and normalize_title(top.title).startswith(nq[:12]):
+            if top.external_id not in seen and plausible_title_match(top.title, query):
                 matches.append((top.external_id, top.title, top.url))
                 seen.add(top.external_id)
     return matches

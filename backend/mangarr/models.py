@@ -71,6 +71,11 @@ class Series(Base):
     # a title-matching existing folder over it
     folder_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # when provider metadata (status, totals, …) was last pulled; the monitor
+    # re-refreshes stale series so finished/hiatus states don't rot
+    metadata_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     root_folder: Mapped[RootFolder | None] = relationship(back_populates="series")
     chapters: Mapped[list[Chapter]] = relationship(

@@ -129,3 +129,19 @@ class TestApplyRenames:
         assert outcomes[0].status == "skipped-collision"
         assert src.exists()  # source untouched
         assert existing.read_bytes() == b"keep me"  # target untouched
+
+    def test_case_only_rename_is_not_a_collision(self, tmp_path):
+        """On a case-insensitive filesystem the target 'exists' (it IS the
+        source); that must rename, not skip forever as a collision."""
+        src = tmp_path / "dandadan - ch. 0148.cbz"
+        make(src)
+        series = Series(id=1, title="Dandadan", folder_name="Dandadan")
+        ch = Chapter(id=1, series_id=1, number=148.0, volume=None, downloaded=True,
+                     file_path=str(src))
+        items = plan(series, [ch], tmp_path)
+        assert len(items) == 1
+        assert not items[0].conflict
+        outcomes = apply_renames(items, {1: ch})
+        assert outcomes[0].status == "renamed"
+        assert (tmp_path / "Dandadan - Ch. 0148.cbz") in tmp_path.iterdir()
+        assert ch.file_path.endswith("Dandadan - Ch. 0148.cbz")
