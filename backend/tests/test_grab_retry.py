@@ -16,6 +16,7 @@ from mangarr.models import (
     Download,
     DownloadKind,
     DownloadStatus,
+    RootFolder,
     Series,
     SeriesSourceLink,
 )
@@ -166,3 +167,49 @@ async def test_chapter_cache_shared_between_update_and_grab(db_session, monkeypa
     assert added == 2
     assert queued == 2
     assert source.list_calls == 1
+
+
+async def test_active_direct_download_removed_by_user_is_not_completed(
+    db_session, tmp_path, monkeypatch
+):
+    root = RootFolder(path=str(tmp_path))
+    series = Series(
+        title="Test Series",
+        sort_title="test series",
+        root_folder=root,
+        folder_name="Test Series",
+    )
+    chapter = Chapter(number=1.0, monitored=True)
+    series.chapters.append(chapter)
+    db_session.add(series)
+    await db_session.commit()
+    dl = Download(
+        series_id=series.id,
+        chapter_id=chapter.id,
+        kind=DownloadKind.DIRECT,
+        status=DownloadStatus.QUEUED,
+        source_name="fake",
+        payload="c1",
+    )
+    db_session.add(dl)
+    await db_session.commit()
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource([1]))
+
+    async def fake_download(source, payload, series, chapter, dest, progress_cb=None,
+                            cancel_cb=None, web_url=""):
+        dl.status = DownloadStatus.FAILED
+        dl.error = REMOVED_BY_USER
+        await db_session.commit()
+        if cancel_cb is not None:
+            await cancel_cb()
+        raise AssertionError("cancel callback should abort the download")
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", fake_download)
+
+    await tasks._run_direct_download(db_session, dl)
+    await db_session.refresh(dl)
+    await db_session.refresh(chapter)
+
+    assert dl.status == DownloadStatus.FAILED
+    assert dl.error == REMOVED_BY_USER
+    assert chapter.downloaded is False

@@ -83,30 +83,64 @@ def _folders_of(series: Series) -> list[Path]:
     return resolve_folders(_root_of(series), series, [f.path for f in series.extra_folders])
 
 
+def _canonical_path(path: str | Path) -> str:
+    """Stable path key for comparing API input against discovered media files."""
+    try:
+        return str(Path(path).resolve(strict=False))
+    except OSError:
+        return str(Path(path).absolute())
+
+
+def _media_paths_of(series: Series) -> dict[str, Path]:
+    """Media files currently visible in the series folders, keyed canonically."""
+    media: dict[str, Path] = {}
+    for folder in _folders_of(series):
+        if not folder.exists():
+            continue
+        for mf in find_media_files(folder):
+            media[_canonical_path(mf.path)] = mf.path
+    return media
+
+
+def _require_series_media_path(series: Series, raw_path: str) -> Path:
+    path = _media_paths_of(series).get(_canonical_path(raw_path))
+    if path is None:
+        raise HTTPException(400, "File is not a media file in this series' configured folders")
+    if not path.exists():
+        raise HTTPException(400, "File not found on disk")
+    return path
+
+
 # ------------------------------------------------------------------ scan
 
 @router.post("/series/{series_id}/scan", response_model=ScanResultOut)
 async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
-    series = await _load(session, series_id)
-    root = _root_of(series)
-    folders = _folders_of(series)
-    # adopt a matching folder if the primary one doesn't exist yet — unless
-    # the user picked the folder deliberately
-    if not folders[0].exists() and not series.extra_folders and not series.folder_pinned:
-        found = find_existing_folder(root, series)
-        if found:
-            series.folder_name = found
-            folders = _folders_of(series)
-    result = scan_series(series, list(series.chapters), folders)
-    await session.commit()
-    return ScanResultOut(
-        folder=", ".join(str(f) for f in folders),
-        folder_exists=any(f.exists() for f in folders),
-        matched_chapters=result.matched_chapters,
-        volume_files=result.volume_files,
-        cleared=result.cleared,
-        unmatched=[m.path.name for m in result.unmatched],
-    )
+    from ..jobs.tasks import acquire_series_lock
+
+    lock = await acquire_series_lock(series_id)
+    try:
+        series = await _load(session, series_id)
+        root = _root_of(series)
+        folders = _folders_of(series)
+        # adopt a matching folder if the primary one doesn't exist yet — unless
+        # the user picked the folder deliberately
+        if not folders[0].exists() and not series.extra_folders and not series.folder_pinned:
+            found = find_existing_folder(root, series)
+            if found:
+                series.folder_name = found
+                folders = _folders_of(series)
+        result = scan_series(series, list(series.chapters), folders)
+        await session.commit()
+        return ScanResultOut(
+            folder=", ".join(str(f) for f in folders),
+            folder_exists=any(f.exists() for f in folders),
+            matched_chapters=result.matched_chapters,
+            volume_files=result.volume_files,
+            cleared=result.cleared,
+            unmatched=[m.path.name for m in result.unmatched],
+        )
+    finally:
+        lock.release()
 
 
 @router.post("/library/scan", status_code=202)
@@ -195,10 +229,9 @@ async def map_file(
     chapter = next((c for c in series.chapters if c.id == body.chapter_id), None)
     if chapter is None:
         raise HTTPException(404, "Chapter not found")
-    if not Path(body.file_path).exists():
-        raise HTTPException(400, "File not found on disk")
+    media_path = _require_series_media_path(series, body.file_path)
     chapter.downloaded = True
-    chapter.file_path = body.file_path
+    chapter.file_path = str(media_path)
     await session.commit()
 
 
@@ -247,15 +280,14 @@ async def map_file_range(
     from ..util import parse_volume_number
 
     series = await _load(session, series_id)
-    if not Path(body.file_path).exists():
-        raise HTTPException(400, "File not found on disk")
+    media_path = _require_series_media_path(series, body.file_path)
     lo, hi = sorted((body.from_number, body.to_number))
-    volume = parse_volume_number(Path(body.file_path).stem)
+    volume = parse_volume_number(media_path.stem)
     mapped = 0
     for ch in series.chapters:
         if lo <= ch.number <= hi:
             ch.downloaded = True
-            ch.file_path = body.file_path
+            ch.file_path = str(media_path)
             if volume is not None:
                 ch.volume = volume
             mapped += 1
@@ -394,25 +426,29 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     their records would just orphan the transfer."""
     from sqlalchemy import delete as sa_delete, or_
 
-    from ..jobs.tasks import scan_series_folder, update_chapters
+    from ..jobs.tasks import acquire_series_lock, update_chapters
     from ..models import Download, DownloadStatus, HistoryEvent
 
-    active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
-    series = await _load(session, series_id)
-    values = await registry.apply_settings(session)
-    await session.execute(sa_delete(Download).where(
-        Download.series_id == series_id,
-        or_(Download.chapter_id.isnot(None), Download.status.notin_(active)),
-    ))
-    await session.execute(sa_delete(HistoryEvent).where(HistoryEvent.series_id == series_id))
-    for ch in list(series.chapters):
-        await session.delete(ch)
-    await session.commit()
+    lock = await acquire_series_lock(series_id)
+    try:
+        active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
+        series = await _load(session, series_id)
+        values = await registry.apply_settings(session)
+        await session.execute(sa_delete(Download).where(
+            Download.series_id == series_id,
+            or_(Download.chapter_id.isnot(None), Download.status.notin_(active)),
+        ))
+        await session.execute(sa_delete(HistoryEvent).where(HistoryEvent.series_id == series_id))
+        for ch in list(series.chapters):
+            await session.delete(ch)
+        await session.commit()
 
-    series = await _load(session, series_id)
-    await update_chapters(session, series, values)
-    scan = await _scan_now(session, series)
-    return ResyncOut(chapters=len(series.chapters), matched_chapters=scan)
+        series = await _load(session, series_id)
+        await update_chapters(session, series, values)
+        scan = await _scan_now(session, series)
+        return ResyncOut(chapters=len(series.chapters), matched_chapters=scan)
+    finally:
+        lock.release()
 
 
 def _run_resync(series: Series, chapters, volume_map: dict[float, int]):
@@ -520,33 +556,42 @@ async def resync_volumes(
     requested instead of the auto-selected best map. No-op when no linked
     source has volume data (so manual mappings on metadata-gap series
     survive)."""
-    from ..jobs.tasks import collect_volume_maps, fetch_volume_map, refine_volume_map_with_disk
+    from ..jobs.tasks import (
+        acquire_series_lock,
+        collect_volume_maps,
+        fetch_volume_map,
+        refine_volume_map_with_disk,
+    )
     from ..volumes import sanitize_volume_map
 
-    series = await _load(session, series_id)
-    values = await registry.apply_settings(session)
-    if body is not None and body.source:
-        labeled = await collect_volume_maps(series, values)
-        chosen = next((m for name, m in labeled if name == body.source), None)
-        if chosen is None:
-            raise HTTPException(404, f"No volume data from source {body.source!r}")
-        volume_map = sanitize_volume_map(chosen)
-    else:
-        volume_map = await fetch_volume_map(series, values)
-    if not volume_map:
-        return VolumeResyncOut(has_data=False, assigned=0, changed=0,
-                               repointed=0, cleared=0)
+    lock = await acquire_series_lock(series_id)
+    try:
+        series = await _load(session, series_id)
+        values = await registry.apply_settings(session)
+        if body is not None and body.source:
+            labeled = await collect_volume_maps(series, values)
+            chosen = next((m for name, m in labeled if name == body.source), None)
+            if chosen is None:
+                raise HTTPException(404, f"No volume data from source {body.source!r}")
+            volume_map = sanitize_volume_map(chosen)
+        else:
+            volume_map = await fetch_volume_map(series, values)
+        if not volume_map:
+            return VolumeResyncOut(has_data=False, assigned=0, changed=0,
+                                   repointed=0, cleared=0)
 
-    # volume archives on disk anchor the chapters the source can't place
-    volume_map = refine_volume_map_with_disk(series, volume_map)
-    assigned, changed, repointed, cleared, _ = _run_resync(
-        series, list(series.chapters), volume_map
-    )
-    await session.commit()
-    return VolumeResyncOut(
-        has_data=True, assigned=assigned, changed=changed,
-        repointed=repointed, cleared=cleared,
-    )
+        # volume archives on disk anchor the chapters the source can't place
+        volume_map = refine_volume_map_with_disk(series, volume_map)
+        assigned, changed, repointed, cleared, _ = _run_resync(
+            series, list(series.chapters), volume_map
+        )
+        await session.commit()
+        return VolumeResyncOut(
+            has_data=True, assigned=assigned, changed=changed,
+            repointed=repointed, cleared=cleared,
+        )
+    finally:
+        lock.release()
 
 
 async def _scan_now(session: AsyncSession, series: Series) -> int:

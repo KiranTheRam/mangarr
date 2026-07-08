@@ -404,9 +404,10 @@ export default function SeriesDetail() {
     window.setTimeout(() => setWorkNotice((current) => (current === message ? null : current)), timeout);
   };
 
-  const { data: series, isLoading } = useQuery({
+  const { data: series, isLoading, isError, error } = useQuery({
     queryKey: ["series", seriesId],
     queryFn: () => api.get<SeriesDetailType>(`/series/${seriesId}`),
+    enabled: Number.isFinite(seriesId),
     // poll fast while a background refresh is populating the page (e.g.
     // right after adding the series), lazily otherwise
     refetchInterval: (query) => (query.state.data?.refreshing ? 2000 : 10000),
@@ -483,6 +484,28 @@ export default function SeriesDetail() {
       }),
     onSuccess: invalidate,
   });
+
+  if (!Number.isFinite(seriesId)) {
+    return (
+      <>
+        <Toolbar title="Series" />
+        <div className="content">
+          <div className="error-banner">Invalid series id.</div>
+        </div>
+      </>
+    );
+  }
+
+  if (isError) {
+    return (
+      <>
+        <Toolbar title="Series" />
+        <div className="content">
+          <div className="error-banner">{(error as Error).message}</div>
+        </div>
+      </>
+    );
+  }
 
   if (isLoading || !series) {
     return (

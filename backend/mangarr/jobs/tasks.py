@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import session_scope
@@ -56,6 +56,20 @@ METADATA_REFRESH_AFTER = timedelta(days=7)
 # one monitor/refresh pass fetches each source's chapter list once and shares
 # it between update_chapters() and grab_missing_chapters()
 ChapterListCache = dict[tuple[str, str], list[SourceChapter]]
+
+
+class DownloadCancelled(RuntimeError):
+    """Raised inside the direct worker when the user removes the queue item."""
+
+
+async def _raise_if_download_removed(session: AsyncSession, download_id: int) -> None:
+    row = (
+        await session.execute(
+            select(Download.status, Download.error).where(Download.id == download_id)
+        )
+    ).one_or_none()
+    if row and row[0] == DownloadStatus.FAILED and row[1] == REMOVED_BY_USER:
+        raise DownloadCancelled(REMOVED_BY_USER)
 
 
 async def _list_chapters_cached(
@@ -480,10 +494,34 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
 # spawn the task pre-mark the id (create_task doesn't start synchronously);
 # the task itself clears it.
 REFRESHING: set[int] = set()
+_SERIES_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _series_lock(series_id: int) -> asyncio.Lock:
+    lock = _SERIES_LOCKS.get(series_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SERIES_LOCKS[series_id] = lock
+    return lock
+
+
+async def acquire_series_lock(series_id: int) -> asyncio.Lock:
+    lock = _series_lock(series_id)
+    await lock.acquire()
+    return lock
+
+
+async def try_acquire_series_lock(series_id: int) -> asyncio.Lock | None:
+    lock = _series_lock(series_id)
+    if lock.locked():
+        return None
+    await lock.acquire()
+    return lock
 
 
 async def refresh_series_full(series_id: int, grab_missing: bool = False) -> None:
     REFRESHING.add(series_id)
+    lock = await acquire_series_lock(series_id)
     try:
         async with session_scope() as session:
             series = await _load_series(session, series_id)
@@ -520,6 +558,7 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
         # would only surface when the task object is garbage-collected
         log.exception("full refresh of series %d failed", series_id)
     finally:
+        lock.release()
         REFRESHING.discard(series_id)
 
 
@@ -597,6 +636,8 @@ async def enqueue_torrent(
     session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
 ) -> Download:
     torrent_hash = magnet_btih_hex(magnet)
+    if not torrent_hash:
+        raise ValueError("magnet link must include a valid btih info hash")
     client = QbtClient(
         values["qbittorrent_url"], values["qbittorrent_username"], values["qbittorrent_password"]
     )
@@ -650,15 +691,19 @@ async def process_direct_queue() -> None:
 
 
 async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
+    download_id = dl.id
+    source_name = dl.source_name
     values = await registry.apply_settings(session)
     series = await _load_series(session, dl.series_id) if dl.series_id else None
     chapter = await session.get(Chapter, dl.chapter_id) if dl.chapter_id else None
-    source = registry.DIRECT_SOURCES.get(dl.source_name)
+    source = registry.DIRECT_SOURCES.get(source_name)
     if series is None or chapter is None or source is None:
         dl.status = DownloadStatus.FAILED
         dl.error = "series/chapter/source no longer exists"
         await session.commit()
         return
+    series_id = series.id
+    chapter_id = chapter.id
 
     root = series.root_folder.path if series.root_folder else None
     if not root:
@@ -667,14 +712,33 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         await session.commit()
         return
 
-    dl.status = DownloadStatus.DOWNLOADING
-    await session.commit()
-
     progress_lock = asyncio.Lock()
     last_progress_commit = 0.0
+    last_cancel_check = 0.0
+
+    async def ensure_not_cancelled(force: bool = False) -> None:
+        nonlocal last_cancel_check
+        now = time.monotonic()
+        if not force and now - last_cancel_check < 0.5:
+            return
+        last_cancel_check = now
+        await _raise_if_download_removed(session, download_id)
+
+    claimed = await session.execute(
+        sa_update(Download)
+        .where(Download.id == download_id, Download.status == DownloadStatus.QUEUED)
+        .values(status=DownloadStatus.DOWNLOADING)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        log.info("direct download %d was removed before the worker could start it", download_id)
+        return
+    await session.commit()
+    await session.refresh(dl)
 
     async def on_progress(done: int, total: int) -> None:
         nonlocal last_progress_commit
+        await ensure_not_cancelled()
         progress = done / total
         now = time.monotonic()
         if done < total and now - last_progress_commit < 1.0:
@@ -689,6 +753,8 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             last_progress_commit = now
             await session.commit()
 
+    dest: Path | None = None
+    dest_preexisted = False
     try:
         # inside the try: a broken naming template must fail THIS download
         # (visibly, with an error) instead of crashing the queue worker and
@@ -699,20 +765,38 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             series.title, series.folder_name,
             chapter.number, chapter.volume, chapter.title,
         )
+        dest_preexisted = dest.exists()
         await download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
-            progress_cb=on_progress, web_url="",
+            progress_cb=on_progress,
+            cancel_cb=lambda: ensure_not_cancelled(force=True),
+            web_url="",
         )
+        await ensure_not_cancelled(force=True)
+    except DownloadCancelled:
+        await session.rollback()
+        if dest is not None and not dest_preexisted:
+            for path in (dest, dest.with_suffix(".cbz.partial")):
+                try:
+                    if path.exists():
+                        path.unlink()
+                except OSError as exc:
+                    log.warning("could not remove cancelled download artifact %s: %s", path, exc)
+        log.info("direct download %d cancelled by user", download_id)
+        return
     except Exception as exc:
-        log.exception("direct download %d failed", dl.id)
+        log.exception("direct download %d failed", download_id)
         # a progress commit may have been cancelled mid-flight when the page
         # fetches were torn down; reset the session before recording failure
         await session.rollback()
+        dl = await session.get(Download, download_id)
+        if dl is None:
+            return
         dl.status = DownloadStatus.FAILED
         dl.error = str(exc)[:500]
         session.add(HistoryEvent(
-            series_id=series.id, chapter_id=chapter.id, event="failed",
-            source_name=dl.source_name, detail=dl.error,
+            series_id=series_id, chapter_id=chapter_id, event="failed",
+            source_name=source_name, detail=dl.error,
         ))
         await session.commit()
         return
@@ -959,29 +1043,36 @@ async def monitor_all() -> None:
         series_ids = [row[0] for row in result.all()]
 
     for series_id in series_ids:
+        lock = await try_acquire_series_lock(series_id)
+        if lock is None:
+            log.info("monitor: series %d is already refreshing; skipping this pass", series_id)
+            continue
         try:
-            async with session_scope() as session:
-                values = await registry.apply_settings(session)
-                series = await _load_series(session, series_id)
-                if series is None:
-                    continue
-                if _metadata_is_stale(series):
+            try:
+                async with session_scope() as session:
+                    values = await registry.apply_settings(session)
+                    series = await _load_series(session, series_id)
+                    if series is None:
+                        continue
+                    if _metadata_is_stale(series):
+                        try:
+                            await refresh_series_metadata(session, series)
+                        except Exception as exc:
+                            log.warning("metadata refresh failed for series %d: %s", series_id, exc)
+                            await session.rollback()
+                    chapter_cache: ChapterListCache = {}
+                    await link_sources(session, series, values, respect_backoff=True)
+                    await update_chapters(session, series, values, chapter_cache)
+                    # adopt whatever is on disk before deciding what's missing, so
+                    # files that appeared since the last pass aren't re-downloaded
                     try:
-                        await refresh_series_metadata(session, series)
+                        await scan_series_folder(session, series)
                     except Exception as exc:
-                        log.warning("metadata refresh failed for series %d: %s", series_id, exc)
-                        await session.rollback()
-                chapter_cache: ChapterListCache = {}
-                await link_sources(session, series, values, respect_backoff=True)
-                await update_chapters(session, series, values, chapter_cache)
-                # adopt whatever is on disk before deciding what's missing, so
-                # files that appeared since the last pass aren't re-downloaded
-                try:
-                    await scan_series_folder(session, series)
-                except Exception as exc:
-                    log.warning("library scan failed for series %d: %s", series_id, exc)
-                await grab_missing_chapters(session, series, values,
-                                            chapter_cache=chapter_cache)
-        except Exception:
-            # one broken series must not abort the whole monitor pass
-            log.exception("monitor pass failed for series %d", series_id)
+                        log.warning("library scan failed for series %d: %s", series_id, exc)
+                    await grab_missing_chapters(session, series, values,
+                                                chapter_cache=chapter_cache)
+            except Exception:
+                # one broken series must not abort the whole monitor pass
+                log.exception("monitor pass failed for series %d", series_id)
+        finally:
+            lock.release()

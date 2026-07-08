@@ -12,9 +12,11 @@ const queryClient = new QueryClient({
   },
 });
 
+const rootEl = document.getElementById("root")!;
+
 initClient()
   .then(() => {
-    ReactDOM.createRoot(document.getElementById("root")!).render(
+    ReactDOM.createRoot(rootEl).render(
       <React.StrictMode>
         <QueryClientProvider client={queryClient}>
           <BrowserRouter>
@@ -25,7 +27,11 @@ initClient()
     );
   })
   .catch((err) => {
-    document.getElementById("root")!.innerHTML =
-      `<div style="padding:40px;font-family:sans-serif;color:#e1e2e6">
-        <h2>Mangarr backend unreachable</h2><p>${err.message}</p></div>`;
+    const message = err instanceof Error ? err.message : String(err);
+    ReactDOM.createRoot(rootEl).render(
+      <div style={{ padding: 40, fontFamily: "sans-serif", color: "#e1e2e6" }}>
+        <h2>Mangarr backend unreachable</h2>
+        <p>{message}</p>
+      </div>,
+    );
   });

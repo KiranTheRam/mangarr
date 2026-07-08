@@ -77,3 +77,18 @@ class TestApply:
         res = apply_cleanup(series, [ch], [tmp_path], [str(tmp_path / "Series - Vol. 01.cbz")])
         assert res.deleted == 0 and res.skipped == 1
         assert (tmp_path / "Series - Vol. 01.cbz").exists()  # not deleted
+
+    def test_refuses_to_delete_path_outside_series_media(self, tmp_path):
+        folder = tmp_path / "Series"
+        outside = tmp_path / "outside.cbz"
+        folder.mkdir()
+        make(folder / "Series - Ch. 0001.cbz")
+        make(outside)
+        series = Series(id=1, title="Series", folder_name="Series")
+        ch = Chapter(id=1, series_id=1, number=1.0, downloaded=True,
+                     file_path=str(folder / "Series - Ch. 0001.cbz"))
+
+        res = apply_cleanup(series, [ch], [folder], [str(outside)])
+
+        assert res.deleted == 0 and res.skipped == 1
+        assert outside.exists()

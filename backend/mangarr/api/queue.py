@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
 from ..download.qbittorrent import QbtClient
-from ..jobs.tasks import REMOVED_BY_USER, enqueue_direct, enqueue_torrent
+from ..jobs.tasks import REMOVED_BY_USER, enqueue_direct, enqueue_torrent, magnet_btih_hex
 from ..models import (
     Chapter,
     Download,
@@ -113,6 +113,8 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
     elif body.magnet:
         if values["qbittorrent_enabled"] != "true":
             raise HTTPException(400, "qBittorrent is not enabled in settings")
+        if not magnet_btih_hex(body.magnet):
+            raise HTTPException(422, "Magnet link must include a valid btih info hash")
         series = await session.get(Series, body.series_id) if body.series_id else None
         try:
             dl = await enqueue_torrent(

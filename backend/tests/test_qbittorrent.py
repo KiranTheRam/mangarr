@@ -3,6 +3,7 @@ import pytest
 import respx
 
 from mangarr.download.qbittorrent import QbtClient
+from mangarr.jobs.tasks import enqueue_torrent
 
 BASE = "http://qbt:8080"
 
@@ -51,3 +52,8 @@ async def test_add_magnet_sends_category_and_savepath():
     assert "category=mangarr" in body
     assert "savepath=%2Fdownloads%2Fmangarr" in body
     assert "autoTMM=false" in body
+
+
+async def test_enqueue_torrent_rejects_magnet_without_btih():
+    with pytest.raises(ValueError, match="btih"):
+        await enqueue_torrent(None, None, "magnet:?dn=nohash", "bad", {})  # type: ignore[arg-type]

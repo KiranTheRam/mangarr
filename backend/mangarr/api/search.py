@@ -1,3 +1,7 @@
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
+from typing import TypeVar
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +18,25 @@ from ..titles import english_title, plausible_title_match, split_alt_titles, tit
 from ..util import normalize_title
 
 router = APIRouter(prefix="/search", tags=["search"])
+
+DIRECT_SEARCH_CONCURRENCY = 4
+TORRENT_SEARCH_CONCURRENCY = 2
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+async def _gather_limited(
+    items: Sequence[T],
+    limit: int,
+    worker: Callable[[T], Awaitable[R]],
+) -> list[R]:
+    sem = asyncio.Semaphore(limit)
+
+    async def run(item: T) -> R:
+        async with sem:
+            return await worker(item)
+
+    return list(await asyncio.gather(*(run(item) for item in items)))
 
 
 @router.get("/metadata", response_model=list[MetadataResult])
@@ -125,8 +148,9 @@ async def search_releases(
     queries = title_queries(series.title, alt_titles)
     local_chapters = {ch.number: ch for ch in series.chapters}
 
-    direct_seen: set[tuple[str, str]] = set()
-    for src in registry.enabled_direct_sources(values):
+    async def direct_releases_for_source(src: DirectSource) -> list[ReleaseOut]:
+        out: list[ReleaseOut] = []
+        direct_seen: set[tuple[str, str]] = set()
         link = links.get(src.name)
         source_ids = (
             [(link.external_id, link.external_title, link.external_url)]
@@ -150,7 +174,7 @@ async def search_releases(
                 if chapter is None and local_chapter.downloaded:
                     continue
                 direct_seen.add((src.name, sc.external_id))
-                releases.append(
+                out.append(
                     ReleaseOut(
                         kind="direct",
                         source_name=src.name,
@@ -165,9 +189,19 @@ async def search_releases(
                 added_for_source += 1
                 if chapter is None and added_for_source >= 60:
                     break
+        return out
+
+    direct_parts = await _gather_limited(
+        registry.enabled_direct_sources(values),
+        DIRECT_SEARCH_CONCURRENCY,
+        direct_releases_for_source,
+    )
+    for part in direct_parts:
+        releases.extend(part)
 
     if values["qbittorrent_enabled"] == "true":
-        for indexer in registry.enabled_torrent_indexers(values):
+        async def torrent_releases_for_indexer(indexer) -> list[ReleaseOut]:
+            out: list[ReleaseOut] = []
             torrent_seen: set[str] = set()
             for query in queries:
                 try:
@@ -179,7 +213,7 @@ async def search_releases(
                     if key in torrent_seen:
                         continue
                     torrent_seen.add(key)
-                    releases.append(
+                    out.append(
                         ReleaseOut(
                             kind="torrent",
                             source_name=indexer.name,
@@ -191,4 +225,13 @@ async def search_releases(
                             leechers=t.leechers,
                         )
                     )
+            return out
+
+        torrent_parts = await _gather_limited(
+            registry.enabled_torrent_indexers(values),
+            TORRENT_SEARCH_CONCURRENCY,
+            torrent_releases_for_indexer,
+        )
+        for part in torrent_parts:
+            releases.extend(part)
     return releases

@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 PAGE_CONCURRENCY = 3
 
 ProgressCallback = Callable[[int, int], None | Awaitable[None]]
+CancelCallback = Callable[[], None | Awaitable[None]]
 
 
 async def download_chapter_to_cbz(
@@ -26,6 +27,7 @@ async def download_chapter_to_cbz(
     chapter: Chapter,
     dest_path,
     progress_cb: ProgressCallback | None = None,
+    cancel_cb: CancelCallback | None = None,
     web_url: str = "",
 ) -> None:
     """Fetches all pages of a chapter and writes the CBZ to dest_path.
@@ -33,6 +35,15 @@ async def download_chapter_to_cbz(
     page_urls = await source.get_pages(chapter_external_id)
     if not page_urls:
         raise RuntimeError(f"{source.name} returned no pages for chapter {chapter.number}")
+
+    async def check_cancelled() -> None:
+        if cancel_cb is None:
+            return
+        result = cancel_cb()
+        if inspect.isawaitable(result):
+            await result
+
+    await check_cancelled()
 
     pages: list[bytes | None] = [None] * len(page_urls)
     done = 0
@@ -58,10 +69,12 @@ async def download_chapter_to_cbz(
                             raise RuntimeError(f"page {i + 1} failed: {exc}") from exc
                         await asyncio.sleep(2 * (attempt + 1))
             done += 1
+            await check_cancelled()
             if progress_cb:
                 result = progress_cb(done, len(page_urls))
                 if inspect.isawaitable(result):
                     await result
+            await check_cancelled()
 
         # TaskGroup cancels the remaining fetches when one fails permanently —
         # gather() would leave them running against a client being closed
@@ -74,6 +87,8 @@ async def download_chapter_to_cbz(
 
     if any(p is None for p in pages):
         raise RuntimeError("some pages failed to download")
+
+    await check_cancelled()
 
     comicinfo = build_comicinfo(
         series=series.title,

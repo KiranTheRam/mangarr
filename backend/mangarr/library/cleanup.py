@@ -66,6 +66,13 @@ def _all_media(folders: list[Path]) -> list[MediaFile]:
     return media
 
 
+def _canonical(path: str | Path) -> str:
+    try:
+        return str(Path(path).resolve(strict=False))
+    except OSError:
+        return str(Path(path).absolute())
+
+
 def analyze(
     series: Series,
     chapters: list[Chapter],
@@ -151,20 +158,29 @@ def apply_cleanup(
     media = _all_media(folders)
     tracked_ch = {c.number for c in chapters}
     tracked_vol = {c.volume for c in chapters if c.volume is not None}
-    identity_of = {str(mf.path): _identity(mf, tracked_ch, tracked_vol) for mf in media}
-    delete_set = set(delete_paths)
+    media_by_path = {_canonical(mf.path): mf for mf in media}
+    identity_of = {_canonical(mf.path): _identity(mf, tracked_ch, tracked_vol) for mf in media}
+    delete_set = {_canonical(path) for path in delete_paths}
     result = CleanupResult()
 
-    for path in delete_paths:
+    for raw_path in delete_paths:
+        key = _canonical(raw_path)
+        mf = media_by_path.get(key)
+        if mf is None:
+            log.warning("cleanup: refusing path outside series media: %s", raw_path)
+            result.skipped += 1
+            continue
+        path = str(mf.path)
         if not os.path.exists(path):
             continue
-        referencing = [c for c in chapters if c.file_path == path]
+        referencing = [c for c in chapters if c.file_path and _canonical(c.file_path) == key]
         if referencing:
-            ident = identity_of.get(path)
+            ident = identity_of.get(key)
             survivors = [
                 str(mf.path) for mf in media
-                if identity_of.get(str(mf.path)) == ident
-                and str(mf.path) not in delete_set and os.path.exists(str(mf.path))
+                if identity_of.get(_canonical(mf.path)) == ident
+                and _canonical(mf.path) not in delete_set
+                and os.path.exists(str(mf.path))
             ]
             if not survivors:
                 result.skipped += 1  # would leave a chapter with no file — refuse
