@@ -53,6 +53,13 @@ FAILED_GRAB_RETRY_AFTER = timedelta(days=7)
 # lazily during monitor passes rather than all at once
 METADATA_REFRESH_AFTER = timedelta(days=7)
 
+# a direct download that stops making progress (wedged connection, hung
+# source, broken DB session) must not occupy the single queue worker forever:
+# it blocks every queued download behind it while looking merely slow in the
+# UI. Cancel it and fail visibly instead. Generous because a single page is
+# allowed up to 3 attempts x 120s before it fails on its own.
+DIRECT_STALL_TIMEOUT = timedelta(minutes=15)
+
 # one monitor/refresh pass fetches each source's chapter list once and shares
 # it between update_chapters() and grab_missing_chapters()
 ChapterListCache = dict[tuple[str, str], list[SourceChapter]]
@@ -712,17 +719,23 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         await session.commit()
         return
 
-    progress_lock = asyncio.Lock()
+    # page fetches run concurrently and call back into ensure_not_cancelled /
+    # on_progress; the shared AsyncSession is not task-safe, so every session
+    # use in those callbacks is serialized through this lock
+    db_lock = asyncio.Lock()
     last_progress_commit = 0.0
     last_cancel_check = 0.0
+    last_activity = time.monotonic()
 
     async def ensure_not_cancelled(force: bool = False) -> None:
         nonlocal last_cancel_check
-        now = time.monotonic()
-        if not force and now - last_cancel_check < 0.5:
+        if not force and time.monotonic() - last_cancel_check < 0.5:
             return
-        last_cancel_check = now
-        await _raise_if_download_removed(session, download_id)
+        async with db_lock:
+            if not force and time.monotonic() - last_cancel_check < 0.5:
+                return
+            last_cancel_check = time.monotonic()
+            await _raise_if_download_removed(session, download_id)
 
     claimed = await session.execute(
         sa_update(Download)
@@ -737,14 +750,15 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     await session.refresh(dl)
 
     async def on_progress(done: int, total: int) -> None:
-        nonlocal last_progress_commit
+        nonlocal last_progress_commit, last_activity
+        last_activity = time.monotonic()
         await ensure_not_cancelled()
         progress = done / total
         now = time.monotonic()
         if done < total and now - last_progress_commit < 1.0:
             dl.progress = progress
             return
-        async with progress_lock:
+        async with db_lock:
             now = time.monotonic()
             if done < total and now - last_progress_commit < 1.0:
                 dl.progress = progress
@@ -766,12 +780,29 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             chapter.number, chapter.volume, chapter.title,
         )
         dest_preexisted = dest.exists()
-        await download_chapter_to_cbz(
+        download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
             progress_cb=on_progress,
             cancel_cb=lambda: ensure_not_cancelled(force=True),
             web_url="",
-        )
+        ))
+        stall_seconds = DIRECT_STALL_TIMEOUT.total_seconds()
+        while True:
+            finished, _ = await asyncio.wait({download_task},
+                                             timeout=min(15.0, stall_seconds))
+            if finished:
+                download_task.result()
+                break
+            if time.monotonic() - last_activity > stall_seconds:
+                download_task.cancel()
+                try:
+                    await download_task
+                except BaseException:
+                    pass  # the stall, not the cancellation, is the error
+                raise RuntimeError(
+                    f"stalled: no page finished for {stall_seconds / 60:g} minutes; "
+                    "download cancelled so the queue can continue"
+                )
         await ensure_not_cancelled(force=True)
     except DownloadCancelled:
         await session.rollback()

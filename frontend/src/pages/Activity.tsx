@@ -89,7 +89,14 @@ function Queue() {
                   onChange={() => toggle(item.id)}
                 />
               </td>
-              <td>{item.title || item.series_title}</td>
+              <td>
+                {item.title || item.series_title}
+                {item.status === "failed" && item.error && (
+                  <div style={{ color: "var(--danger)", fontSize: "0.85em", marginTop: 2 }}>
+                    {item.error}
+                  </div>
+                )}
+              </td>
               <td>{item.source_name}</td>
               <td>
                 <span className={`pill ${item.kind === "torrent" ? "orange" : "blue"}`}>

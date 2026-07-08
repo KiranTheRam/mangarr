@@ -1,7 +1,8 @@
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
@@ -24,13 +25,27 @@ router = APIRouter(tags=["queue"])
 
 ACTIVE = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
 
+# failed downloads stay visible in the queue this long — otherwise a failure
+# silently disappears from Activity and looks like the grab never happened
+FAILED_VISIBLE_FOR = timedelta(hours=48)
+
 
 @router.get("/queue", response_model=list[QueueItemOut])
 async def get_queue(session: AsyncSession = Depends(get_session)):
+    failed_cutoff = datetime.now(timezone.utc) - FAILED_VISIBLE_FOR
     result = await session.execute(
         select(Download, Series.title)
         .outerjoin(Series, Download.series_id == Series.id)
-        .where(Download.status.in_(ACTIVE))
+        .where(or_(
+            Download.status.in_(ACTIVE),
+            # user-removed items also carry FAILED, but hiding them is the
+            # entire point of removal — only real failures stay visible
+            and_(
+                Download.status == DownloadStatus.FAILED,
+                Download.error != REMOVED_BY_USER,
+                Download.updated_at >= failed_cutoff,
+            ),
+        ))
         .order_by(Download.id)
     )
     items = []
@@ -50,9 +65,14 @@ async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
 
     The REMOVED_BY_USER error text is significant: the monitor's retry logic
     ignores it, so cancelling a queued grab doesn't blacklist that source for
-    the chapter the way a real download failure does."""
+    the chapter the way a real download failure does. Dismissing an
+    already-failed row works the same way — the failure is cleared from the
+    queue view and the chapter becomes eligible for retry again."""
     result = await session.execute(
-        select(Download).where(Download.id.in_(ids), Download.status.in_(ACTIVE))
+        select(Download).where(
+            Download.id.in_(ids),
+            Download.status.in_([*ACTIVE, DownloadStatus.FAILED]),
+        )
     )
     downloads = result.scalars().all()
     hashes = [
