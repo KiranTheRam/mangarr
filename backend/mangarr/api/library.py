@@ -19,7 +19,7 @@ from ..library.scanner import (
     scan_series,
     series_dir,
 )
-from ..models import RootFolder, Series, SeriesFolder, SeriesSourceLink
+from ..models import Chapter, RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     CleanupApplyIn,
     CleanupFileOut,
@@ -291,6 +291,8 @@ async def map_file_range(
             ch.file_path = str(media_path)
             if volume is not None:
                 ch.volume = volume
+                ch.volume_source = "manual"
+                ch.volume_locked = True
             mapped += 1
     if mapped == 0:
         raise HTTPException(400, "No tracked chapters in that range")
@@ -434,6 +436,13 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     try:
         active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
         series = await _load(session, series_id)
+        locked_metadata = {
+            ch.number: (
+                ch.title, ch.volume, ch.title_source, ch.volume_source,
+                ch.title_locked, ch.volume_locked,
+            )
+            for ch in series.chapters if ch.title_locked or ch.volume_locked
+        }
         values = await registry.apply_settings(session)
         await session.execute(sa_delete(Download).where(
             Download.series_id == series_id,
@@ -446,19 +455,45 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
 
         series = await _load(session, series_id)
         await update_chapters(session, series, values)
+        # a locked chapter no source re-lists (e.g. a manually mapped extra)
+        # must survive the rebuild — recreate it rather than dropping the
+        # very metadata the lock promised to keep
+        present = {ch.number for ch in series.chapters}
+        for number in locked_metadata:
+            if number not in present:
+                series.chapters.append(
+                    Chapter(number=number, monitored=series.monitored)
+                )
+        for ch in series.chapters:
+            saved = locked_metadata.get(ch.number)
+            if saved is None:
+                continue
+            title, volume, title_source, volume_source, title_locked, volume_locked = saved
+            if title_locked:
+                ch.title, ch.title_source, ch.title_locked = title, title_source, True
+            if volume_locked:
+                ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
+        await session.commit()
         scan = await _scan_now(session, series)
         return ResyncOut(chapters=len(series.chapters), matched_chapters=scan)
     finally:
         lock.release()
 
 
-def _run_resync(series: Series, chapters, volume_map: dict[float, int]):
+def _run_resync(
+    series: Series, chapters, volume_map: dict[float, int],
+    sources: dict[float, str] | None = None,
+):
     """Stamp `volume_map` onto `chapters` and re-point volume-archive file
     coverage: chapters are un-pointed from volume archives that don't match
     their (new) volume, then rescanned — exact chapter files win, matching
     archives cover the rest, and anything no longer backed by a file is
     cleared honestly. Mutates the given chapters in place (pass detached
     copies for a dry run); the caller commits.
+
+    `sources` labels each map entry with the source that actually claimed
+    it; entries added by disk refinement aren't in it and are stamped
+    "disk-inferred" so real data can later correct them.
 
     Returns (assigned, changed, repointed, cleared, diff) where diff is
     [(chapter number, old volume, new volume), …] sorted by chapter."""
@@ -467,10 +502,16 @@ def _run_resync(series: Series, chapters, volume_map: dict[float, int]):
     changed = 0
     diff: list[tuple[float, int | None, int | None]] = []
     for ch in sorted(chapters, key=lambda c: c.number):
+        if getattr(ch, "volume_locked", False):
+            continue
         new_volume = volume_map.get(ch.number)
         if ch.volume != new_volume:
             diff.append((ch.number, ch.volume, new_volume))
             ch.volume = new_volume
+            ch.volume_source = (
+                (sources or {}).get(ch.number, "disk-inferred")
+                if new_volume is not None else ""
+            )
             changed += 1
 
     before: dict[int, str] = {}
@@ -498,11 +539,11 @@ def _run_resync(series: Series, chapters, volume_map: dict[float, int]):
 def _chapter_copies(chapters):
     """Detached Chapter twins carrying just what _run_resync touches, so a
     dry run can't dirty the session."""
-    from ..models import Chapter
-
     return [
         Chapter(id=ch.id, series_id=ch.series_id, number=ch.number,
-                volume=ch.volume, downloaded=ch.downloaded, file_path=ch.file_path)
+                volume=ch.volume, volume_source=ch.volume_source,
+                volume_locked=ch.volume_locked,
+                downloaded=ch.downloaded, file_path=ch.file_path)
         for ch in chapters
     ]
 
@@ -510,27 +551,31 @@ def _chapter_copies(chapters):
 @router.get("/series/{series_id}/volumes/resync-preview",
             response_model=VolumeResyncPreviewOut)
 async def resync_volumes_preview(series_id: int, session: AsyncSession = Depends(get_session)):
-    """Dry-run of the volume resync, one candidate per source with volume
-    data: what an unqualified resync would rank (most complete sanitized map
-    first — the first candidate is what it would apply), each with the counts
-    and chapter-level diff applying it would produce. Nothing is written."""
+    """Dry-run of the recommended authority-ranked merge and each raw source.
+
+    Includes counts and chapter-level diffs. Nothing is written.
+    """
     from ..jobs.tasks import collect_volume_maps, refine_volume_map_with_disk
-    from ..volumes import sanitize_volume_map
+    from ..volumes import rank_labeled_volume_maps, select_ranked_volume_maps
 
     series = await _load(session, series_id)
     values = await registry.apply_settings(session)
     labeled = await collect_volume_maps(series, values)
-    ranked = sorted(
-        ((name, sanitize_volume_map(m)) for name, m in labeled),
-        key=lambda nm: len(nm[1]), reverse=True,  # stable: priority order breaks ties
-    )
+    ranked = rank_labeled_volume_maps(labeled)
+    _, selected, selected_sources = select_ranked_volume_maps(ranked)
+    candidates_in = [
+        *([("auto", selected, selected_sources)] if selected else []),
+        *((name, cleaned, dict.fromkeys(cleaned, name)) for name, cleaned in ranked),
+    ]
     candidates = []
-    for name, cleaned in ranked:
+    for name, cleaned, entry_sources in candidates_in:
         if not cleaned:
             continue
         refined = refine_volume_map_with_disk(series, cleaned)
         copies = _chapter_copies(series.chapters)
-        assigned, changed, repointed, cleared, diff = _run_resync(series, copies, refined)
+        assigned, changed, repointed, cleared, diff = _run_resync(
+            series, copies, refined, entry_sources
+        )
         candidates.append(VolumeCandidateOut(
             source=name, map_size=len(cleaned),
             assigned=assigned, changed=changed, repointed=repointed, cleared=cleared,
@@ -551,8 +596,8 @@ async def resync_volumes(
     body: VolumeResyncIn | None = None,
     session: AsyncSession = Depends(get_session),
 ):
-    """Rebuild every chapter's volume assignment from the most complete
-    source's volume data (sanitized, applied verbatim — see mangarr.volumes),
+    """Rebuild every unlocked chapter's volume assignment from the recommended
+    authority-ranked data (sanitized and safely merged — see mangarr.volumes),
     overwriting whatever is there — the fix for stale or wrongly-stamped
     assignments. Chapters the source can't place are distributed across the
     volume archives found on disk; with no matching files they stay
@@ -563,23 +608,23 @@ async def resync_volumes(
     from ..jobs.tasks import (
         acquire_series_lock,
         collect_volume_maps,
-        fetch_volume_map,
         refine_volume_map_with_disk,
     )
-    from ..volumes import sanitize_volume_map
+    from ..volumes import sanitize_volume_map, select_labeled_volume_map
 
     lock = await acquire_series_lock(series_id)
     try:
         series = await _load(session, series_id)
         values = await registry.apply_settings(session)
-        if body is not None and body.source:
-            labeled = await collect_volume_maps(series, values)
+        labeled = await collect_volume_maps(series, values)
+        if body is not None and body.source and body.source != "auto":
             chosen = next((m for name, m in labeled if name == body.source), None)
             if chosen is None:
                 raise HTTPException(404, f"No volume data from source {body.source!r}")
             volume_map = sanitize_volume_map(chosen)
+            map_sources = dict.fromkeys(volume_map, body.source)
         else:
-            volume_map = await fetch_volume_map(series, values)
+            _, volume_map, map_sources = select_labeled_volume_map(labeled)
         if not volume_map:
             return VolumeResyncOut(has_data=False, assigned=0, changed=0,
                                    repointed=0, cleared=0)
@@ -587,7 +632,7 @@ async def resync_volumes(
         # volume archives on disk anchor the chapters the source can't place
         volume_map = refine_volume_map_with_disk(series, volume_map)
         assigned, changed, repointed, cleared, _ = _run_resync(
-            series, list(series.chapters), volume_map
+            series, list(series.chapters), volume_map, map_sources
         )
         await session.commit()
         return VolumeResyncOut(

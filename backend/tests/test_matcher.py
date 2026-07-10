@@ -2,7 +2,7 @@ import zipfile
 
 import pytest
 
-from mangarr.library.matcher import find_media_files, match_files
+from mangarr.library.matcher import comicinfo_title, find_media_files, match_files
 from mangarr.models import Chapter
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
@@ -18,12 +18,32 @@ def touch(path, content=b"x"):
     path.write_bytes(content)
 
 
-def make_cbz(path):
+def make_cbz(path, title=""):
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("001.png", PNG)
+        if title:
+            zf.writestr("ComicInfo.xml", f"<ComicInfo><Title>{title}</Title></ComicInfo>")
+
+
+class TestComicinfoTitle:
+    def test_reads_comicinfo_title(self, tmp_path):
+        path = tmp_path / "Series - Ch. 001.cbz"
+        make_cbz(path, "The Beginning")
+        assert comicinfo_title(path) == "The Beginning"
+
+    def test_cached_by_file_version(self, tmp_path):
+        path = tmp_path / "Series - Ch. 002.cbz"
+        make_cbz(path, "First")
+        assert comicinfo_title(path) == "First"
+        # rewriting the file (new mtime/size) invalidates the cached title
+        make_cbz(path, "Second, Revised")
+        import os
+        os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 5))
+        assert comicinfo_title(path) == "Second, Revised"
 
 
 class TestFindMediaFiles:
+
     def test_parses_varied_real_names(self, tmp_path):
         # names taken from the user's actual library
         for name in [

@@ -13,7 +13,9 @@ from ..metadata.mangaupdates import provider as mangaupdates
 from ..models import Chapter, Series, SeriesFolder, SeriesStatus
 from ..schemas import (
     AddSeriesIn,
+    ChapterMetadataIn,
     ChapterMonitorIn,
+    ChapterOut,
     SeriesDetailOut,
     SeriesOut,
     SeriesUpdateIn,
@@ -212,3 +214,29 @@ async def monitor_chapters(
     for chapter in result.scalars().all():
         chapter.monitored = body.monitored
     await session.commit()
+
+
+@router.put("/{series_id}/chapters/{chapter_id}/metadata", response_model=ChapterOut)
+async def update_chapter_metadata(
+    series_id: int,
+    chapter_id: int,
+    body: ChapterMetadataIn,
+    session: AsyncSession = Depends(get_session),
+):
+    chapter = await session.get(Chapter, chapter_id)
+    if chapter is None or chapter.series_id != series_id:
+        raise HTTPException(404, "Chapter not found")
+    # only an actual edit becomes "manual" provenance; saving an unchanged
+    # value (e.g. locking a wikipedia title in place) keeps its real source
+    title = body.title.strip()
+    if title != chapter.title:
+        chapter.title = title
+        chapter.title_source = "manual" if title else ""
+    if body.volume != chapter.volume:
+        chapter.volume = body.volume
+        chapter.volume_source = "manual" if body.volume is not None else ""
+    chapter.title_locked = body.title_locked
+    chapter.volume_locked = body.volume_locked
+    await session.commit()
+    await session.refresh(chapter)
+    return chapter

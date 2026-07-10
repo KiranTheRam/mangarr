@@ -27,6 +27,24 @@ class SourceChapter:
 
 
 @dataclass
+class ChapterMetadata:
+    """Metadata a source knows about a chapter without necessarily serving it.
+
+    ``number`` is optional because printed tables of contents frequently list
+    an "Extra" or "Bonus" by title and position but give it no canonical
+    number.  Those rows are reconciled with decimal-numbered local chapters
+    later, when the rest of the series provides enough context.
+    """
+
+    source_name: str
+    number: float | None
+    volume: int | None = None
+    title: str = ""
+    kind: str = "chapter"  # chapter | extra
+    url: str = ""
+
+
+@dataclass
 class TorrentRelease:
     source_name: str
     title: str
@@ -72,6 +90,13 @@ class DirectSource(ABC):
         """chapter number → volume number, for sources that know volume
         assignments even for chapters they can't serve. Optional."""
         return {}
+
+    async def get_chapter_metadata(self, external_id: str) -> list[ChapterMetadata]:
+        """Optional title/volume metadata for chapters this source cannot
+        necessarily serve.  Kept separate from ``list_chapters`` so an
+        official catalogue or Wikipedia never appears as a download source.
+        """
+        return []
 
 
 class TorrentIndexer(ABC):

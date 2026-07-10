@@ -1,4 +1,4 @@
-"""English Wikipedia as a volume-map-only source.
+"""English Wikipedia chapter titles and printed-volume metadata.
 
 Wikipedia's chapter-list articles ({{Graphic novel list}} templates) are the
 most complete chapter→volume data available for licensed series — MangaDex's
@@ -20,7 +20,7 @@ import mwparserfromhell
 
 from .. import USER_AGENT
 from ..util import RateLimiter, rl_request
-from .base import DirectSource, SourceChapter, SourceSeries
+from .base import ChapterMetadata, DirectSource, SourceChapter, SourceSeries
 
 API_URL = "https://en.wikipedia.org/w/api.php"
 
@@ -46,6 +46,70 @@ _PROSE_SINGLE = re.compile(r"chapters?\s+(\d+(?:\.\d+)?)(?!\s*[–—-])(?!\.?\d
                            re.IGNORECASE)
 # a trailing disambiguator: "Berserk (manga)" → "Berserk"
 _PARENTHETICAL = re.compile(r"\s*\([^)]*\)\s*$")
+_EXTRA_LINE = re.compile(r"^\s*[*#:]+\s*(?:extra|bonus|omake)\s*[:.–—-]\s*(.+)$", re.I)
+
+
+def _item_title(value: str, number: float | None = None) -> str:
+    """Readable English title from a list item, including {{Nihongo}}."""
+    code = mwparserfromhell.parse(value)
+    for tpl in code.filter_templates(recursive=True):
+        if tpl.name.strip().lower() == "nihongo":
+            positional = [p for p in tpl.params if not p.showkey]
+            if positional:
+                text = positional[0].value.strip_code().strip()
+                if text:
+                    return text.strip(' "“”')
+    text = " ".join(code.strip_code().replace("\n", " ").split())
+    if number is not None:
+        text = re.sub(
+            rf"^\s*(?:chapter\s*)?{re.escape(str(number).removesuffix('.0'))}\s*[.):\-–—]?\s*",
+            "", text, flags=re.I,
+        )
+    return text.strip(' "“”')
+
+
+def _chapter_rows(value: str, volume: int) -> list[ChapterMetadata]:
+    """Explicitly numbered rows plus explicitly labelled unnumbered extras."""
+    rows: list[ChapterMetadata] = []
+    code = mwparserfromhell.parse(value)
+    for tpl in code.filter_templates(recursive=True):
+        if tpl.name.strip().lower() != "numbered list":
+            continue
+        start = 1.0
+        if tpl.has("start"):
+            try:
+                start = float(tpl.get("start").value.strip_code().strip())
+            except ValueError:
+                continue
+        items = [p for p in tpl.params if not p.showkey and str(p.value).strip()]
+        for index, item in enumerate(items):
+            number = start + index
+            rows.append(ChapterMetadata(
+                source_name="wikipedia", number=number, volume=volume,
+                title=_item_title(str(item.value), number),
+            ))
+    if rows:
+        return rows
+    for line in value.splitlines():
+        match = _LINE_NUMBER.match(line)
+        if match:
+            number = float(match.group(1))
+            rows.append(ChapterMetadata(
+                source_name="wikipedia", number=number, volume=volume,
+                title=_item_title(line[match.end():], number),
+            ))
+            continue
+        extra = _EXTRA_LINE.match(line)
+        if extra:
+            rows.append(ChapterMetadata(
+                source_name="wikipedia", number=None, volume=volume,
+                title=_item_title(extra.group(1)), kind="extra",
+            ))
+    if rows:
+        return rows
+    # Prose ranges still provide useful volume mapping, but no invented title.
+    return [ChapterMetadata(source_name="wikipedia", number=n, volume=volume)
+            for n in _chapter_numbers(value)]
 
 
 def _chapter_numbers(value: str) -> list[float]:
@@ -85,12 +149,25 @@ def _chapter_numbers(value: str) -> list[float]:
 
 
 def parse_volume_map(wikitext: str) -> dict[float, int]:
-    """Chapter→volume assignments from {{Graphic novel list}} templates."""
+    """Chapter→volume assignments from {{Graphic novel list}} templates.
+    The first occurrence of a chapter number wins (split list pages can
+    overlap at their boundaries)."""
+    return _rows_to_volume_map(parse_chapter_metadata(wikitext))
+
+
+def _rows_to_volume_map(rows: list[ChapterMetadata]) -> dict[float, int]:
     mapping: dict[float, int] = {}
+    for row in rows:
+        if row.number is not None and row.volume is not None:
+            mapping.setdefault(float(row.number), row.volume)
+    return mapping
+
+
+def parse_chapter_metadata(wikitext: str) -> list[ChapterMetadata]:
+    rows: list[ChapterMetadata] = []
+    seen: set[tuple[float | None, int, str]] = set()
     for tpl in mwparserfromhell.parse(wikitext).filter_templates():
-        if tpl.name.strip().lower() != "graphic novel list":
-            continue
-        if not tpl.has("VolumeNumber"):
+        if tpl.name.strip().lower() != "graphic novel list" or not tpl.has("VolumeNumber"):
             continue
         vol_text = tpl.get("VolumeNumber").value.strip_code().strip()
         if not re.fullmatch(r"\d+", vol_text):
@@ -99,9 +176,12 @@ def parse_volume_map(wikitext: str) -> dict[float, int]:
         for param in _CHAPTER_PARAMS:
             if not tpl.has(param):
                 continue
-            for number in _chapter_numbers(str(tpl.get(param).value)):
-                mapping.setdefault(number, volume)
-    return mapping
+            for row in _chapter_rows(str(tpl.get(param).value), volume):
+                key = (row.number, volume, row.title)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(row)
+    return rows
 
 
 def _article_url(title: str) -> str:
@@ -115,7 +195,7 @@ class WikipediaSource(DirectSource):
         self._client = client or httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT}, timeout=30, follow_redirects=True
         )
-        self._map_cache: dict[str, tuple[float, dict[float, int]]] = {}
+        self._metadata_cache: dict[str, tuple[float, list[ChapterMetadata]]] = {}
 
     async def _query(self, params: dict) -> dict:
         resp = await rl_request(
@@ -158,16 +238,20 @@ class WikipediaSource(DirectSource):
         raise NotImplementedError("wikipedia is metadata-only")
 
     async def get_volume_map(self, external_id: str) -> dict[float, int]:
-        cached = self._map_cache.get(external_id)
+        # a cheap derivation of get_chapter_metadata, which handles caching
+        return _rows_to_volume_map(await self.get_chapter_metadata(external_id))
+
+    async def get_chapter_metadata(self, external_id: str) -> list[ChapterMetadata]:
+        cached = self._metadata_cache.get(external_id)
         if cached and cached[0] > time.monotonic():
-            return dict(cached[1])
-        mapping: dict[float, int] = {}
+            return list(cached[1])
+        rows: list[ChapterMetadata] = []
         for page in await self._find_list_pages(external_id):
-            wikitext = await self._fetch_wikitext(page)
-            for number, volume in parse_volume_map(wikitext).items():
-                mapping.setdefault(number, volume)
-        self._map_cache[external_id] = (time.monotonic() + VOLUME_MAP_CACHE_TTL, mapping)
-        return dict(mapping)
+            rows.extend(parse_chapter_metadata(await self._fetch_wikitext(page)))
+        self._metadata_cache[external_id] = (
+            time.monotonic() + VOLUME_MAP_CACHE_TTL, rows,
+        )
+        return list(rows)
 
     async def _find_list_pages(self, article_title: str) -> list[str]:
         """The chapter-list page(s) for a series article, discovered at fetch

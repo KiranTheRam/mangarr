@@ -2,7 +2,12 @@ import httpx
 import pytest
 import respx
 
-from mangarr.sources.wikipedia import API_URL, WikipediaSource, parse_volume_map
+from mangarr.sources.wikipedia import (
+    API_URL,
+    WikipediaSource,
+    parse_chapter_metadata,
+    parse_volume_map,
+)
 
 # Shueisha/Viz style: {{Numbered list|start=N}} inside ChapterList columns
 NUMBERED_PAGE = """
@@ -132,6 +137,26 @@ class TestParseVolumeMap:
 | ChapterList = {{Numbered list|start=5|A}}
 }}"""
         assert parse_volume_map(text) == {}
+
+
+class TestParseChapterMetadata:
+    def test_numbered_list_includes_english_titles(self):
+        rows = parse_chapter_metadata(NUMBERED_PAGE)
+        assert [(row.number, row.volume, row.title) for row in rows[:3]] == [
+            (1.0, 1, "A"), (2.0, 1, "B"), (3.0, 1, "C"),
+        ]
+
+    def test_explicit_bonus_is_kept_unnumbered(self):
+        text = """{{Graphic novel list
+| VolumeNumber = 2
+| ChapterList =
+* 9. {{Nihongo|\"Main\"}}
+* Extra: {{Nihongo|\"A Day Off\"}}
+}}"""
+        rows = parse_chapter_metadata(text)
+        assert [(row.number, row.title, row.kind) for row in rows] == [
+            (9.0, "Main", "chapter"), (None, "A Day Off", "extra"),
+        ]
 
 
 def _search_json(*titles):

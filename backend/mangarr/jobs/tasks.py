@@ -13,6 +13,12 @@ from pathlib import Path
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..chapter_metadata import (
+    apply_metadata_rows,
+    apply_title,
+    apply_volume,
+    reconcile_decimal_volumes,
+)
 from ..db import session_scope
 from ..download.direct import download_chapter_to_cbz
 from ..download.qbittorrent import QbtClient
@@ -34,7 +40,7 @@ from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
 from ..titles import plausible_title_match, split_alt_titles, title_queries
 from ..util import normalize_title
-from ..volumes import distribute_over_disk_volumes, select_volume_map
+from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
 
 log = logging.getLogger(__name__)
 
@@ -274,20 +280,18 @@ async def update_chapters(
             if ch is None:
                 ch = Chapter(
                     number=sc.number,
-                    volume=sc.volume,
-                    title=sc.title,
                     monitored=series.monitored,
                 )
+                apply_volume(ch, sc.volume, sc.source_name)
+                apply_title(ch, sc.title, sc.source_name, series.title)
                 # append via the relationship so series.chapters is current for
                 # the scan/backfill later in this same pass
                 series.chapters.append(ch)
                 existing[sc.number] = ch
                 added += 1
             else:
-                if ch.volume is None and sc.volume is not None:
-                    ch.volume = sc.volume
-                if not ch.title and sc.title:
-                    ch.title = sc.title
+                apply_volume(ch, sc.volume, sc.source_name)
+                apply_title(ch, sc.title, sc.source_name, series.title)
 
     # MangaUpdates tracks releases even when no direct source serves them
     # yet (or ever) — add those chapters so Wanted reflects reality
@@ -323,12 +327,33 @@ async def update_chapters(
         or _has_internal_number_gap(existing)
     )
     if needs_volume_map:
-        volume_map = await fetch_volume_map(series, values)
-        added += _add_volume_map_gap_chapters(series, existing, volume_map)
+        _, volume_map, map_sources = await fetch_volume_map(series, values)
+        added += _add_volume_map_gap_chapters(series, existing, volume_map, map_sources)
+        # refine (and its decimal reconciliation) adds inferred entries the
+        # sources never claimed — those fall back to the "disk-inferred" label
         volume_map = refine_volume_map_with_disk(series, volume_map)
         for number, ch in existing.items():
-            if ch.volume is None and number in volume_map:
-                ch.volume = volume_map[number]
+            if number in volume_map:
+                apply_volume(ch, volume_map[number],
+                             map_sources.get(number, "disk-inferred"))
+
+    # Merge field-level metadata independently of chapter availability. This
+    # is where Wikipedia supplies titles and VIZ supplies official volumes.
+    # The fetches are independent (and usually cache hits), so run them
+    # concurrently; results apply in source order for determinism.
+    metadata_sources = [
+        (src, links[src.name]) for src in registry.enabled_direct_sources(values)
+        if src.name in links
+    ]
+    results = await asyncio.gather(
+        *(src.get_chapter_metadata(link.external_id) for src, link in metadata_sources),
+        return_exceptions=True,
+    )
+    for (src, _), rows in zip(metadata_sources, results):
+        if isinstance(rows, BaseException):
+            log.warning("chapter metadata failed on %s for %r: %s", src.name, series.title, rows)
+            continue
+        apply_metadata_rows(existing.values(), rows, series.title)
 
     await session.commit()
     return added
@@ -351,6 +376,7 @@ def _add_volume_map_gap_chapters(
     series: Series,
     existing: dict[float, Chapter],
     volume_map: dict[float, int],
+    map_sources: dict[float, str] | None = None,
 ) -> int:
     """Create missing chapters explicitly named by a selected volume map.
 
@@ -366,7 +392,11 @@ def _add_volume_map_gap_chapters(
     for number, volume in sorted(volume_map.items()):
         if number in existing or number < low or number > high or number <= 0:
             continue
-        ch = Chapter(number=number, volume=volume, monitored=series.monitored)
+        ch = Chapter(
+            number=number, volume=volume,
+            volume_source=(map_sources or {}).get(number, "disk-inferred"),
+            monitored=series.monitored,
+        )
         series.chapters.append(ch)
         existing[number] = ch
         added += 1
@@ -402,12 +432,15 @@ async def collect_volume_maps(
     return maps
 
 
-async def fetch_volume_map(series: Series, values: dict[str, str]) -> dict[float, int]:
-    """Chapter→volume assignments for a series: every linked source's volume
-    data is collected, and the single most complete source's assignments are
-    applied verbatim (sanitized of stray mislabeled chapters, never merged or
-    gap-guessed — see mangarr.volumes)."""
-    return select_volume_map(m for _, m in await collect_volume_maps(series, values))
+async def fetch_volume_map(
+    series: Series, values: dict[str, str]
+) -> tuple[str, dict[float, int], dict[float, str]]:
+    """Authority-ranked chapter→volume assignments for a series.
+
+    Returns (primary source name, mapping, per-chapter source labels) so
+    callers can stamp honest provenance; see :mod:`mangarr.volumes`.
+    """
+    return select_labeled_volume_map(await collect_volume_maps(series, values))
 
 
 def _series_folders(series: Series) -> list[Path]:
@@ -453,7 +486,9 @@ def refine_volume_map_with_disk(
         return volume_map
     disk_volumes = disk_volume_numbers(series)
     if not disk_volumes:
-        return volume_map
+        return reconcile_decimal_volumes(
+            volume_map, (c.number for c in series.chapters)
+        )
     finished = series.status in (SeriesStatus.FINISHED, SeriesStatus.CANCELLED)
     complete = bool(
         finished and series.total_volumes and max(disk_volumes) >= series.total_volumes
@@ -462,10 +497,11 @@ def refine_volume_map_with_disk(
         series.total_chapters / series.total_volumes
         if series.total_chapters and series.total_volumes else None
     )
-    return distribute_over_disk_volumes(
+    mapping = distribute_over_disk_volumes(
         volume_map, [c.number for c in series.chapters], disk_volumes,
         complete=complete, fallback_rate=fallback_rate,
     )
+    return reconcile_decimal_volumes(mapping, (c.number for c in series.chapters))
 
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:

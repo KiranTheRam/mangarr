@@ -130,6 +130,12 @@ class Chapter(Base):
     number: Mapped[float] = mapped_column(Float)  # 10.5 etc.
     volume: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str] = mapped_column(String, default="")
+    # Provenance is tracked per field because chapter existence, title, and
+    # printed-volume placement often come from different providers.
+    title_source: Mapped[str] = mapped_column(String, default="")
+    volume_source: Mapped[str] = mapped_column(String, default="")
+    title_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    volume_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     monitored: Mapped[bool] = mapped_column(Boolean, default=True)
     downloaded: Mapped[bool] = mapped_column(Boolean, default=False)
     file_path: Mapped[str] = mapped_column(String, default="")

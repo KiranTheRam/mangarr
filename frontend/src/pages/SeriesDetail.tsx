@@ -286,6 +286,7 @@ function VolumeResyncModal({
 }) {
   const selected =
     preview.candidates.find((c) => c.source === source) ?? preview.candidates[0];
+  const sourceLabel = (value: string) => value === "auto" ? "Recommended merge" : value;
   const vol = (v: number | null) => (v == null ? "—" : `Vol. ${v}`);
   const bestHasChanges = preview.candidates[0]?.has_changes;
   // when nothing would change, the interesting view is the mapping itself
@@ -316,7 +317,7 @@ function VolumeResyncModal({
             onChange={() => onPick(c.source)}
           />
           <span>
-            <strong>{c.source}</strong>
+            <strong>{sourceLabel(c.source)}</strong>
             {i === 0 && (
               <span className="pill green" style={{ marginLeft: 8 }}>
                 best match
@@ -338,7 +339,7 @@ function VolumeResyncModal({
       {selected && (
         <>
           <div style={{ margin: "14px 0 8px", color: "var(--text-dim)", fontSize: 13 }}>
-            Applying <strong>{selected.source}</strong> leaves {selected.assigned} chapter
+            Applying <strong>{sourceLabel(selected.source)}</strong> leaves {selected.assigned} chapter
             {selected.assigned === 1 ? "" : "s"} assigned to volumes, changes{" "}
             {selected.changed} assignment{selected.changed === 1 ? "" : "s"}
             {selected.repointed > 0 &&
@@ -392,7 +393,7 @@ function VolumeResyncModal({
               </div>
             ) : (
               <p style={{ color: "var(--text-dim)" }}>
-                No changes — {selected.source}'s mapping matches the current volume
+                No changes — {sourceLabel(selected.source)} matches the current volume
                 assignments.
               </p>
             )
@@ -445,7 +446,7 @@ function VolumeResyncModal({
           Keep current volumes
         </button>
         <button className="btn primary" disabled={applying || !selected} onClick={onApply}>
-          {applying ? "Applying…" : `Apply ${selected?.source ?? ""} volumes`}
+          {applying ? "Applying…" : `Apply ${selected ? sourceLabel(selected.source) : ""} volumes`}
         </button>
       </div>
     </Modal>
@@ -466,12 +467,83 @@ function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: 
     .map(([volume, chs]) => ({ volume, chapters: chs.sort((a, b) => b.number - a.number) }));
 }
 
+function ChapterMetadataModal({
+  seriesId,
+  chapter,
+  onClose,
+  onSaved,
+}: {
+  seriesId: number;
+  chapter: Chapter;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [title, setTitle] = useState(chapter.title);
+  const [volume, setVolume] = useState(chapter.volume == null ? "" : String(chapter.volume));
+  const [titleLocked, setTitleLocked] = useState(chapter.title_locked);
+  const [volumeLocked, setVolumeLocked] = useState(chapter.volume_locked);
+  const save = useMutation({
+    mutationFn: () => api.put(`/series/${seriesId}/chapters/${chapter.id}/metadata`, {
+      title,
+      volume: volume.trim() === "" ? null : Number(volume),
+      title_locked: titleLocked,
+      volume_locked: volumeLocked,
+    }),
+    onSuccess: () => {
+      onSaved();
+      onClose();
+    },
+  });
+  return (
+    <Modal title={`Edit ${chapterLabel(chapter.number, chapter.volume)}`} onClose={onClose}>
+      <div className="form-row">
+        <label>Title</label>
+        <input
+          value={title}
+          onChange={(event) => {
+            setTitle(event.target.value);
+            setTitleLocked(true);
+          }}
+        />
+      </div>
+      <div className="form-row">
+        <label>Volume</label>
+        <input
+          type="number"
+          min="1"
+          value={volume}
+          onChange={(event) => {
+            setVolume(event.target.value);
+            setVolumeLocked(true);
+          }}
+        />
+      </div>
+      <label style={{ display: "block", marginBottom: 8 }}>
+        <input type="checkbox" checked={titleLocked} onChange={(event) => setTitleLocked(event.target.checked)} />{" "}
+        Keep this title during future refreshes
+      </label>
+      <label style={{ display: "block" }}>
+        <input type="checkbox" checked={volumeLocked} onChange={(event) => setVolumeLocked(event.target.checked)} />{" "}
+        Keep this volume during future refreshes/resyncs
+      </label>
+      {save.isError && <div className="error-banner">{(save.error as Error).message}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+        <button className="btn" onClick={onClose}>Cancel</button>
+        <button className="btn primary" disabled={save.isPending || (volume !== "" && Number(volume) < 1)} onClick={() => save.mutate()}>
+          {save.isPending ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 export default function SeriesDetail() {
   const { id } = useParams();
   const seriesId = Number(id);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState<{ chapterId?: number; title: string } | null>(null);
+  const [editingChapter, setEditingChapter] = useState<Chapter | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const toggleReveal = (k: string) => setRevealed((r) => ({ ...r, [k]: !r[k] }));
@@ -641,7 +713,7 @@ export default function SeriesDetail() {
           <th style={{ width: 130 }}>Chapter</th>
           <th>Title</th>
           <th style={{ width: 120 }}>Status</th>
-          <th style={{ width: 90 }}></th>
+          <th style={{ width: 125 }}></th>
         </tr>
       </thead>
       <tbody>
@@ -674,7 +746,10 @@ export default function SeriesDetail() {
                 <div className="filepath">{ch.file_path}</div>
               )}
             </td>
-            <td style={{ color: ch.title ? "inherit" : "var(--text-faint)" }}>
+            <td
+              style={{ color: ch.title ? "inherit" : "var(--text-faint)" }}
+              title={ch.title_source ? `Title source: ${ch.title_source}${ch.title_locked ? " (locked)" : ""}` : undefined}
+            >
               {ch.title || "—"}
             </td>
             <td>
@@ -687,6 +762,13 @@ export default function SeriesDetail() {
               )}
             </td>
             <td>
+              <button
+                className="btn icon-btn"
+                title={`Edit title and volume${ch.volume_source ? ` (volume source: ${ch.volume_source})` : ""}`}
+                onClick={() => setEditingChapter(ch)}
+              >
+                ✏️
+              </button>
               <button
                 className="btn icon-btn"
                 title="Interactive search"
@@ -966,6 +1048,14 @@ export default function SeriesDetail() {
           chapterId={search.chapterId}
           title={search.title}
           onClose={() => setSearch(null)}
+        />
+      )}
+      {editingChapter && (
+        <ChapterMetadataModal
+          seriesId={seriesId}
+          chapter={editingChapter}
+          onClose={() => setEditingChapter(null)}
+          onSaved={invalidate}
         />
       )}
       {resyncPreview && (

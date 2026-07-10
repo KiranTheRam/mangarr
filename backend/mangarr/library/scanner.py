@@ -14,9 +14,10 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..chapter_metadata import apply_title
 from ..models import Chapter, Series
 from ..util import BRACKET_GROUPS, normalize_title
-from .matcher import MediaFile, find_media_files, match_files
+from .matcher import MediaFile, comicinfo_title, find_media_files, match_files
 from .naming import series_folder
 
 log = logging.getLogger(__name__)
@@ -123,6 +124,13 @@ def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) ->
         if mf.chapter is None:
             continue
         chapter = mf.chapter
+        # read ComicInfo lazily, only for files that matched a chapter and
+        # only when the title could actually be applied (comicinfo_title
+        # caches per file version, so repeat scans just stat)
+        if not mf.media.is_dir and not getattr(chapter, "title_locked", False):
+            title = comicinfo_title(mf.media.path)
+            if title:
+                apply_title(chapter, title, "comicinfo", series.title)
         path_str = str(mf.media.path)
         if chapter.id not in owned_now and (
             not chapter.downloaded or chapter.file_path != path_str

@@ -16,6 +16,10 @@ export interface Chapter {
   number: number;
   volume: number | null;
   title: string;
+  title_source: string;
+  volume_source: string;
+  title_locked: boolean;
+  volume_locked: boolean;
   monitored: boolean;
   downloaded: boolean;
   file_path: string;

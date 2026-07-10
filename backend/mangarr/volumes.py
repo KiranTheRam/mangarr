@@ -1,14 +1,12 @@
 """Select a trustworthy chapter→volume map from source metadata.
 
-Volume→chapter data (MangaDex /aggregate is the only structured source;
-MangaUpdates contributes sparse per-release volume tags) is community-entered
-and varies wildly in completeness per source. mangarr does not guess ranges:
-each source's map is sanitized (a lone mislabeled chapter — e.g. one
-scanlation tagging chapter 232 as volume 1 — breaks volume monotonicity in
-chapter order and is dropped), and then the single most complete source's
-assignments are applied verbatim. Explicit chapter numbers from that map may
-fill gaps between chapters seen from chapter/release sources; chapters no
-source can name stay unassigned rather than being distributed by heuristics.
+Volume→chapter data varies wildly in authority and completeness. Every map is
+sanitized (a lone mislabeled chapter — e.g. one scanlation tagging chapter 232
+as volume 1 — breaks monotonicity and is dropped), then official and printed
+table-of-contents sources rank above community aggregates. Lower-ranked data
+extends the primary row by row: a row is merged only when the result doesn't
+already cover that chapter and the volume fits monotonically between the
+accepted neighbours, and every merged row remembers which source supplied it.
 
 The one exception is the user's own files: volume archives already on disk
 prove those volumes exist, and distribute_over_disk_volumes() uses their
@@ -20,18 +18,65 @@ would be re-downloaded.
 import bisect
 from collections.abc import Iterable
 
+from .chapter_metadata import source_authority
 
-def select_volume_map(maps: Iterable[dict[float, int]]) -> dict[float, int]:
-    """The most complete source's assignments, sanitized. Sources are given
-    in priority order; on equal coverage the earlier one wins. Maps are never
-    merged — mixing two sources' volume boundaries produces garbage neither
-    of them claims."""
-    best: dict[float, int] = {}
-    for m in maps:
-        cleaned = sanitize_volume_map(m)
-        if len(cleaned) > len(best):
-            best = cleaned
-    return best
+
+def rank_labeled_volume_maps(
+    maps: Iterable[tuple[str, dict[float, int]]],
+) -> list[tuple[str, dict[float, int]]]:
+    """Sanitize and rank maps by authority, then coverage.
+
+    This prevents a large but sparse/interpolated community map from beating
+    an official catalogue or a printed table of contents simply by having
+    more rows.
+    """
+    cleaned = [(name, sanitize_volume_map(mapping)) for name, mapping in maps]
+    return sorted(
+        ((name, mapping) for name, mapping in cleaned if mapping),
+        key=lambda item: (source_authority(item[0]), len(item[1])),
+        reverse=True,
+    )
+
+
+def select_labeled_volume_map(
+    maps: Iterable[tuple[str, dict[float, int]]],
+) -> tuple[str, dict[float, int], dict[float, str]]:
+    """Choose the most authoritative map and extend it with non-conflicting rows.
+
+    Lower-ranked maps contribute, in rank order, only chapters the result
+    doesn't already cover, and only where the volume fits monotonically
+    between the accepted neighbours — a conflicting row loses to the
+    higher-ranked value and an out-of-order row is dropped, but nothing
+    already accepted is ever displaced.
+
+    Returns (primary source name, mapping, per-chapter source labels).
+    """
+    return select_ranked_volume_maps(rank_labeled_volume_maps(maps))
+
+
+def select_ranked_volume_maps(
+    ranked: list[tuple[str, dict[float, int]]],
+) -> tuple[str, dict[float, int], dict[float, str]]:
+    """The merge behind select_labeled_volume_map, for callers that already
+    ranked (and thereby sanitized) their maps."""
+    if not ranked:
+        return "", {}, {}
+    primary, result = ranked[0][0], dict(ranked[0][1])
+    sources = dict.fromkeys(result, primary)
+    ordered = sorted(result)
+    for name, candidate in ranked[1:]:
+        for number, volume in sorted(candidate.items()):
+            if number in result:
+                continue
+            i = bisect.bisect_left(ordered, number)
+            if i > 0 and result[ordered[i - 1]] > volume:
+                continue
+            if i < len(ordered) and volume > result[ordered[i]]:
+                continue
+            result[number] = volume
+            sources[number] = name
+            ordered.insert(i, number)
+    return primary, result, sources
 
 
 def sanitize_volume_map(mapping: dict[float, int]) -> dict[float, int]:
@@ -105,6 +150,26 @@ def distribute_over_disk_volumes(
         volumes = sorted(v for v in set(disk_volumes) if v > max(mapping.values()))
     if not positioned or not volumes:
         return result
+    if complete and sparse and mapping:
+        # Interpolate on both sides of sparse anchors instead of splitting the
+        # whole series blindly and then overwriting the anchors. This keeps the
+        # result monotonic and prevents overlapping volume ranges.
+        available = sorted(set(volumes))
+        anchors = [(i, mapping[n]) for i, n in positioned if n in mapping]
+        for position, number in positioned:
+            if number in mapping:
+                continue
+            left = max((a for a in anchors if a[0] < position), default=None)
+            right = min((a for a in anchors if a[0] > position), default=None)
+            lo_pos, lo_vol = left or (0, available[0])
+            hi_pos, hi_vol = right or (len(positioned) - 1, available[-1])
+            if hi_pos == lo_pos:
+                estimate = lo_vol
+            else:
+                fraction = (position - lo_pos) / (hi_pos - lo_pos)
+                estimate = round(lo_vol + (hi_vol - lo_vol) * fraction)
+            result[number] = min(available, key=lambda v: abs(v - estimate))
+        return sanitize_volume_map(result)
     if complete:
         per = len(positioned) / len(volumes)
     else:

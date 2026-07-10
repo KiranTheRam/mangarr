@@ -3,46 +3,56 @@
 from mangarr.volumes import (
     distribute_over_disk_volumes,
     sanitize_volume_map,
-    select_volume_map,
+    select_labeled_volume_map,
 )
 
 
-class TestSelectVolumeMap:
-    def test_most_complete_source_wins_verbatim(self):
-        # Seihantai na Kimi to Boku: MangaDex aggregate knows vols 1-2
-        # (ch 1-14), MangaUpdates has zero volume tags — apply MangaDex
-        # as-is and leave everything else honestly unassigned
-        mangadex = {float(n): 1 for n in range(1, 7)} | {float(n): 2 for n in range(7, 15)}
-        result = select_volume_map([mangadex, {}])
-        assert result == mangadex
-        assert 15.0 not in result
+class TestSelectLabeledVolumeMap:
+    def test_official_map_extended_with_labeled_non_conflicting_rows(self):
+        viz = {1.0: 1, 2.0: 1, 3.0: 2}
+        wikipedia = {1.0: 1, 2.0: 1, 3.0: 2, 4.0: 2, 5.0: 3}
+        source, result, sources = select_labeled_volume_map([
+            ("wikipedia", wikipedia),
+            ("viz", viz),
+        ])
+        assert source == "viz"
+        assert result == wikipedia
+        assert sources[3.0] == "viz"
+        assert sources[5.0] == "wikipedia"
 
-    def test_richer_later_source_beats_sparse_earlier_one(self):
-        sparse = {100.0: 11}
-        rich = {float(c): (c - 1) // 9 + 1 for c in range(1, 100)}
-        assert select_volume_map([sparse, rich]) == rich
+    def test_conflicting_rows_lose_but_non_conflicting_rows_still_merge(self):
+        viz = {1.0: 1, 2.0: 1, 3.0: 2}
+        conflicting = {1.0: 1, 2.0: 2, 3.0: 2, 4.0: 3}
+        _, result, sources = select_labeled_volume_map([
+            ("viz", viz), ("mangaupdates", conflicting),
+        ])
+        # chapter 2 keeps viz's placement; chapter 4 fills from mangaupdates
+        assert result == {1.0: 1, 2.0: 1, 3.0: 2, 4.0: 3}
+        assert sources[2.0] == "viz"
+        assert sources[4.0] == "mangaupdates"
 
-    def test_earlier_source_wins_ties(self):
-        a = {1.0: 1, 2.0: 1}
-        b = {1.0: 5, 2.0: 5}
-        assert select_volume_map([a, b]) == a
+    def test_extension_never_displaces_official_rows(self):
+        # a self-consistent community tail that contradicts the official
+        # ordering (chapters 10/11 tagged vol 1 after viz already put
+        # chapter 3 in vol 2) must be dropped, not merged — merging it and
+        # re-sanitizing used to evict viz's own 3→2 row
+        viz = {1.0: 1, 2.0: 1, 3.0: 2}
+        mu = {1.0: 1, 2.0: 1, 10.0: 1, 11.0: 1}
+        _, result, _ = select_labeled_volume_map([("viz", viz), ("mangaupdates", mu)])
+        assert result == viz
 
-    def test_maps_are_never_merged(self):
-        a = {1.0: 1, 2.0: 1, 3.0: 2}
-        b = {4.0: 9, 5.0: 9}
-        result = select_volume_map([a, b])
-        assert result == a
-        assert 4.0 not in result
-
-    def test_candidates_are_sanitized_before_comparison(self):
+    def test_candidates_are_sanitized_before_ranking(self):
         # a source whose entries mostly contradict each other offers less
         # usable data than its raw size suggests
         contradictory = {1.0: 5, 2.0: 1, 3.0: 4, 4.0: 2}  # best subset: 2
         consistent = {1.0: 1, 2.0: 1, 3.0: 2}
-        assert select_volume_map([contradictory, consistent]) == consistent
+        _, result, _ = select_labeled_volume_map([
+            ("mangadex", contradictory), ("mangaplus", consistent),
+        ])
+        assert {n: result[n] for n in consistent} == consistent
 
     def test_empty(self):
-        assert select_volume_map([]) == {}
+        assert select_labeled_volume_map([]) == ("", {}, {})
 
 
 class TestSanitizeVolumeMap:

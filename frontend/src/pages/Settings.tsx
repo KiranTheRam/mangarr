@@ -61,11 +61,15 @@ const SOURCE_LABELS: Record<string, string> = {
   mangadex: "MangaDex",
   weebcentral: "WeebCentral",
   asura: "Asura Scans",
+  viz: "VIZ (official metadata)",
+  wikipedia: "Wikipedia (metadata)",
   nyaa: "Nyaa (torrents)",
 };
 
 const SOURCE_HINTS: Record<string, string> = {
   mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
+  viz: "Exact printed-volume mappings for VIZ-licensed series; does not download chapters.",
+  wikipedia: "Chapter titles and printed-volume tables for publishers not covered by VIZ.",
   nyaa: "Sent to the download client below and imported when complete.",
 };
 

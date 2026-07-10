@@ -28,6 +28,10 @@ class ChapterOut(BaseModel):
     number: float
     volume: int | None
     title: str
+    title_source: str
+    volume_source: str
+    title_locked: bool
+    volume_locked: bool
     monitored: bool
     downloaded: bool
     file_path: str
@@ -110,6 +114,14 @@ class SeriesUpdateIn(BaseModel):
 class ChapterMonitorIn(BaseModel):
     chapter_ids: list[int]
     monitored: bool
+
+
+class ChapterMetadataIn(BaseModel):
+    """User-confirmed chapter metadata. Locks survive future refreshes."""
+    title: str = ""
+    volume: int | None = Field(default=None, ge=1)
+    title_locked: bool = True
+    volume_locked: bool = True
 
 
 class MetadataResult(BaseModel):

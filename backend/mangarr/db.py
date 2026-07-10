@@ -28,6 +28,10 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("series", "mangaupdates_id", "BIGINT", "ux_series_mangaupdates_id"),
     ("series", "folder_pinned", "BOOLEAN NOT NULL DEFAULT 0", None),
     ("series", "metadata_refreshed_at", "DATETIME", None),
+    ("chapters", "title_source", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("chapters", "volume_source", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("chapters", "title_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("chapters", "volume_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
 ]
 
 

@@ -1,11 +1,15 @@
 """Shared, read-only matching of on-disk files to tracked chapters.
 
 Used both by the importer (copying completed downloads into the library) and
-the scanner (adopting an existing library in place). Filename-based only — it
-never opens or writes files."""
+the scanner (adopting an existing library in place). Matching is filename-based
+and never opens files; comicinfo_title() reads a CBZ's ComicInfo.xml on demand
+(cached per file version) for callers that already matched the file to a
+chapter. Files are never written."""
 
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.etree import ElementTree
 
 from ..models import Chapter
 from ..util import has_chapter_marker, parse_chapter_number, parse_volume_number
@@ -83,6 +87,43 @@ def _media_of(path: Path, is_dir: bool) -> MediaFile:
     if volume is not None and chapter is not None and not has_chapter_marker(text):
         chapter = None
     return MediaFile(path=path, is_dir=is_dir, chapter_number=chapter, volume_number=volume)
+
+
+# path -> (mtime, size, title); opening every archive on every scan is far too
+# slow for a network-mounted library, so each file version is read only once
+_comicinfo_cache: dict[str, tuple[float, int, str]] = {}
+
+
+def comicinfo_title(path: Path) -> str:
+    """The standard ComicInfo Title field from a CBZ/ZIP, if present."""
+    if path.suffix.lower() not in {".cbz", ".zip"}:
+        return ""
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    cached = _comicinfo_cache.get(str(path))
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    title = _read_comicinfo_title(path)
+    _comicinfo_cache[str(path)] = (stat.st_mtime, stat.st_size, title)
+    return title
+
+
+def _read_comicinfo_title(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            member = next(
+                (name for name in archive.namelist()
+                 if Path(name).name.lower() == "comicinfo.xml"),
+                None,
+            )
+            if member is None:
+                return ""
+            root = ElementTree.fromstring(archive.read(member))
+            return " ".join((root.findtext("Title") or "").split())
+    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError):
+        return ""
 
 
 def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
