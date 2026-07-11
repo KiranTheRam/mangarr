@@ -6,28 +6,7 @@ services:
       - "6996:6996"
     volumes:
       - ./data/mangarr-config:/config
-      # One shared media mount for both containers: the manga library and the
-      # torrent downloads live on the same filesystem, so completed torrents
-      # can be hardlinked into the library (no copy, keeps seeding). In the
-      # mangarr UI: Root Folders -> /media/manga, Downloads folder ->
-      # /media/torrents.
-      - ./data/media:/media
-    restart: unless-stopped
-
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: mangarr-qbittorrent
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=Etc/UTC
-      - WEBUI_PORT=8080
-    ports:
-      - "8080:8080"
-      - "6881:6881"
-      - "6881:6881/udp"
-    volumes:
-      - ./data/qbittorrent-config:/config
-      # must match mangarr's mount so both see downloads at the same path
+      # Mount the same media path in your existing qBittorrent container so
+      # Mangarr can import completed downloads and hardlink them into the library.
       - ./data/media:/media
     restart: unless-stopped

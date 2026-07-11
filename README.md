@@ -57,28 +57,37 @@ git clone <this repo> mangarr && cd mangarr
 docker compose up -d
 ```
 
-Open <http://localhost:6996>. The compose file also starts a
-[linuxserver/qbittorrent](https://docs.linuxserver.io/images/docker-qbittorrent/)
-container on <http://localhost:8080> sharing one `./data/media` volume with
-mangarr — a single shared mount holding both the library and the torrent
-downloads, so mangarr sees completed downloads at the same path qBittorrent
-reports **and** can hardlink them into the library (no duplicate space, the
-torrent keeps seeding). On a NAS/unRAID, map your media share the same way
-into both containers (e.g. `/mnt/user/media:/media`).
+The default Compose file runs the published `kirantheram/mangarr:latest`
+Docker Hub image and stores configuration and media under `./data`. Open
+<http://localhost:6996> after it starts.
 
 First-run checklist, in the mangarr UI:
 
 1. **Settings → Root Folders**: add `/media/manga`.
-2. **Settings → Download Client**: qBittorrent URL `http://qbittorrent:8080`
-   plus the WebUI credentials (check the qbittorrent container logs for the
-   temporary password on first boot), then *Test Connection*. Set
-   **Downloads folder** to `/media/torrents` (browseable) so torrents land on
-   the same filesystem as the library and imports can hardlink.
-3. **Settings → MangaDex Account** (recommended): create a free account at
+2. **Settings → MangaDex Account** (recommended): create a free account at
    mangadex.org, then *Settings → API Clients* there to make a personal
    client; paste client id/secret and your username/password.
-4. **Add New**: search a title, pick a root folder, add. Chapters appear after
+3. **Add New**: search a title, pick a root folder, add. Chapters appear after
    the automatic source-linking pass (a few seconds).
+
+### Using an existing qBittorrent container
+
+Mangarr does not bundle qBittorrent. To enable torrent downloads, connect it
+to a qBittorrent instance you already run:
+
+1. Mount the same host media directory into both containers at the same
+   container path. With the default Compose file, mount `./data/media` in
+   qBittorrent as `/media` too. On a NAS or unRAID system, both containers
+   could instead use a shared mapping such as `/mnt/user/media:/media`.
+2. Make qBittorrent reachable from Mangarr. Put both containers on the same
+   Docker network and use a URL such as `http://qbittorrent:8080`, or use the
+   qBittorrent host's LAN address and WebUI port.
+3. In **Settings → Download Client**, enter that URL and the qBittorrent WebUI
+   credentials, then select **Test Connection**.
+4. Set **Downloads folder** to `/media/torrents`. Because qBittorrent and
+   Mangarr see the same path, Mangarr can import completed downloads and
+   hardlink them into `/media/manga` without duplicating data while the
+   torrent continues seeding.
 
 ## Using an existing library
 
