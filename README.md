@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="frontend/public/mangarr-icon.svg" width="160" height="160" alt="Mangarr icon">
+</p>
+
 # mangarr
 
 Radarr/Sonarr-style automation for manga. Monitor series, automatically grab

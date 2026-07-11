@@ -115,8 +115,9 @@ input[type="checkbox"] {
 }
 
 .sidebar-logo .logo-mark {
-  color: var(--accent);
-  font-size: 22px;
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
 }
 
 .sidebar nav {
