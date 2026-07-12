@@ -1,6 +1,6 @@
 [project]
 name = "mangarr"
-version = "0.1.0"
+version = "0.1.1"
 description = "Radarr/Sonarr-style automation for manga and comics"
 requires-python = ">=3.11"
 dependencies = [

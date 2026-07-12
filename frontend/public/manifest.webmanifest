@@ -1,0 +1,17 @@
+{
+  "name": "Mangarr",
+  "short_name": "Mangarr",
+  "description": "Manga collection manager",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1d24",
+  "theme_color": "#20242c",
+  "icons": [
+    {
+      "src": "/mangarr-icon.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

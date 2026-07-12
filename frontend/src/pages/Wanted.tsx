@@ -24,7 +24,7 @@ export default function Wanted() {
             hint="All monitored chapters are downloaded."
           />
         ) : (
-          <table className="data-table">
+          <table className="data-table card-table wanted-table">
             <thead>
               <tr>
                 <th style={{ width: 280 }}>Series</th>
@@ -35,13 +35,13 @@ export default function Wanted() {
             <tbody>
               {data.map((w) => (
                 <tr key={w.chapter_id}>
-                  <td>
+                  <td className="cell-series">
                     <Link to={`/series/${w.series_id}`} style={{ color: "var(--info)" }}>
                       {w.series_title}
                     </Link>
                   </td>
-                  <td>{chapterLabel(w.number, w.volume)}</td>
-                  <td style={{ color: "var(--text-dim)" }}>{w.title || "—"}</td>
+                  <td className="cell-chapter">{chapterLabel(w.number, w.volume)}</td>
+                  <td className="cell-wtitle" style={{ color: "var(--text-dim)" }}>{w.title || "—"}</td>
                 </tr>
               ))}
             </tbody>

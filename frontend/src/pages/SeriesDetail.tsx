@@ -190,7 +190,7 @@ function InteractiveSearch({
               </button>
             </div>
           )}
-          <table className="data-table">
+          <table className="data-table card-table release-table">
             <thead>
               <tr>
                 {directSelectable.length > 0 && <th style={{ width: 42 }}></th>}
@@ -204,7 +204,7 @@ function InteractiveSearch({
               {visibleReleases.map((r, i) => (
                 <tr key={`${r.source_name}-${r.external_id || r.magnet || i}`}>
                   {directSelectable.length > 0 && (
-                    <td>
+                    <td className="cell-select">
                       {r.kind === "direct" && (r.chapter_id ?? chapterId) != null && (
                         <input
                           type="checkbox"
@@ -214,7 +214,7 @@ function InteractiveSearch({
                       )}
                     </td>
                   )}
-                  <td>
+                  <td className="cell-rtitle">
                     {r.url ? (
                       <a href={r.url} target="_blank" rel="noreferrer" style={{ color: "var(--info)" }}>
                         {r.title}
@@ -223,9 +223,9 @@ function InteractiveSearch({
                       r.title
                     )}
                   </td>
-                  <td>{r.kind === "torrent" ? formatBytes(r.size_bytes) : "—"}</td>
-                  <td>{r.kind === "torrent" ? `${r.seeders}/${r.leechers}` : "—"}</td>
-                  <td>
+                  <td className="cell-size">{r.kind === "torrent" ? formatBytes(r.size_bytes) : "—"}</td>
+                  <td className="cell-peers">{r.kind === "torrent" ? `${r.seeders}/${r.leechers}` : "—"}</td>
+                  <td className="cell-grab">
                     <button
                       className="btn icon-btn"
                       title="Grab"
@@ -545,6 +545,8 @@ export default function SeriesDetail() {
   const [search, setSearch] = useState<{ chapterId?: number; title: string } | null>(null);
   const [editingChapter, setEditingChapter] = useState<Chapter | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  // mobile: the synopsis is clamped to a few lines; tapping it toggles the full text
+  const [descExpanded, setDescExpanded] = useState(false);
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const toggleReveal = (k: string) => setRevealed((r) => ({ ...r, [k]: !r[k] }));
   const [showRename, setShowRename] = useState(false);
@@ -706,7 +708,7 @@ export default function SeriesDetail() {
     Boolean(busyNotice || scanResult || volumeResult) || activeDownloads.length > 0;
 
   const chapterRows = (chapters: Chapter[]) => (
-    <table className="data-table">
+    <table className="data-table card-table chapter-table">
       <thead>
         <tr>
           <th style={{ width: 36 }}></th>
@@ -719,7 +721,7 @@ export default function SeriesDetail() {
       <tbody>
         {chapters.map((ch) => (
           <tr key={ch.id}>
-            <td>
+            <td className="cell-monitor">
               <button
                 className={`monitor-toggle${ch.monitored ? " on" : ""}`}
                 title={ch.monitored ? "Monitored" : "Unmonitored"}
@@ -730,7 +732,7 @@ export default function SeriesDetail() {
                 {ch.monitored ? "🔖" : "◻"}
               </button>
             </td>
-            <td>
+            <td className="cell-chapter">
               {ch.downloaded && ch.file_path && !isVolumeArchive(ch.file_path) ? (
                 <button
                   className="link-text"
@@ -747,12 +749,13 @@ export default function SeriesDetail() {
               )}
             </td>
             <td
+              className="cell-title"
               style={{ color: ch.title ? "inherit" : "var(--text-faint)" }}
               title={ch.title_source ? `Title source: ${ch.title_source}${ch.title_locked ? " (locked)" : ""}` : undefined}
             >
               {ch.title || "—"}
             </td>
-            <td>
+            <td className="cell-status">
               {ch.downloaded ? (
                 <span className="pill green" title={ch.file_path}>
                   Downloaded
@@ -761,7 +764,7 @@ export default function SeriesDetail() {
                 <span className="pill gray">Missing</span>
               )}
             </td>
-            <td>
+            <td className="cell-actions">
               <button
                 className="btn icon-btn"
                 title={`Edit title and volume${ch.volume_source ? ` (volume source: ${ch.volume_source})` : ""}`}
@@ -918,22 +921,24 @@ export default function SeriesDetail() {
           style={series.banner_url ? { backgroundImage: `url(${series.banner_url})` } : {}}
         >
           {series.cover_url && <img className="cover" src={series.cover_url} alt="" />}
-          <div>
-            <h2>
-              {series.title}{" "}
-              {series.year && <span style={{ color: "var(--text-dim)" }}>({series.year})</span>}
-            </h2>
-            {series.english_title && series.english_title !== series.title && (
-              <div className="alt-title-line series-alt-title">
-                English: {series.english_title}
+          <div className="series-info">
+            <div className="series-title-block">
+              <h2>
+                {series.title}{" "}
+                {series.year && <span style={{ color: "var(--text-dim)" }}>({series.year})</span>}
+              </h2>
+              {series.english_title && series.english_title !== series.title && (
+                <div className="alt-title-line series-alt-title">
+                  English: {series.english_title}
+                </div>
+              )}
+              <div className="series-meta">
+                <span className={`pill ${statusPill[series.status] ?? "gray"}`}>{series.status}</span>
+                <span>
+                  {series.downloaded_count} / {series.chapter_count} chapters
+                </span>
+                {series.total_volumes && <span>{series.total_volumes} volumes</span>}
               </div>
-            )}
-            <div className="series-meta">
-              <span className={`pill ${statusPill[series.status] ?? "gray"}`}>{series.status}</span>
-              <span>
-                {series.downloaded_count} / {series.chapter_count} chapters
-              </span>
-              {series.total_volumes && <span>{series.total_volumes} volumes</span>}
             </div>
             <div style={{ marginBottom: 10 }}>
               {series.genres
@@ -946,7 +951,8 @@ export default function SeriesDetail() {
                 ))}
             </div>
             <div
-              className="series-desc"
+              className={`series-desc${descExpanded ? " expanded" : ""}`}
+              onClick={() => setDescExpanded((v) => !v)}
               dangerouslySetInnerHTML={{ __html: sanitizeDescription(series.description) }}
             />
             <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>

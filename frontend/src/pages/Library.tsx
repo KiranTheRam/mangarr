@@ -90,7 +90,7 @@ export default function Library() {
 
   return (
     <>
-      <Toolbar title="Library">
+      <Toolbar title="Library" className="library-toolbar">
         <select value={filters.monitored} onChange={setFilter("monitored")}>
           <option value="all">All</option>
           <option value="monitored">Monitored</option>
@@ -108,10 +108,10 @@ export default function Library() {
         </select>
         <input
           type="search"
+          className="toolbar-search"
           placeholder="Search library…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          style={{ width: 260 }}
         />
         {filtering && data && filtered && (
           <span style={{ fontSize: 12, color: "#999" }}>

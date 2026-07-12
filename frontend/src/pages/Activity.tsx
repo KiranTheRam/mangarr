@@ -61,7 +61,7 @@ function Queue() {
           {removeSelected.isPending ? "Removing…" : "Remove selected"}
         </button>
       </div>
-      <table className="data-table">
+      <table className="data-table card-table queue-table">
         <thead>
           <tr>
             <th style={{ width: 34 }}>
@@ -82,14 +82,14 @@ function Queue() {
         <tbody>
           {data.map((item) => (
             <tr key={item.id}>
-              <td>
+              <td className="cell-select">
                 <input
                   type="checkbox"
                   checked={selected.has(item.id)}
                   onChange={() => toggle(item.id)}
                 />
               </td>
-              <td>
+              <td className="cell-qtitle">
                 {item.title || item.series_title}
                 {item.status === "failed" && item.error && (
                   <div style={{ color: "var(--danger)", fontSize: "0.85em", marginTop: 2 }}>
@@ -97,22 +97,22 @@ function Queue() {
                   </div>
                 )}
               </td>
-              <td>{item.source_name}</td>
-              <td>
+              <td className="cell-source">{item.source_name}</td>
+              <td className="cell-type">
                 <span className={`pill ${item.kind === "torrent" ? "orange" : "blue"}`}>
                   {item.kind}
                 </span>
               </td>
-              <td>
+              <td className="cell-status">
                 <span className={`pill ${statusPill[item.status] ?? "gray"}`}>{item.status}</span>
               </td>
-              <td>
+              <td className="cell-progress">
                 <div className="progress-bar">
                   <div style={{ width: `${Math.round(item.progress * 100)}%` }} />
                   <span>{Math.round(item.progress * 100)}%</span>
                 </div>
               </td>
-              <td>
+              <td className="cell-remove">
                 <button
                   className="btn icon-btn"
                   title="Remove"
@@ -141,7 +141,7 @@ function History() {
   if (!data || data.length === 0) return <EmptyState icon="🕘" title="No history yet" />;
 
   return (
-    <table className="data-table">
+    <table className="data-table card-table history-table">
       <thead>
         <tr>
           <th style={{ width: 100 }}>Event</th>
@@ -154,13 +154,13 @@ function History() {
       <tbody>
         {data.map((ev) => (
           <tr key={ev.id}>
-            <td>
+            <td className="cell-event">
               <span className={`pill ${statusPill[ev.event] ?? "gray"}`}>{ev.event}</span>
             </td>
-            <td>{ev.series_title}</td>
-            <td style={{ color: "var(--text-dim)", wordBreak: "break-all" }}>{ev.detail}</td>
-            <td>{ev.source_name}</td>
-            <td style={{ color: "var(--text-dim)" }}>
+            <td className="cell-series">{ev.series_title}</td>
+            <td className="cell-detail" style={{ color: "var(--text-dim)", wordBreak: "break-all" }}>{ev.detail}</td>
+            <td className="cell-source">{ev.source_name}</td>
+            <td className="cell-date" style={{ color: "var(--text-dim)" }}>
               {new Date(ev.created_at).toLocaleString()}
             </td>
           </tr>

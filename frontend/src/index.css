@@ -213,6 +213,10 @@ input[type="checkbox"] {
   overflow-x: auto;
 }
 
+.toolbar-search {
+  width: 260px;
+}
+
 .content {
   flex: 1;
   overflow-y: auto;
@@ -1081,4 +1085,600 @@ h4.link-text:hover {
 }
 .priority-row .toggle {
   margin-left: auto;
+}
+
+/* ==========================================================================
+   Mobile (≤ 768px) — the desktop layout is untouched above this line.
+   Navigation moves to a bottom tab bar, tables become stacked cards,
+   modals become bottom sheets, and forms stack their labels.
+   ========================================================================== */
+
+@media (max-width: 768px) {
+  :root {
+    --bottom-nav-height: 56px;
+  }
+
+  .app {
+    height: 100dvh;
+  }
+
+  /* 16px inputs stop iOS Safari from zooming the page on focus */
+  input,
+  select {
+    font-size: 16px;
+    min-height: 42px;
+  }
+
+  input[type="checkbox"],
+  input[type="radio"] {
+    min-height: 0;
+    width: 18px;
+    height: 18px;
+  }
+
+  .btn {
+    min-height: 40px;
+    padding: 8px 14px;
+  }
+
+  .btn.sm {
+    min-height: 32px;
+    padding: 4px 12px;
+  }
+
+  .btn.icon-btn {
+    min-height: 36px;
+    min-width: 36px;
+    justify-content: center;
+  }
+
+  .monitor-toggle {
+    font-size: 18px;
+    padding: 4px;
+  }
+
+  /* ----- sidebar becomes a bottom tab bar ----- */
+
+  .sidebar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 50;
+    width: auto;
+    min-width: 0;
+    height: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    flex-direction: row;
+    border-right: none;
+    border-top: 1px solid var(--border);
+    background: rgba(34, 38, 47, 0.96);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+  }
+
+  .sidebar-logo,
+  .sidebar-footer {
+    display: none;
+  }
+
+  .sidebar nav {
+    display: flex;
+    flex: 1;
+    padding-top: 0;
+  }
+
+  .nav-item {
+    position: relative;
+    flex: 1;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    padding: 7px 0 5px;
+    font-size: 10.5px;
+    border-left: none;
+  }
+
+  .nav-item .icon {
+    width: auto;
+    font-size: 19px;
+    line-height: 22px;
+  }
+
+  .nav-item:hover {
+    background: none;
+  }
+
+  .nav-item.active {
+    background: none;
+    color: var(--accent);
+  }
+
+  /* the desktop left-edge accent, rotated for thumbs: a bar atop the active tab */
+  .nav-item.active::before {
+    content: "";
+    position: absolute;
+    top: -1px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 36px;
+    height: 3px;
+    border-radius: 0 0 3px 3px;
+    background: var(--accent);
+  }
+
+  .nav-badge {
+    position: absolute;
+    top: 3px;
+    left: calc(50% + 4px);
+    margin-left: 0;
+    padding: 0 6px;
+    font-size: 10px;
+    line-height: 16px;
+  }
+
+  /* keep scrolling content clear of the fixed tab bar */
+  .main {
+    padding-bottom: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* ----- toolbar ----- */
+
+  .toolbar {
+    height: auto;
+    min-height: 52px;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 14px 8px;
+  }
+
+  .toolbar h1 {
+    font-size: 17px;
+  }
+
+  /* Library toolbar reflows: title + count + Add on top, full-width
+     search next, the three filters sharing the last row */
+  .library-toolbar .toolbar-search {
+    order: 5;
+    width: 100%;
+  }
+
+  .library-toolbar select {
+    order: 6;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  /* series actions: one thumb-scrollable row, no wrapping */
+  .series-toolbar {
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .series-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .series-toolbar .btn {
+    flex: 0 0 auto;
+  }
+
+  .content {
+    padding: 14px 14px 24px;
+  }
+
+  /* ----- poster grid ----- */
+
+  .poster-grid {
+    grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+    gap: 10px;
+  }
+
+  .poster-card:hover {
+    transform: none;
+  }
+
+  .poster-card:active {
+    transform: scale(0.97);
+  }
+
+  .poster-label {
+    padding: 18px 6px 6px;
+    font-size: 11px;
+  }
+
+  .poster-ribbon {
+    left: 6px;
+    width: 16px;
+    height: 20px;
+  }
+
+  /* ----- series header: small cover beside the title, rest full width ----- */
+
+  .series-header {
+    display: grid;
+    grid-template-columns: 104px minmax(0, 1fr);
+    gap: 10px 14px;
+    align-items: start;
+    margin: 0 -14px 16px;
+    padding: 16px 14px;
+  }
+
+  .series-header.flush-top {
+    margin-top: -14px;
+  }
+
+  .series-header img.cover {
+    width: 104px;
+    grid-row: 1;
+  }
+
+  .series-info {
+    display: contents;
+  }
+
+  /* grandchildren must be positioned to paint above the header's dim overlay */
+  .series-info > * {
+    position: relative;
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
+
+  .series-title-block {
+    grid-column: 2;
+    grid-row: 1;
+    align-self: center;
+  }
+
+  .series-header h2 {
+    font-size: 19px;
+  }
+
+  .series-meta {
+    gap: 8px 12px;
+    margin-bottom: 0;
+  }
+
+  /* clamp the synopsis; tapping toggles the full text (see SeriesDetail) */
+  .series-desc {
+    display: -webkit-box;
+    -webkit-line-clamp: 5;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    font-size: 13px;
+  }
+
+  .series-desc.expanded {
+    display: block;
+    -webkit-line-clamp: none;
+    overflow: visible;
+  }
+
+  .folder-line {
+    flex-wrap: wrap;
+  }
+
+  .folder-line code {
+    word-break: break-all;
+  }
+
+  /* ----- tables that turn into stacked cards ----- */
+
+  .card-table,
+  .card-table tbody {
+    display: block;
+  }
+
+  .card-table thead {
+    display: none;
+  }
+
+  .card-table tr {
+    display: grid;
+    gap: 4px 10px;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(54, 60, 73, 0.5);
+  }
+
+  .card-table tr:last-child {
+    border-bottom: none;
+  }
+
+  .card-table td {
+    display: block;
+    padding: 0;
+    border-bottom: none;
+  }
+
+  /* chapters: [monitor] chapter …… status / title …… actions */
+  .chapter-table tr {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+  }
+
+  .chapter-table .cell-monitor {
+    grid-area: 1 / 1 / 3 / 2;
+    align-self: center;
+  }
+
+  .chapter-table .cell-chapter {
+    grid-area: 1 / 2 / 2 / 4;
+    font-weight: 500;
+  }
+
+  .chapter-table .cell-status {
+    grid-area: 1 / 4;
+    justify-self: end;
+  }
+
+  .chapter-table .cell-title {
+    grid-area: 2 / 2 / 3 / 4;
+    font-size: 12.5px;
+    color: var(--text-dim);
+  }
+
+  .chapter-table .cell-actions {
+    grid-area: 2 / 4;
+    justify-self: end;
+    white-space: nowrap;
+  }
+
+  /* releases: [select] title …… grab / size · peers */
+  .release-table tr {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+  }
+
+  .release-table .cell-select {
+    grid-area: 1 / 1 / 3 / 2;
+    align-self: center;
+  }
+
+  .release-table .cell-rtitle {
+    grid-area: 1 / 2 / 2 / 4;
+    word-break: break-word;
+  }
+
+  .release-table .cell-grab {
+    grid-area: 1 / 4 / 3 / 5;
+    align-self: center;
+  }
+
+  .release-table .cell-size,
+  .release-table .cell-peers {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .release-table .cell-size {
+    grid-area: 2 / 2;
+  }
+
+  .release-table .cell-peers {
+    grid-area: 2 / 3;
+  }
+
+  /* queue: [select] title …… remove / source · type · status / progress */
+  .queue-table tr {
+    grid-template-columns: auto auto auto minmax(0, 1fr) auto;
+  }
+
+  .queue-table .cell-select {
+    grid-area: 1 / 1 / 4 / 2;
+    align-self: center;
+  }
+
+  .queue-table .cell-qtitle {
+    grid-area: 1 / 2 / 2 / 5;
+    font-weight: 500;
+    word-break: break-word;
+  }
+
+  .queue-table .cell-remove {
+    grid-area: 1 / 5 / 2 / 6;
+    justify-self: end;
+  }
+
+  .queue-table .cell-source {
+    grid-area: 2 / 2;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .queue-table .cell-type {
+    grid-area: 2 / 3;
+  }
+
+  .queue-table .cell-status {
+    grid-area: 2 / 4 / 3 / 6;
+    justify-self: start;
+  }
+
+  .queue-table .cell-progress {
+    grid-area: 3 / 2 / 4 / 6;
+    margin-top: 4px;
+  }
+
+  /* history: [event] series / detail / source · date */
+  .history-table tr {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .history-table .cell-event {
+    grid-area: 1 / 1;
+  }
+
+  .history-table .cell-series {
+    grid-area: 1 / 2;
+    font-weight: 500;
+  }
+
+  .history-table .cell-detail {
+    grid-area: 2 / 1 / 3 / 3;
+    font-size: 12.5px;
+  }
+
+  .history-table .cell-source {
+    grid-area: 3 / 1;
+    font-size: 12px;
+    color: var(--text-faint);
+  }
+
+  .history-table .cell-date {
+    grid-area: 3 / 2;
+    justify-self: end;
+    font-size: 12px;
+  }
+
+  /* wanted: series / chapter · title */
+  .wanted-table tr {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .wanted-table .cell-series {
+    grid-area: 1 / 1 / 2 / 3;
+    font-weight: 500;
+  }
+
+  .wanted-table .cell-chapter {
+    grid-area: 2 / 1;
+  }
+
+  .wanted-table .cell-wtitle {
+    grid-area: 2 / 2;
+  }
+
+  /* any other table (rename previews, file lists…) scrolls sideways instead */
+  .data-table:not(.card-table) {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* ----- modals become bottom sheets ----- */
+
+  .modal-backdrop {
+    align-items: flex-end;
+  }
+
+  .modal {
+    width: 100%;
+    max-height: 92dvh;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+    border-radius: 14px 14px 0 0;
+    animation: sheet-up 0.22s ease;
+  }
+
+  .modal-header {
+    position: relative;
+    padding: 18px 16px 12px;
+  }
+
+  /* grab handle */
+  .modal-header::before {
+    content: "";
+    position: absolute;
+    top: 7px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 40px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+
+  .modal-body {
+    padding: 14px 16px calc(18px + env(safe-area-inset-bottom, 0px));
+  }
+
+  @keyframes sheet-up {
+    from {
+      transform: translateY(28px);
+      opacity: 0.6;
+    }
+    to {
+      transform: none;
+      opacity: 1;
+    }
+  }
+
+  .release-actions {
+    flex-wrap: wrap;
+  }
+
+  /* ----- forms: labels stack above their inputs ----- */
+
+  .form-row {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    margin-bottom: 16px;
+  }
+
+  .form-row label {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .form-row label:empty {
+    display: none;
+  }
+
+  .form-row input:not([type="checkbox"]):not([type="radio"]),
+  .form-row select {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: none;
+  }
+
+  .settings-section {
+    padding: 16px 14px;
+  }
+
+  /* source priority rows: hint text drops to its own line */
+  .priority-row {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .priority-name {
+    min-width: 0;
+  }
+
+  .priority-hint {
+    flex: 1 1 100%;
+    order: 5;
+  }
+
+  /* ----- add-series search results ----- */
+
+  .search-result {
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .search-result img {
+    width: 68px;
+    height: 102px;
+  }
+
+  .range-mapper input {
+    min-height: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal {
+    animation: none;
+  }
+
+  .poster-card,
+  .progress-bar > div,
+  .toggle,
+  .toggle::after {
+    transition: none;
+  }
 }
