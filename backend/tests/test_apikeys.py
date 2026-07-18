@@ -60,6 +60,12 @@ async def test_require_api_key_accepts_managed_key(session, monkeypatch):
     refreshed = await session.get(ApiKey, created.id)
     assert refreshed.last_used_at is not None
 
+    # SQLite drops timezone information from DateTime columns. A later API
+    # request must still be accepted after reading that value back.
+    await session.refresh(created)
+    assert created.last_used_at.tzinfo is None
+    await require_api_key(created.key, session)
+
 
 @pytest.mark.asyncio
 async def test_require_api_key_rejects_unknown_and_empty(session, monkeypatch):
