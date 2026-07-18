@@ -137,6 +137,14 @@ export interface SystemStatus {
 
 export type Settings = Record<string, string>;
 
+export interface ApiKey {
+  id: number;
+  name: string;
+  key: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
 export interface ScanResult {
   folder: string;
   folder_exists: boolean;

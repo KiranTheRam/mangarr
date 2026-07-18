@@ -50,9 +50,17 @@ DEFAULTS: dict[str, str] = {
     "monitor_interval_minutes": "60",
     # Library
     "library_scan_on_add": "true",  # adopt existing on-disk files on add/refresh
+    # Outbound webhook fired when chapters are imported (e.g. NextPanel's
+    # /api/v1/webhooks/mangarr endpoint). Secret is sent as X-Webhook-Secret.
+    "webhook_enabled": "false",
+    "webhook_url": "",
+    "webhook_secret": "",
 }
 
-SECRET_KEYS = {"mangadex_client_secret", "mangadex_password", "qbittorrent_password"}
+SECRET_KEYS = {
+    "mangadex_client_secret", "mangadex_password", "qbittorrent_password",
+    "webhook_secret",
+}
 
 
 def validate(values: dict[str, str]) -> None:

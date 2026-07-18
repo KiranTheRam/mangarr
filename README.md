@@ -155,8 +155,11 @@ Environment variables (all optional):
 Everything else (sources, credentials, naming templates, qBittorrent,
 monitor interval) lives in the UI under Settings and is stored in the DB.
 
-The API key is generated on first start at `<data dir>/api_key` and shown by
-`GET /initialize.json`.
+The web UI's API key is generated on first start at `<data dir>/api_key` and
+handed to the UI via `GET /initialize.json`. To give external clients (e.g.
+NextPanel or scripts) their own keys, create named keys under **Settings → API
+Keys**; any of them authenticates `/api/v1` calls via `X-Api-Key` and can be
+revoked independently.
 
 ## How grabbing works
 

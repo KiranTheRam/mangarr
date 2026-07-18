@@ -13,6 +13,7 @@ from pathlib import Path
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import notifications
 from ..chapter_metadata import (
     apply_metadata_rows,
     apply_title,
@@ -877,6 +878,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         source_name=dl.source_name, detail=str(dest),
     ))
     await session.commit()
+    notifications.notify_import(values, series.id, f"Chapter {chapter.number:g}")
 
 
 # --------------------------------------------------------------- qbt sync
@@ -995,6 +997,7 @@ async def _import_torrent(
         detail=f"{len(imported)} file(s) from {dl.title}",
     ))
     await session.commit()
+    notifications.notify_import(values, series.id, f"{len(imported)} file(s) from torrent")
 
 
 # ------------------------------------------------------------ monitor loop

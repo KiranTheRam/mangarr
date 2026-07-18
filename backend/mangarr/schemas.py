@@ -210,10 +210,28 @@ class WantedItemOut(BaseModel):
     title: str
 
 
+class ApiKeyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    key: str
+    created_at: datetime
+    last_used_at: datetime | None
+
+
+class ApiKeyCreateIn(BaseModel):
+    name: str
+
+
 class QbtTestIn(BaseModel):
     url: str
     username: str
     password: str
+
+
+class WebhookTestIn(BaseModel):
+    url: str
+    secret: str = ""
 
 
 class SystemStatus(BaseModel):

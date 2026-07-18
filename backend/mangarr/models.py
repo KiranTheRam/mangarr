@@ -205,3 +205,17 @@ class Setting(Base):
 
     key: Mapped[str] = mapped_column(String, primary_key=True)
     value: Mapped[str] = mapped_column(Text, default="")
+
+
+class ApiKey(Base):
+    """A named API key for scripted/external access (e.g. NextPanel). The web
+    UI uses the bootstrap key from initialize.json; these are user-managed keys
+    created and revoked from Settings, any of which authenticates API calls."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

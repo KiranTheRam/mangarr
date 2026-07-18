@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { RootFolder, Settings as SettingsType } from "../api/types";
+import type { ApiKey, RootFolder, Settings as SettingsType } from "../api/types";
 import { FolderBrowser } from "../components/FolderBrowser";
 import { Spinner, Toggle, Toolbar } from "../components/common";
 
@@ -49,6 +49,104 @@ function RootFolders() {
         />
         <button className="btn primary" disabled={!path || add.isPending} onClick={() => add.mutate()}>
           + Add
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ApiKeyRow({ apiKey, onRemove }: { apiKey: ApiKey; onRemove: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(apiKey.key);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+  const used = apiKey.last_used_at
+    ? `last used ${new Date(apiKey.last_used_at).toLocaleString()}`
+    : "never used";
+  return (
+    <div className="form-row" style={{ alignItems: "center" }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontWeight: 600 }}>{apiKey.name}</div>
+        <code
+          style={{
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+            fontSize: 13,
+            color: "var(--text-dim)",
+            wordBreak: "break-all",
+          }}
+        >
+          {apiKey.key}
+        </code>
+        <div style={{ fontSize: 12, color: "var(--text-faint)" }}>
+          Added {new Date(apiKey.created_at).toLocaleDateString()} · {used}
+        </div>
+      </div>
+      <button className="btn" onClick={copy}>
+        {copied ? "Copied" : "Copy"}
+      </button>
+      <button className="btn icon-btn" title="Revoke key" aria-label={`Revoke ${apiKey.name}`} onClick={onRemove}>
+        ✕
+      </button>
+    </div>
+  );
+}
+
+function ApiKeys() {
+  const queryClient = useQueryClient();
+  const [name, setName] = useState("");
+  const { data } = useQuery({
+    queryKey: ["apikeys"],
+    queryFn: () => api.get<ApiKey[]>("/apikeys"),
+  });
+
+  const add = useMutation({
+    mutationFn: () => api.post<ApiKey>("/apikeys", { name: name.trim() }),
+    onSuccess: () => {
+      setName("");
+      queryClient.invalidateQueries({ queryKey: ["apikeys"] });
+    },
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: number) => api.del(`/apikeys/${id}`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["apikeys"] }),
+  });
+
+  return (
+    <div className="settings-section">
+      <h3>API Keys</h3>
+      <p className="section-hint">
+        Create keys for external clients (e.g. NextPanel or scripts) to access the API. Send a
+        key as the <code>X-Api-Key</code> header. Any key here grants full access — revoke ones
+        you no longer use.
+      </p>
+      {data?.map((k) => (
+        <ApiKeyRow key={k.id} apiKey={k} onRemove={() => remove.mutate(k.id)} />
+      ))}
+      {data && data.length === 0 && (
+        <p style={{ color: "var(--text-faint)", fontSize: 13 }}>No API keys yet.</p>
+      )}
+      {add.isError && <div className="error-banner">{(add.error as Error).message}</div>}
+      {remove.isError && <div className="error-banner">{(remove.error as Error).message}</div>}
+      <div className="form-row">
+        <input
+          type="text"
+          placeholder="Key name (e.g. NextPanel)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && name.trim() && !add.isPending) add.mutate();
+          }}
+          style={{ flex: 1, maxWidth: 380 }}
+        />
+        <button className="btn primary" disabled={!name.trim() || add.isPending} onClick={() => add.mutate()}>
+          + Generate Key
         </button>
       </div>
     </div>
@@ -164,6 +262,17 @@ export default function Settings() {
     onError: (e) => setQbtTest(`✖ ${(e as Error).message}`),
   });
 
+  const [webhookTest, setWebhookTest] = useState<string | null>(null);
+  const testWebhook = useMutation({
+    mutationFn: () =>
+      api.post("/settings/webhook/test", {
+        url: form.webhook_url,
+        secret: form.webhook_secret,
+      }),
+    onSuccess: () => setWebhookTest("✔ Webhook delivered"),
+    onError: (e) => setWebhookTest(`✖ ${(e as Error).message}`),
+  });
+
   const [browsing, setBrowsing] = useState(false);
 
   if (isLoading || !saved) {
@@ -193,6 +302,7 @@ export default function Settings() {
       </Toolbar>
       <div className="content">
         <RootFolders />
+        <ApiKeys />
 
         <div className="settings-section">
           <h3>Media Management</h3>
@@ -304,6 +414,38 @@ export default function Settings() {
             {qbtTest && (
               <span style={{ fontSize: 13, color: qbtTest.startsWith("✔") ? "var(--success)" : "var(--danger)" }}>
                 {qbtTest}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className="settings-section">
+          <h3>Connect — Webhook</h3>
+          <p className="section-hint">
+            Notify a request manager (e.g. NextPanel) whenever chapters are imported, so requests
+            flip to Available instantly. Point the URL at NextPanel's
+            /api/v1/webhooks/mangarr endpoint and paste the same webhook secret configured there.
+          </p>
+          <div className="form-row">
+            <label>Enabled</label>
+            <Toggle on={form.webhook_enabled === "true"} onChange={setBool("webhook_enabled")} />
+          </div>
+          <div className="form-row">
+            <label>Webhook URL</label>
+            {text("webhook_url")}
+          </div>
+          <div className="form-row">
+            <label>Secret</label>
+            {text("webhook_secret", true)}
+          </div>
+          <div className="form-row">
+            <label></label>
+            <button className="btn" onClick={() => testWebhook.mutate()} disabled={testWebhook.isPending || !form.webhook_url}>
+              Send Test Event
+            </button>
+            {webhookTest && (
+              <span style={{ fontSize: 13, color: webhookTest.startsWith("✔") ? "var(--success)" : "var(--danger)" }}>
+                {webhookTest}
               </span>
             )}
           </div>

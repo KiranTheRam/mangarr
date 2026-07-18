@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import settings_service
+from .. import notifications, settings_service
 from ..db import get_session
 from ..download.qbittorrent import QbtError, test_connection
-from ..schemas import QbtTestIn
+from ..schemas import QbtTestIn, WebhookTestIn
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -37,6 +37,19 @@ async def update_settings(
 
         reschedule_monitor(int(to_save["monitor_interval_minutes"]))
     return await get_settings(session)
+
+
+@router.post("/webhook/test")
+async def webhook_test(body: WebhookTestIn, session: AsyncSession = Depends(get_session)):
+    secret = body.secret
+    if secret == MASK:
+        secret = await settings_service.get(session, "webhook_secret")
+    ok = await notifications.send_webhook(
+        body.url, secret, {"app": notifications.APP_NAME, "event": "test", "series_id": 0}
+    )
+    if not ok:
+        raise HTTPException(400, "Webhook endpoint rejected the test event or is unreachable")
+    return {"ok": True}
 
 
 @router.post("/qbittorrent/test")

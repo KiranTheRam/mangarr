@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .api import library, queue, search, series, settings, system
+from .api import apikeys, library, queue, search, series, settings, system
 from .api.deps import get_api_key, require_api_key
 from .config import config
 from .db import init_db
@@ -37,6 +37,7 @@ api.include_router(library.router)
 api.include_router(search.router)
 api.include_router(queue.router)
 api.include_router(settings.router)
+api.include_router(apikeys.router)
 api.include_router(system.router)
 app.mount("/api/v1", api)
 
