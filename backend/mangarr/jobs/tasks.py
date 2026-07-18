@@ -676,6 +676,26 @@ def magnet_btih_hex(magnet: str) -> str:
         return ""
 
 
+def torrent_save_path(base: str, category: str) -> str | None:
+    """Return the category's final path without duplicating its suffix.
+
+    Older installations treated ``downloads_dir`` as the final category
+    directory, while newer setup guidance treats it as the downloads root.
+    Accept both forms so an existing ``/downloads/mangarr`` setting does not
+    become ``/downloads/mangarr/mangarr`` after an upgrade.
+    """
+    base = base.strip()
+    category = category.strip().strip("/")
+    if not base:
+        return None
+    base = base.rstrip("/") or "/"
+    if not category:
+        return base
+    if base != "/" and base.rsplit("/", 1)[-1] == category:
+        return base
+    return f"/{category}" if base == "/" else f"{base}/{category}"
+
+
 async def enqueue_torrent(
     session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
 ) -> Download:
@@ -692,7 +712,7 @@ async def enqueue_torrent(
         # A configured downloads folder wins over qBittorrent's default save
         # path — pick one on the library's filesystem so imports can hardlink.
         base = values.get("downloads_dir", "").strip() or await client.default_save_path()
-        save_path = f"{base.rstrip('/')}/{category}" if base else None
+        save_path = torrent_save_path(base, category)
         await client.ensure_category(category, save_path)
         await client.add_magnet(magnet, category=category, save_path=save_path)
     finally:
@@ -873,6 +893,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     chapter.file_path = str(dest)
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
+    dl.error = ""
     session.add(HistoryEvent(
         series_id=series.id, chapter_id=chapter.id, event="imported",
         source_name=dl.source_name, detail=str(dest),
@@ -967,19 +988,39 @@ async def _import_torrent(
             dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
-    _import_path_missing_counts.pop(dl.id, None)
     try:
         imported = import_torrent_payload(
             content_path, series, list(series.chapters), Path(series.root_folder.path),
             values["naming_template"], values["naming_template_no_volume"],
             import_mode=values.get("import_mode", "hardlink"),
         )
+    except FileNotFoundError as exc:
+        # qBittorrent may finish downloading and then atomically move the
+        # payload from its temporary directory to the category directory.
+        # A move between discovery and hardlink/copy is transient: let the
+        # next sync fetch the torrent's new content_path and retry.  Import is
+        # idempotent because already-created destinations are not overwritten.
+        misses = _import_path_missing_counts.get(dl.id, 0) + 1
+        _import_path_missing_counts[dl.id] = misses
+        if misses >= IMPORT_PATH_MISSING_LIMIT:
+            _import_path_missing_counts.pop(dl.id, None)
+            dl.status = DownloadStatus.FAILED
+            dl.error = (f"content kept disappearing during import: {exc} — "
+                        "check qBittorrent's temporary and category paths")[:500]
+            log.exception("torrent import %d repeatedly lost its content path", dl.id)
+        else:
+            dl.status = DownloadStatus.DOWNLOADING
+            dl.error = f"content moved during import; retrying: {exc}"[:500]
+            log.info("torrent import %d content moved; retrying on next sync", dl.id)
+        await session.commit()
+        return
     except Exception as exc:
         log.exception("torrent import %d failed", dl.id)
         dl.status = DownloadStatus.FAILED
         dl.error = str(exc)[:500]
         await session.commit()
         return
+    _import_path_missing_counts.pop(dl.id, None)
     for dest, chapter, volume in imported:
         if chapter is not None:
             chapter.downloaded = True
@@ -992,6 +1033,7 @@ async def _import_torrent(
                     ch.file_path = str(dest)
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
+    dl.error = ""
     session.add(HistoryEvent(
         series_id=series.id, event="imported", source_name="nyaa",
         detail=f"{len(imported)} file(s) from {dl.title}",

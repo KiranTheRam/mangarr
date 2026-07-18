@@ -22,13 +22,18 @@ class QbtTorrent:
 
     @property
     def is_complete(self) -> bool:
-        return self.progress >= 1.0 or self.state in (
+        # qBittorrent can report progress=1 while it is still moving a
+        # completed payload out of its temporary directory.  Import only
+        # from seeding-side states, where content_path points at the stable
+        # final location.
+        return self.state in (
             "uploading",
             "stalledUP",
             "pausedUP",
             "stoppedUP",
             "queuedUP",
             "forcedUP",
+            "checkingUP",
         )
 
 

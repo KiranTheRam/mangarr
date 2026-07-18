@@ -388,16 +388,16 @@ export default function Settings() {
             {text("qbittorrent_category")}
           </div>
           <div className="form-row">
-            <label>Downloads folder</label>
+            <label>Downloads root</label>
             {text("downloads_dir")}
             <button className="btn" onClick={() => setBrowsing(true)}>
               Browse…
             </button>
           </div>
           <p className="section-hint">
-            Where torrents are saved (both mangarr and qBittorrent must see this path). Leave empty
-            to use qBittorrent's default. Put it on the same filesystem/share as the library so
-            imports can hardlink instead of copy.
+            Base folder shared by mangarr and qBittorrent; the category is added automatically.
+            Leave empty to use qBittorrent&apos;s default. Put it on the same filesystem/share as
+            the library so imports can hardlink instead of copy.
           </p>
           <div className="form-row">
             <label>Import mode</label>
