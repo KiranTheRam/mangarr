@@ -134,6 +134,14 @@ def parse_chapter_number(text: str) -> float | None:
     return None
 
 
+def is_special_chapter(number: float) -> bool:
+    """True for a decimal chapter (60.5, 9.1 …). Those are near-universally
+    specials/bonus/omake, are often not released by any tracked source, and so
+    must not hold a series back from counting as fully downloaded. They are
+    still tracked and searched for like any other chapter."""
+    return not float(number).is_integer()
+
+
 def parse_volume_number(text: str) -> int | None:
     m = VOLUME_PATTERN.search(text)
     if m:

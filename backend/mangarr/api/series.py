@@ -1,7 +1,9 @@
 import asyncio
+from collections.abc import Iterable
+from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import Integer, cast, func, select
+from sqlalchemy import Integer, case, cast, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -21,16 +23,40 @@ from ..schemas import (
     SeriesUpdateIn,
 )
 from ..titles import english_title, split_alt_titles, unique_titles
-from ..util import sanitize_filename
+from ..util import is_special_chapter, sanitize_filename
 
 router = APIRouter(prefix="/series", tags=["series"])
 
 
-def _series_out(series: Series, chapter_count: int, downloaded_count: int) -> SeriesOut:
+class _Counts(NamedTuple):
+    """Chapter tallies split so specials never count toward completion."""
+    chapters: int = 0
+    downloaded: int = 0
+    specials: int = 0
+    specials_downloaded: int = 0
+
+
+def _count_chapters(chapters: Iterable[Chapter]) -> _Counts:
+    totals = [0, 0, 0, 0]
+    for c in chapters:
+        offset = 2 if is_special_chapter(c.number) else 0
+        totals[offset] += 1
+        if c.downloaded:
+            totals[offset + 1] += 1
+    return _Counts(*totals)
+
+
+def _apply_counts(out: SeriesOut, counts: _Counts) -> None:
+    out.chapter_count = counts.chapters
+    out.downloaded_count = counts.downloaded
+    out.special_count = counts.specials
+    out.special_downloaded_count = counts.specials_downloaded
+
+
+def _series_out(series: Series, counts: _Counts) -> SeriesOut:
     out = SeriesOut.model_validate(series)
     out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
-    out.chapter_count = chapter_count
-    out.downloaded_count = downloaded_count
+    _apply_counts(out, counts)
     return out
 
 
@@ -54,19 +80,25 @@ async def _normalize_folder_name(session: AsyncSession, series: Series, folder_n
 
 @router.get("", response_model=list[SeriesOut])
 async def list_series(session: AsyncSession = Depends(get_session)):
-    counts: dict[int, tuple[int, int]] = {}
+    # the SQL mirror of util.is_special_chapter: a cast to INTEGER truncates the
+    # fractional part, so a decimal chapter no longer equals its own number
+    special = cast(Chapter.number, Integer) != Chapter.number
+    downloaded = cast(Chapter.downloaded, Integer)
+    counts: dict[int, _Counts] = {}
     rows = await session.execute(
         select(
             Chapter.series_id,
-            func.count(Chapter.id),
-            func.sum(cast(Chapter.downloaded, Integer)),
+            func.sum(case((special, 0), else_=1)),
+            func.sum(case((special, 0), else_=downloaded)),
+            func.sum(case((special, 1), else_=0)),
+            func.sum(case((special, downloaded), else_=0)),
         ).group_by(Chapter.series_id)
     )
-    for series_id, total, downloaded in rows.all():
-        counts[series_id] = (total, int(downloaded or 0))
+    for series_id, *totals in rows.all():
+        counts[series_id] = _Counts(*(int(t or 0) for t in totals))
     result = await session.execute(select(Series).order_by(Series.sort_title, Series.title))
     return [
-        _series_out(s, *counts.get(s.id, (0, 0)))
+        _series_out(s, counts.get(s.id, _Counts()))
         for s in result.scalars().all()
     ]
 
@@ -140,8 +172,7 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
         raise HTTPException(404, "Series not found")
     out = SeriesDetailOut.model_validate(series)
     out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
-    out.chapter_count = len(series.chapters)
-    out.downloaded_count = sum(1 for c in series.chapters if c.downloaded)
+    _apply_counts(out, _count_chapters(series.chapters))
     out.refreshing = series_id in REFRESHING
     return out
 

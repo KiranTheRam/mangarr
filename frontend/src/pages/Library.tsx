@@ -43,6 +43,16 @@ function matchesFilters(s: Series, f: Filters): boolean {
   return true;
 }
 
+/** Decimal chapters (60.5 …) are specials — still searched for, but they never
+ * count toward completion, so they get their own tally rather than dragging the
+ * main progress below 100%. */
+function specialsLabel(s: Series): string | undefined {
+  if (s.special_count === 0) return undefined;
+  return `${s.special_downloaded_count} of ${s.special_count} special chapter${
+    s.special_count === 1 ? "" : "s"
+  } downloaded (not counted toward completion)`;
+}
+
 function PosterCard({ series }: { series: Series }) {
   const navigate = useNavigate();
   const pct =
@@ -57,8 +67,14 @@ function PosterCard({ series }: { series: Series }) {
       <div className={`poster-ribbon${series.monitored ? "" : " unmonitored"}`} />
       <div className="poster-label">
         {series.title}
-        <div style={{ fontSize: 11, color: "#bbb", marginTop: 2 }}>
+        <div style={{ fontSize: 11, color: "#bbb", marginTop: 2 }} title={specialsLabel(series)}>
           {series.downloaded_count} / {series.chapter_count || "?"}
+          {series.special_count > 0 && (
+            <span style={{ color: "#888" }}>
+              {" "}
+              +{series.special_downloaded_count}/{series.special_count}
+            </span>
+          )}
         </div>
       </div>
       <div className="poster-progress">
