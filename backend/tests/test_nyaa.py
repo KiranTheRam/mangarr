@@ -60,6 +60,7 @@ class TestParseRss:
         assert first.source_name == "nyaa"
         assert first.title == "Ashita no Joe (Tomorrow's Joe) v01-v13 (Digital)"
         assert first.url == "https://nyaa.si/view/1000001"
+        assert first.torrent_url == "https://nyaa.si/download/1000001.torrent"
         assert first.seeders == 42
         assert first.leechers == 3
         assert first.size_bytes == int(2.5 * 1024**3)

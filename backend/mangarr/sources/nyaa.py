@@ -15,6 +15,7 @@ NYAA_NS = "https://nyaa.si/xmlns/nyaa"
 _limiter = RateLimiter(rate=1, per_seconds=2)
 
 _SIZE_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4}
+MAX_TORRENT_METADATA_BYTES = 4 * 1024 * 1024
 
 
 def parse_size(text: str) -> int:
@@ -47,6 +48,7 @@ def parse_rss(xml_text: str) -> list[TorrentRelease]:
                 title=title,
                 magnet=magnet,
                 url=text("guid"),
+                torrent_url=text("link"),
                 size_bytes=parse_size(text("size", NYAA_NS)),
                 seeders=int(text("seeders", NYAA_NS) or 0),
                 leechers=int(text("leechers", NYAA_NS) or 0),
@@ -72,6 +74,18 @@ class NyaaIndexer(TorrentIndexer):
         resp.raise_for_status()
         releases = parse_rss(resp.text)
         return sorted(releases, key=lambda r: r.seeders, reverse=True)
+
+    async def get_torrent_metadata(self, release: TorrentRelease) -> bytes:
+        if not release.torrent_url:
+            return b""
+        response = await rl_request(
+            self._client, "GET", release.torrent_url, limiter=_limiter
+        )
+        response.raise_for_status()
+        content = response.content
+        if len(content) > MAX_TORRENT_METADATA_BYTES:
+            raise ValueError("torrent metadata exceeds 4 MiB safety limit")
+        return content
 
 
 indexer = NyaaIndexer()

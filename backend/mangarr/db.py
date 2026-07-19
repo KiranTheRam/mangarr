@@ -32,6 +32,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("chapters", "volume_source", "VARCHAR NOT NULL DEFAULT ''", None),
     ("chapters", "title_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
     ("chapters", "volume_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("chapters", "available_sources", "VARCHAR NOT NULL DEFAULT ''", None),
 ]
 
 

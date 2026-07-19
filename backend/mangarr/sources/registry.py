@@ -7,6 +7,7 @@ from .. import settings_service
 from .base import DirectSource, TorrentIndexer
 from .asura import source as asura_source
 from .mangadex import source as mangadex_source
+from .mangafire import source as mangafire_source
 from .mangaplus import source as mangaplus_source
 from .nyaa import indexer as nyaa_indexer
 from .tcbscans import source as tcbscans_source
@@ -17,6 +18,7 @@ from .wikipedia import source as wikipedia_source
 DIRECT_SOURCES: dict[str, DirectSource] = {
     mangaplus_source.name: mangaplus_source,
     mangadex_source.name: mangadex_source,
+    mangafire_source.name: mangafire_source,
     weebcentral_source.name: weebcentral_source,
     tcbscans_source.name: tcbscans_source,
     asura_source.name: asura_source,

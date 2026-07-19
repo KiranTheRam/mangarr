@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 from mangarr.jobs import tasks
-from mangarr.jobs.tasks import REMOVED_BY_USER, grab_missing_chapters, update_chapters
+from mangarr.jobs.tasks import (
+    REMOVED_BY_USER,
+    auto_grab_best_torrent,
+    grab_missing_chapters,
+    update_chapters,
+)
 from mangarr.models import (
     Base,
     Chapter,
@@ -20,7 +25,8 @@ from mangarr.models import (
     Series,
     SeriesSourceLink,
 )
-from mangarr.sources.base import DirectSource, SourceChapter
+from mangarr.sources.base import DirectSource, SourceChapter, TorrentRelease
+from mangarr.torrent_selection import TorrentSelection
 
 
 class FakeSource(DirectSource):
@@ -167,6 +173,102 @@ async def test_chapter_cache_shared_between_update_and_grab(db_session, monkeypa
     assert added == 2
     assert queued == 2
     assert source.list_calls == 1
+    assert all(ch.available_sources == "fake" for ch in series.chapters)
+
+
+async def test_successful_refresh_clears_stale_source_availability(db_session, monkeypatch):
+    series = await _make_series(db_session, [1, 2])
+    for chapter in series.chapters:
+        chapter.available_sources = "fake"
+    await db_session.commit()
+    source = FakeSource([1])
+    _use_source(monkeypatch, source)
+
+    await update_chapters(db_session, series, {})
+
+    assert {ch.number: ch.available_sources for ch in series.chapters} == {
+        1.0: "fake",
+        2.0: "",
+    }
+
+
+async def test_refresh_clears_availability_from_disabled_sources(db_session, monkeypatch):
+    series = await _make_series(db_session, [1])
+    series.mangaupdates_id = None
+    series.chapters[0].available_sources = "fake"
+    await db_session.commit()
+    monkeypatch.setattr(tasks.registry, "enabled_direct_sources", lambda values: [])
+
+    await update_chapters(db_session, series, {})
+
+    assert series.chapters[0].available_sources == ""
+
+
+async def test_new_torrent_coverage_allows_uncovered_direct_grabs(db_session, monkeypatch):
+    series = await _make_series(db_session, [1, 2])
+    source = FakeSource([1, 2])
+    _use_source(monkeypatch, source)
+    db_session.add(Download(
+        series_id=series.id,
+        chapter_id=None,
+        kind=DownloadKind.TORRENT,
+        status=DownloadStatus.DOWNLOADING,
+        source_name="nyaa",
+    ))
+    await db_session.commit()
+
+    queued = await grab_missing_chapters(
+        db_session, series, {}, exclude_numbers={1.0}
+    )
+
+    assert queued == 1
+    direct = (
+        await db_session.execute(
+            select(Download).where(Download.kind == DownloadKind.DIRECT)
+        )
+    ).scalar_one()
+    assert direct.chapter_id == next(ch.id for ch in series.chapters if ch.number == 2.0)
+
+
+async def test_auto_torrent_grab_returns_inspected_coverage(db_session, tmp_path, monkeypatch):
+    series = await _make_series(db_session, [1, 2.5])
+    series.root_folder = RootFolder(path=str(tmp_path))
+    await db_session.commit()
+    release = TorrentRelease(
+        source_name="nyaa",
+        title="Test Series pack",
+        magnet="magnet:?xt=urn:btih:" + "a" * 40,
+        size_bytes=1024,
+        seeders=4,
+    )
+    captured = {}
+
+    async def fake_select(*args, **kwargs):
+        captured["max_size"] = kwargs["max_size_bytes"]
+        captured["min_seeders"] = kwargs["min_seeders"]
+        return TorrentSelection(release=release, coverage={1.0, 2.5})
+
+    async def fake_enqueue(session, selected_series, magnet, title, values):
+        captured["enqueued"] = (selected_series.id, magnet, title)
+
+    monkeypatch.setattr(tasks, "select_best_torrent", fake_select)
+    monkeypatch.setattr(tasks, "enqueue_torrent", fake_enqueue)
+    monkeypatch.setattr(tasks.registry, "enabled_torrent_indexers", lambda values: [object()])
+
+    coverage = await auto_grab_best_torrent(
+        db_session,
+        series,
+        {
+            "qbittorrent_enabled": "true",
+            "torrent_auto_max_size_gib": "30",
+            "torrent_auto_min_seeders": "1",
+        },
+    )
+
+    assert coverage == {1.0, 2.5}
+    assert captured["max_size"] == 30 * 1024**3
+    assert captured["min_seeders"] == 1
+    assert captured["enqueued"] == (series.id, release.magnet, release.title)
 
 
 async def test_active_direct_download_removed_by_user_is_not_completed(

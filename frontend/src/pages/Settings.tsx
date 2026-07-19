@@ -157,6 +157,7 @@ const SOURCE_LABELS: Record<string, string> = {
   mangaplus: "MangaPlus",
   tcbscans: "TCB Scans",
   mangadex: "MangaDex",
+  mangafire: "MangaFire",
   weebcentral: "WeebCentral",
   asura: "Asura Scans",
   viz: "VIZ (official metadata)",
@@ -166,6 +167,7 @@ const SOURCE_LABELS: Record<string, string> = {
 
 const SOURCE_HINTS: Record<string, string> = {
   mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
+  mangafire: "Broad English archive coverage, including many bonus and decimal chapters.",
   viz: "Exact printed-volume mappings for VIZ-licensed series; does not download chapters.",
   wikipedia: "Chapter titles and printed-volume tables for publishers not covered by VIZ.",
   nyaa: "Sent to the download client below and imported when complete.",
@@ -406,6 +408,19 @@ export default function Settings() {
               <option value="copy">Copy (safe across filesystems)</option>
             </select>
           </div>
+          <div className="form-row">
+            <label>Auto-grab maximum size (GiB)</label>
+            {text("torrent_auto_max_size_gib")}
+          </div>
+          <div className="form-row">
+            <label>Auto-grab minimum seeders</label>
+            {text("torrent_auto_min_seeders")}
+          </div>
+          <p className="section-hint">
+            During “Search now” setup, Mangarr reads Nyaa torrent metadata, chooses the single
+            release covering the most missing chapters, and uses direct sources for anything the
+            selected torrent does not cover.
+          </p>
           <div className="form-row">
             <label></label>
             <button className="btn" onClick={() => testQbt.mutate()} disabled={testQbt.isPending}>

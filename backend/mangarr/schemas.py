@@ -35,6 +35,7 @@ class ChapterOut(BaseModel):
     monitored: bool
     downloaded: bool
     file_path: str
+    available_sources: str
 
 
 class SeriesOut(BaseModel):

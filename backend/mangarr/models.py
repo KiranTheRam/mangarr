@@ -140,6 +140,10 @@ class Chapter(Base):
     downloaded: Mapped[bool] = mapped_column(Boolean, default=False)
     file_path: Mapped[str] = mapped_column(String, default="")
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Comma-separated enabled direct sources whose latest successful chapter
+    # listing contains this exact number.  Metadata-only/catalogue rows remain
+    # visible while the UI can honestly say that no linked source serves them.
+    available_sources: Mapped[str] = mapped_column(String, default="")
 
     series: Mapped[Series] = relationship(back_populates="chapters")
 

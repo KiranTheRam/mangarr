@@ -40,6 +40,7 @@ from ..models import (
 from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
 from ..titles import plausible_title_match, split_alt_titles, title_queries
+from ..torrent_selection import select_best_torrent
 from ..util import normalize_title
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
 
@@ -267,7 +268,17 @@ async def update_chapters(
     existing = {c.number: c for c in series.chapters}
     added = 0
     links = {sl.source_name: sl for sl in series.source_links}
-    for src in registry.enabled_direct_sources(values):
+    enabled_sources = registry.enabled_direct_sources(values)
+    claimable_sources = {src.name for src in enabled_sources if src.name in links}
+    availability = {
+        number: {
+            name
+            for name in (chapter.available_sources or "").split(",")
+            if name in claimable_sources
+        }
+        for number, chapter in existing.items()
+    }
+    for src in enabled_sources:
         link = links.get(src.name)
         if link is None:
             continue
@@ -276,6 +287,11 @@ async def update_chapters(
         except Exception as exc:
             log.warning("chapter list failed on %s for %r: %s", src.name, series.title, exc)
             continue
+        # This source answered successfully, so its previous availability
+        # claims can be replaced by the fresh list.  A transient source error
+        # above deliberately preserves the last known state instead.
+        for source_names in availability.values():
+            source_names.discard(src.name)
         for sc in source_chapters:
             ch = existing.get(sc.number)
             if ch is None:
@@ -289,10 +305,12 @@ async def update_chapters(
                 # the scan/backfill later in this same pass
                 series.chapters.append(ch)
                 existing[sc.number] = ch
+                availability[sc.number] = set()
                 added += 1
             else:
                 apply_volume(ch, sc.volume, sc.source_name)
                 apply_title(ch, sc.title, sc.source_name, series.title)
+            availability.setdefault(sc.number, set()).add(src.name)
 
     # MangaUpdates tracks releases even when no direct source serves them
     # yet (or ever) — add those chapters so Wanted reflects reality
@@ -313,6 +331,7 @@ async def update_chapters(
                     )
                     series.chapters.append(ch)
                     existing[number] = ch
+                    availability[number] = set()
                     added += 1
                 elif ch.released_at is None and released_at is not None:
                     ch.released_at = released_at
@@ -343,7 +362,7 @@ async def update_chapters(
     # The fetches are independent (and usually cache hits), so run them
     # concurrently; results apply in source order for determinism.
     metadata_sources = [
-        (src, links[src.name]) for src in registry.enabled_direct_sources(values)
+        (src, links[src.name]) for src in enabled_sources
         if src.name in links
     ]
     results = await asyncio.gather(
@@ -355,6 +374,9 @@ async def update_chapters(
             log.warning("chapter metadata failed on %s for %r: %s", src.name, series.title, rows)
             continue
         apply_metadata_rows(existing.values(), rows, series.title)
+
+    for number, chapter in existing.items():
+        chapter.available_sources = ",".join(sorted(availability.get(number, set())))
 
     await session.commit()
     return added
@@ -593,9 +615,11 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
                 # explicit one-time search (e.g. "search for missing" at add
                 # time): runs even for unmonitored series, whose chapters carry
                 # monitored=False — the user asked for the missing content now
+                torrent_coverage = await auto_grab_best_torrent(session, series, values)
                 await grab_missing_chapters(
                     session, series, values, only_monitored=False,
                     chapter_cache=chapter_cache,
+                    exclude_numbers=torrent_coverage,
                 )
     except Exception:
         # this runs as a fire-and-forget task: without this, the exception
@@ -744,6 +768,55 @@ async def enqueue_torrent(
     ))
     await session.commit()
     return dl
+
+
+async def auto_grab_best_torrent(
+    session: AsyncSession, series: Series, values: dict[str, str]
+) -> set[float]:
+    """Inspect Nyaa metadata and queue one best-coverage add-time release.
+
+    Returns the chapter numbers that the selected torrent is expected to
+    cover.  The caller excludes those from direct grabs in the same setup pass
+    while still queueing direct downloads for every uncovered chapter.
+    """
+    if (
+        values.get("qbittorrent_enabled") != "true"
+        or not series.root_folder
+        or not registry.enabled_torrent_indexers(values)
+    ):
+        return set()
+    try:
+        max_gib = int(values.get("torrent_auto_max_size_gib", "30"))
+        min_seeders = int(values.get("torrent_auto_min_seeders", "1"))
+        selection = await select_best_torrent(
+            series,
+            list(series.chapters),
+            registry.enabled_torrent_indexers(values),
+            max_size_bytes=max_gib * 1024**3,
+            min_seeders=min_seeders,
+        )
+    except Exception as exc:
+        log.warning("automatic torrent search failed for %r: %s", series.title, exc)
+        return set()
+    if selection is None:
+        log.info("automatic torrent search found no inspectable coverage for %r", series.title)
+        return set()
+    try:
+        await enqueue_torrent(
+            session, series, selection.release.magnet, selection.release.title, values
+        )
+    except Exception as exc:
+        log.warning("automatic torrent grab failed for %r: %s", series.title, exc)
+        return set()
+    log.info(
+        "automatic torrent selected %r for %r: %d chapter(s), %d seeder(s), %.2f GiB",
+        selection.release.title,
+        series.title,
+        len(selection.coverage),
+        selection.release.seeders,
+        selection.release.size_bytes / 1024**3,
+    )
+    return set(selection.coverage)
 
 
 # --------------------------------------------------------- direct downloads
@@ -1059,6 +1132,7 @@ async def grab_missing_chapters(
     session: AsyncSession, series: Series, values: dict[str, str],
     only_monitored: bool = True,
     chapter_cache: ChapterListCache | None = None,
+    exclude_numbers: set[float] | None = None,
 ) -> int:
     """Queue missing monitored chapters from linked direct sources.
 
@@ -1078,16 +1152,20 @@ async def grab_missing_chapters(
         )
     )
     active = {row[0] for row in result.all()}
-    if None in active:
+    if None in active and exclude_numbers is None:
         # a series-level download (e.g. a Nyaa volume pack) is in flight — its
         # chapter coverage is unknown until it imports, so grabbing per-chapter
         # now would duplicate everything
         log.info("monitor: %r has a series-level download in flight; skipping grabs", series.title)
         return 0
 
+    excluded = exclude_numbers or set()
     wanted = [
         c for c in series.chapters
-        if (c.monitored or not only_monitored) and not c.downloaded and c.id not in active
+        if (c.monitored or not only_monitored)
+        and not c.downloaded
+        and c.id not in active
+        and c.number not in excluded
     ]
     if not wanted:
         return 0

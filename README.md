@@ -34,6 +34,8 @@ design; it is the automation half of your manga stack.
   - **MangaDex** (API) — huge, well-tagged archive; supplies volume data. Works
     anonymously but limits guests to 10 chapters/day — add a free account +
     personal API client in Settings for normal use.
+  - **MangaFire** (API) — broad English archive and an additional direct source
+    for decimal-numbered bonus and special chapters.
   - **WeebCentral** (scraper) — broad catalog, no account needed.
   - **Asura Scans** (API) — Korean/Chinese webtoons and manhwa (not Japanese
     manga). Skips locked early-access (premium) chapters automatically.
@@ -68,7 +70,11 @@ First-run checklist, in the mangarr UI:
    mangadex.org, then *Settings → API Clients* there to make a personal
    client; paste client id/secret and your username/password.
 3. **Add New**: search a title, pick a root folder, add. Chapters appear after
-   the automatic source-linking pass (a few seconds).
+   the automatic source-linking pass (a few seconds). If **Search now** and
+   qBittorrent are enabled, Mangarr also inspects Nyaa torrent file lists,
+   queues the seeded release with the most missing-chapter coverage, then uses
+   direct sources for anything that release does not contain. Automatic
+   torrents are capped at 30 GiB by default and can be tuned in Settings.
 
 ### Using an existing qBittorrent container
 
@@ -169,9 +175,11 @@ revoked independently.
 2. The monitor job (default: every 15 min) diffs source chapter lists against
    the library. New monitored, missing chapters are grabbed from the highest
    priority source that has them (`Settings → Sources → priority`).
-3. Direct grabs download pages with per-source rate limits (MangaDex: 5 req/s
-   API, 40 img/min) and pack them into a CBZ. Torrent grabs go to qBittorrent
-   under the `mangarr` category and are imported when complete.
+3. Direct grabs download pages with per-source rate limits and pack them into
+   a CBZ. Add-time torrent searches inspect the small `.torrent` metadata
+   first and rank releases by exact file coverage, special-chapter coverage,
+   seeders, and size. The selected release goes to qBittorrent under the
+   `mangarr` category and is imported when complete.
 
 Please be a good citizen: keep the honest User-Agent, don't lower the rate
 limits, and use a MangaDex account so their team can see the traffic is

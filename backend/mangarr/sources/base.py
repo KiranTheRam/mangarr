@@ -50,6 +50,7 @@ class TorrentRelease:
     title: str
     magnet: str
     url: str = ""
+    torrent_url: str = ""
     size_bytes: int = 0
     seeders: int = 0
     leechers: int = 0
@@ -104,3 +105,7 @@ class TorrentIndexer(ABC):
 
     @abstractmethod
     async def search(self, query: str) -> list[TorrentRelease]: ...
+
+    async def get_torrent_metadata(self, release: TorrentRelease) -> bytes:
+        """Fetch a small .torrent file for coverage inspection, if offered."""
+        return b""
