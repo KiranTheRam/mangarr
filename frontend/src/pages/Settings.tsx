@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ChangeEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { ApiKey, RootFolder, Settings as SettingsType } from "../api/types";
@@ -182,6 +182,26 @@ const CONTENT_SOURCES = new Set([
   "asura",
 ]);
 
+function orderedSourceNames(form: SettingsType): string[] {
+  const known = Object.keys(form)
+    .filter(
+      (key) =>
+        key.startsWith("source_") &&
+        key.endsWith("_enabled") &&
+        !key.endsWith("_proxy_enabled"),
+    )
+    .map((key) => key.slice("source_".length, -"_enabled".length));
+  const order = (form.source_priority ?? "")
+    .split(",")
+    .map((source) => source.trim())
+    .filter(
+      (source, index, sources) =>
+        source && known.includes(source) && sources.indexOf(source) === index,
+    );
+  for (const source of known) if (!order.includes(source)) order.push(source);
+  return order;
+}
+
 /** Ordered, toggleable source list — stored as the comma-separated
  * source_priority setting, but never hand-edited as text. */
 function SourcePriority({
@@ -191,19 +211,7 @@ function SourcePriority({
   form: SettingsType;
   setForm: (f: SettingsType) => void;
 }) {
-  const known = Object.keys(form)
-    .filter(
-      (k) =>
-        k.startsWith("source_") &&
-        k.endsWith("_enabled") &&
-        !k.endsWith("_proxy_enabled"),
-    )
-    .map((k) => k.slice("source_".length, -"_enabled".length));
-  const order = (form.source_priority ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s, i, arr) => s && known.includes(s) && arr.indexOf(s) === i);
-  for (const s of known) if (!order.includes(s)) order.push(s);
+  const order = orderedSourceNames(form);
 
   const move = (index: number, delta: number) => {
     const next = [...order];
@@ -236,15 +244,16 @@ function SourcePriority({
             <span className="priority-name">{SOURCE_LABELS[name] ?? name}</span>
             <span className="priority-hint">{SOURCE_HINTS[name] ?? ""}</span>
             {CONTENT_SOURCES.has(name) && (
-              <span className="priority-toggle" title="Proxy chapter page/image downloads">
+              <span className="priority-toggle priority-proxy-toggle" title="Proxy chapter page/image downloads">
                 <span>Proxy</span>
                 <Toggle
-                  on={form[`source_${name}_proxy_enabled`] === "true"}
-                  label={`Proxy ${SOURCE_LABELS[name] ?? name} content downloads`}
-                  onChange={(v) =>
+                  on={enabled && form[`source_${name}_proxy_enabled`] === "true"}
+                  disabled={!enabled}
+                  label={`Use proxy for ${SOURCE_LABELS[name] ?? name} content downloads`}
+                  onChange={(proxyEnabled) =>
                     setForm({
                       ...form,
-                      [`source_${name}_proxy_enabled`]: v ? "true" : "false",
+                      [`source_${name}_proxy_enabled`]: proxyEnabled ? "true" : "false",
                     })
                   }
                 />
@@ -255,14 +264,94 @@ function SourcePriority({
               <Toggle
                 on={enabled}
                 label={`${enabled ? "Disable" : "Enable"} ${SOURCE_LABELS[name] ?? name}`}
-                onChange={(v) =>
-                  setForm({ ...form, [`source_${name}_enabled`]: v ? "true" : "false" })
-                }
+                onChange={(v) => {
+                  const next = {
+                    ...form,
+                    [`source_${name}_enabled`]: v ? "true" : "false",
+                  };
+                  if (!v && CONTENT_SOURCES.has(name)) {
+                    next[`source_${name}_proxy_enabled`] = "false";
+                  }
+                  setForm(next);
+                }}
               />
             </span>
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function ProxySettings({
+  form,
+  setForm,
+  set,
+}: {
+  form: SettingsType;
+  setForm: (form: SettingsType) => void;
+  set: (key: string) => (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
+}) {
+  const eligibleSources = orderedSourceNames(form).filter(
+    (name) => CONTENT_SOURCES.has(name) && form[`source_${name}_enabled`] === "true",
+  );
+
+  return (
+    <div className="settings-section proxy-settings mobile-proxy-settings">
+      <h3>Proxy</h3>
+      <p className="section-hint">
+        Optionally route chapter page and image downloads through one HTTP proxy. Discovery,
+        metadata, authentication, and page manifests always connect directly.
+      </p>
+      <div className="form-row">
+        <label>Proxy address</label>
+        <input
+          type="text"
+          inputMode="url"
+          autoCapitalize="none"
+          autoCorrect="off"
+          placeholder="http://192.168.1.28:8888"
+          value={form.download_proxy_url ?? ""}
+          onChange={set("download_proxy_url")}
+        />
+      </div>
+      <div className="proxy-source-list" aria-label="Sources using the download proxy">
+        <div className="proxy-source-list-heading">Use proxy for content downloads from</div>
+        {eligibleSources.map((name) => {
+          const label = SOURCE_LABELS[name] ?? name;
+          return (
+            <div className="proxy-source-row" key={name}>
+              <div className="proxy-source-copy">
+                <span className="proxy-source-name">{label}</span>
+                <span className="proxy-source-detail">
+                  {form[`source_${name}_proxy_enabled`] === "true"
+                    ? "Downloads fail closed through the proxy"
+                    : "Downloads connect directly"}
+                </span>
+              </div>
+              <Toggle
+                on={form[`source_${name}_proxy_enabled`] === "true"}
+                label={`Use proxy for ${label} content downloads`}
+                onChange={(enabled) =>
+                  setForm({
+                    ...form,
+                    [`source_${name}_proxy_enabled`]: enabled ? "true" : "false",
+                  })
+                }
+              />
+            </div>
+          );
+        })}
+        {eligibleSources.length === 0 && (
+          <p className="section-hint proxy-empty">
+            Enable a content source in Sources to make it eligible for the proxy.
+          </p>
+        )}
+      </div>
+      <p className="section-hint proxy-fail-closed-note">
+        Proxied downloads fail closed: if the proxy is unavailable, Mangarr does not retry that
+        content request directly. Turn a source off here to make its downloads connect directly.
+      </p>
     </div>
   );
 }
@@ -321,7 +410,7 @@ export default function Settings() {
     );
   }
 
-  const set = (key: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
+  const set = (key: string) => (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
     setForm({ ...form, [key]: e.target.value });
   const setBool = (key: string) => (v: boolean) => setForm({ ...form, [key]: v ? "true" : "false" });
 
@@ -367,22 +456,29 @@ export default function Settings() {
             Chapters are grabbed from the highest-priority enabled source that has them — use the
             arrows to reorder.
           </p>
-          <div className="form-row">
-            <label>Content proxy URL</label>
-            <input
-              type="text"
-              placeholder="http://192.168.1.28:8888"
-              value={form.download_proxy_url ?? ""}
-              onChange={set("download_proxy_url")}
-            />
+          <div className="desktop-proxy-settings">
+            <div className="form-row">
+              <label>Content proxy URL</label>
+              <input
+                type="text"
+                inputMode="url"
+                autoCapitalize="none"
+                autoCorrect="off"
+                placeholder="http://192.168.1.28:8888"
+                value={form.download_proxy_url ?? ""}
+                onChange={set("download_proxy_url")}
+              />
+            </div>
+            <p className="section-hint">
+              Proxy applies only to chapter page/image downloads for checked sources. Discovery,
+              metadata, authentication, and page manifests remain direct. Checked sources fail
+              closed instead of retrying directly when the proxy is unavailable.
+            </p>
           </div>
-          <p className="section-hint">
-            Proxy applies only to chapter page/image downloads for checked sources. Discovery,
-            metadata, authentication, and page manifests remain direct. A checked source fails
-            rather than retrying directly when the proxy is unavailable.
-          </p>
           <SourcePriority form={form} setForm={setForm} />
         </div>
+
+        <ProxySettings form={form} setForm={setForm} set={set} />
 
         <div className="settings-section">
           <h3>MangaDex Account</h3>

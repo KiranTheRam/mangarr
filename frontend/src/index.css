@@ -592,6 +592,76 @@ table.data-table {
 .modal-body {
   padding: 20px;
   overflow-y: auto;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.chapter-exclusion {
+  margin: 4px 0 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+}
+
+.chapter-exclusion.active {
+  border-color: color-mix(in srgb, var(--warning) 65%, var(--border));
+  background: color-mix(in srgb, var(--warning) 8%, var(--bg));
+}
+
+.chapter-edit-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.chapter-edit-option input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.chapter-edit-option span {
+  min-width: 0;
+}
+
+.chapter-edit-option strong,
+.chapter-edit-option small {
+  display: block;
+}
+
+.chapter-edit-option small {
+  margin-top: 3px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.chapter-lock-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.chapter-select-all-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.chapter-select-all-label span {
+  display: none;
 }
 
 .source-tabs {
@@ -737,6 +807,11 @@ table.data-table {
 
 .toggle.on::after {
   left: 22px;
+}
+
+.toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* add-series search results */
@@ -1126,6 +1201,76 @@ h4.link-text:hover {
   font-size: 10px;
   line-height: 1;
 }
+
+/* ---------- per-source download proxy ---------- */
+
+.mobile-proxy-settings {
+  display: none;
+}
+
+.proxy-settings .form-row input {
+  max-width: 420px;
+}
+
+.proxy-source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 560px;
+}
+
+.proxy-source-list-heading {
+  margin: 2px 0 3px;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.proxy-source-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 52px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.proxy-source-copy {
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+
+.proxy-source-name {
+  min-width: 112px;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+.proxy-source-detail {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.proxy-empty,
+.proxy-fail-closed-note {
+  max-width: 560px;
+}
+
+.proxy-empty {
+  margin: 0;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+
+.proxy-fail-closed-note {
+  margin-top: 10px;
+}
 /* ==========================================================================
    Mobile (≤ 768px) — the desktop layout is untouched above this line.
    Navigation moves to a bottom tab bar, tables become stacked cards,
@@ -1415,6 +1560,39 @@ h4.link-text:hover {
     display: none;
   }
 
+  /* Preserve the desktop per-section select-all feature while keeping the
+     rest of each table header out of the compact card layout. */
+  .chapter-table thead {
+    display: block;
+  }
+
+  .chapter-table thead tr {
+    display: flex;
+    padding: 7px 12px;
+    background: color-mix(in srgb, var(--bg) 75%, transparent);
+  }
+
+  .chapter-table thead th {
+    display: none;
+  }
+
+  .chapter-table thead .chapter-select-all {
+    display: block;
+    width: auto !important;
+    padding: 0;
+    border: 0;
+  }
+
+  .chapter-select-all-label {
+    min-height: 32px;
+    color: var(--text-dim);
+    font-size: 12.5px;
+  }
+
+  .chapter-select-all-label span {
+    display: inline;
+  }
+
   .card-table tr {
     display: grid;
     gap: 4px 10px;
@@ -1691,6 +1869,42 @@ h4.link-text:hover {
     padding: 16px 14px;
   }
 
+  .desktop-proxy-settings,
+  .priority-proxy-toggle {
+    display: none;
+  }
+
+  .mobile-proxy-settings {
+    display: block;
+  }
+
+  .proxy-settings .form-row input {
+    max-width: none;
+  }
+
+  .proxy-source-row {
+    min-height: 58px;
+    padding: 10px 12px;
+  }
+
+  .proxy-source-copy {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+  }
+
+  .proxy-source-name {
+    min-width: 0;
+  }
+
+  .chapter-edit-option {
+    min-height: 40px;
+  }
+
+  .chapter-exclusion-toggle {
+    min-height: 58px;
+  }
+
   /* source priority rows: hint text drops to its own line */
   .priority-row {
     flex-wrap: wrap;
@@ -1720,6 +1934,21 @@ h4.link-text:hover {
 
   .range-mapper input {
     min-height: 0;
+  }
+}
+
+@media (max-width: 480px) {
+  /* Avoid clipping the longer library filter labels on narrow phones. */
+  .library-toolbar select {
+    flex: 1 1 calc(50% - 4px);
+  }
+
+  .library-toolbar select:last-of-type {
+    flex-basis: 100%;
+  }
+
+  .modal-actions .btn {
+    flex: 1 1 0;
   }
 }
 
