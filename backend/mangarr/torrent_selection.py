@@ -18,8 +18,8 @@ from .util import (
     parse_volume_number,
 )
 
-INSPECTION_CONCURRENCY = 4
 INSPECTION_LIMIT = 20
+MAX_BENCODE_DEPTH = 100
 
 _CHAPTER_RANGE = re.compile(
     r"(?<![a-z])c(?:h(?:apter)?)?[ ._-]{0,2}(\d+(?:\.\d+)?)\s*[-–—]\s*"
@@ -33,6 +33,8 @@ _VOLUME_RANGE = re.compile(
 )
 _ARCHIVE_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z", ".pdf"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
+_CANONICAL_INTEGER = re.compile(rb"(?:0|-[1-9]\d*|[1-9]\d*)\Z")
+_CANONICAL_LENGTH = re.compile(rb"(?:0|[1-9]\d*)\Z")
 
 
 class BencodeError(ValueError):
@@ -42,7 +44,9 @@ class BencodeError(ValueError):
 def bdecode(data: bytes):
     """Minimal, strict bencode decoder sufficient for torrent file lists."""
 
-    def parse(offset: int):
+    def parse(offset: int, depth: int = 0):
+        if depth > MAX_BENCODE_DEPTH:
+            raise BencodeError("bencode nesting exceeds safety limit")
         if offset >= len(data):
             raise BencodeError("unexpected end of bencode data")
         token = data[offset : offset + 1]
@@ -50,21 +54,25 @@ def bdecode(data: bytes):
             end = data.find(b"e", offset + 1)
             if end < 0:
                 raise BencodeError("unterminated integer")
-            try:
-                return int(data[offset + 1 : end]), end + 1
-            except ValueError as exc:
-                raise BencodeError("invalid integer") from exc
+            raw = data[offset + 1 : end]
+            if not _CANONICAL_INTEGER.fullmatch(raw):
+                raise BencodeError("non-canonical integer")
+            return int(raw), end + 1
         if token in (b"l", b"d"):
             collection = [] if token == b"l" else {}
             cursor = offset + 1
+            previous_key: bytes | None = None
             while cursor < len(data) and data[cursor : cursor + 1] != b"e":
-                key, cursor = parse(cursor)
+                key, cursor = parse(cursor, depth + 1)
                 if token == b"l":
                     collection.append(key)
                     continue
                 if not isinstance(key, bytes):
                     raise BencodeError("dictionary key is not bytes")
-                value, cursor = parse(cursor)
+                if previous_key is not None and key <= previous_key:
+                    raise BencodeError("dictionary keys are not strictly sorted")
+                previous_key = key
+                value, cursor = parse(cursor, depth + 1)
                 collection[key] = value
             if cursor >= len(data):
                 raise BencodeError("unterminated collection")
@@ -72,12 +80,12 @@ def bdecode(data: bytes):
         colon = data.find(b":", offset)
         if colon < 0:
             raise BencodeError("invalid byte string")
-        try:
-            length = int(data[offset:colon])
-        except ValueError as exc:
-            raise BencodeError("invalid byte string length") from exc
+        raw_length = data[offset:colon]
+        if not _CANONICAL_LENGTH.fullmatch(raw_length):
+            raise BencodeError("non-canonical byte string length")
+        length = int(raw_length)
         start, end = colon + 1, colon + 1 + length
-        if length < 0 or end > len(data):
+        if end > len(data):
             raise BencodeError("byte string exceeds input")
         return data[start:end], end
 
@@ -116,7 +124,12 @@ def _numbers_in_range(low: float, high: float, known: set[float]) -> set[float]:
     return {number for number in known if low <= number <= high}
 
 
-def coverage_from_text(text: str, chapters: list[Chapter]) -> set[float]:
+def coverage_from_text(
+    text: str,
+    chapters: list[Chapter],
+    *,
+    allow_bare_chapter: bool = True,
+) -> set[float]:
     known = {chapter.number for chapter in chapters}
     by_volume: dict[int, set[float]] = {}
     for chapter in chapters:
@@ -131,7 +144,10 @@ def coverage_from_text(text: str, chapters: list[Chapter]) -> set[float]:
             covered.update(by_volume.get(volume, set()))
     chapter = parse_chapter_number(text)
     volume = parse_volume_number(text)
-    if chapter in known and (volume is None or has_chapter_marker(text)):
+    explicit_chapter = has_chapter_marker(text)
+    if chapter in known and (
+        explicit_chapter or (allow_bare_chapter and volume is None)
+    ):
         covered.add(float(chapter))
     elif volume is not None:
         covered.update(by_volume.get(volume, set()))
@@ -139,7 +155,10 @@ def coverage_from_text(text: str, chapters: list[Chapter]) -> set[float]:
 
 
 def torrent_coverage(
-    metadata: bytes, release_title: str, chapters: list[Chapter]
+    metadata: bytes,
+    release_title: str,
+    chapters: list[Chapter],
+    series: Series | None = None,
 ) -> set[float]:
     """Chapter numbers represented by files, falling back to the release title."""
     paths = torrent_paths(metadata)
@@ -149,11 +168,28 @@ def torrent_coverage(
         item = PurePosixPath(raw)
         suffix = item.suffix.lower()
         if suffix in _ARCHIVE_EXTS:
-            covered.update(coverage_from_text(item.stem, chapters))
+            covered.update(
+                coverage_from_text(
+                    item.stem,
+                    chapters,
+                    allow_bare_chapter=(
+                        series is not None and release_matches_series(item.stem, series)
+                    ),
+                )
+            )
         elif suffix in _IMAGE_EXTS:
             image_parents.add(str(item.parent))
     for parent in image_parents:
-        covered.update(coverage_from_text(PurePosixPath(parent).name, chapters))
+        name = PurePosixPath(parent).name
+        covered.update(
+            coverage_from_text(
+                name,
+                chapters,
+                allow_bare_chapter=(
+                    series is not None and release_matches_series(name, series)
+                ),
+            )
+        )
     # A broad title such as "c001-c100" may omit decimal extras in the actual
     # file list. Once parseable files are available, treat them as authoritative.
     return covered or coverage_from_text(release_title, chapters)
@@ -165,7 +201,16 @@ def release_matches_series(release_title: str, series: Series) -> bool:
         return False
     aliases = title_queries(series.title, split_alt_titles(series.alt_titles))
     normalized = [normalize_title(alias) for alias in aliases]
-    return any(alias and len(alias) >= 4 and alias in release for alias in normalized)
+    for alias in normalized:
+        compact_length = len(alias.replace(" ", ""))
+        if compact_length < 3:
+            continue
+        if compact_length == 3:
+            if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", release):
+                return True
+        elif alias in release:
+            return True
+    return False
 
 
 @dataclass
@@ -209,26 +254,27 @@ async def select_best_torrent(
                     continue
                 seen.add(key)
                 candidates.append((indexer, release))
+            if len(candidates) >= INSPECTION_LIMIT:
+                # A productive title query already supplied enough
+                # releases to inspect; avoid spending rate-limit slots on up
+                # to five redundant alternate-title searches.
+                break
     # Seeder order puts viable metadata first and bounds work against broad
     # title queries without making popularity outrank actual file coverage.
     candidates.sort(key=lambda item: item[1].seeders, reverse=True)
     candidates = candidates[:INSPECTION_LIMIT]
-    semaphore = asyncio.Semaphore(INSPECTION_CONCURRENCY)
 
     async def inspect(item: tuple[TorrentIndexer, TorrentRelease]):
         indexer, release = item
-        async with semaphore:
-            try:
-                metadata = await indexer.get_torrent_metadata(release)
-                coverage = (
-                    torrent_coverage(metadata, release.title, chapters)
-                    if metadata
-                    else coverage_from_text(release.title, chapters)
-                )
-            except (BencodeError, ValueError, OSError):
-                coverage = coverage_from_text(release.title, chapters)
-            except Exception:
-                coverage = coverage_from_text(release.title, chapters)
+        try:
+            metadata = await indexer.get_torrent_metadata(release)
+            coverage = (
+                torrent_coverage(metadata, release.title, chapters, series)
+                if metadata
+                else coverage_from_text(release.title, chapters)
+            )
+        except Exception:
+            coverage = coverage_from_text(release.title, chapters)
         return TorrentSelection(release=release, coverage=coverage & wanted)
 
     inspected = await asyncio.gather(*(inspect(item) for item in candidates))

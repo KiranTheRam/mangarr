@@ -32,7 +32,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("chapters", "volume_source", "VARCHAR NOT NULL DEFAULT ''", None),
     ("chapters", "title_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
     ("chapters", "volume_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
-    ("chapters", "available_sources", "VARCHAR NOT NULL DEFAULT ''", None),
+    # NULL means the chapter has not had source availability evaluated yet;
+    # an empty string means a successful refresh found no direct source.
+    ("chapters", "available_sources", "VARCHAR", None),
 ]
 
 

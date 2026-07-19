@@ -6,6 +6,7 @@ both less brittle and substantially cheaper than scraping rendered HTML.
 """
 
 import re
+from math import floor, isclose
 from urllib.parse import urljoin
 
 import httpx
@@ -23,6 +24,30 @@ _UPLOAD_TAG = re.compile(r"^\([^()]{1,30}\)$")
 _TITLE_NUMBER = re.compile(
     r"^\s*(?:class|chapter|ch\.?|#)\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE
 )
+
+
+def canonical_chapter_number(api_number: float, title: str) -> float:
+    """Repair MangaFire's narrow official-volume positional-number defect.
+
+    Some official imports encode the item position as ``N.01`` while the
+    visible title carries the next integer chapter (and the first entry has
+    appeared as ``0.01`` / ``Class 2``). Do not generally trust title-leading
+    numbers: combined chapters such as API chapter 105 named "Chapter
+    104-105" must keep the API's canonical 105.
+    """
+    match = _TITLE_NUMBER.match(title)
+    if not match:
+        return api_number
+    title_number = float(match.group(1))
+    fraction = api_number - floor(api_number)
+    delta = title_number - api_number
+    if (
+        title_number.is_integer()
+        and isclose(fraction, 0.01, abs_tol=1e-6)
+        and 0.5 <= delta <= 2.0
+    ):
+        return title_number
+    return api_number
 
 
 class MangaFireSource(DirectSource):
@@ -86,9 +111,7 @@ class MangaFireSource(DirectSource):
                 except (TypeError, ValueError):
                     continue
                 chapter_id = str(item.get("id") or "").strip()
-                if not chapter_id or number in chapters:
-                    # The API returns official before unofficial duplicates.
-                    # One readable edition per number is enough for Mangarr.
+                if not chapter_id:
                     continue
                 raw_title = str(item.get("name") or "").strip()
                 # Some official-volume imports expose positional API numbers
@@ -96,11 +119,12 @@ class MangaFireSource(DirectSource):
                 # 98".  The explicit display number is the canonical chapter;
                 # accepting the positional value would create hundreds of
                 # fake decimal specials.
-                title_number = _TITLE_NUMBER.match(raw_title)
-                if title_number:
-                    number = float(title_number.group(1))
-                    if number in chapters:
-                        continue
+                number = canonical_chapter_number(number, raw_title)
+                if number in chapters:
+                    # The API returns official before unofficial duplicates.
+                    # Deduplicate only after every entry is in canonical
+                    # chapter-number space.
+                    continue
                 title = "" if _UPLOAD_TAG.fullmatch(raw_title) else raw_title
                 chapters[number] = SourceChapter(
                     source_name=self.name,

@@ -861,6 +861,10 @@ export default function SeriesDetail() {
                 <span className="pill green" title={ch.file_path}>
                   Downloaded
                 </span>
+              ) : ch.available_sources === null ? (
+                <span className="pill gray" title="Direct-source availability has not been refreshed yet">
+                  Missing
+                </span>
               ) : ch.available_sources ? (
                 <span className="pill gray" title={`Available from ${ch.available_sources.split(",").join(", ")}`}>
                   Available

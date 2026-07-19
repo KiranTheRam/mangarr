@@ -6,7 +6,7 @@ from urllib.parse import quote
 import httpx
 
 from .. import USER_AGENT
-from ..util import RateLimiter, rl_request
+from ..util import RateLimiter, rl_get_limited_bytes, rl_request
 from .base import TorrentIndexer, TorrentRelease
 
 BASE_URL = "https://nyaa.si"
@@ -78,14 +78,12 @@ class NyaaIndexer(TorrentIndexer):
     async def get_torrent_metadata(self, release: TorrentRelease) -> bytes:
         if not release.torrent_url:
             return b""
-        response = await rl_request(
-            self._client, "GET", release.torrent_url, limiter=_limiter
+        return await rl_get_limited_bytes(
+            self._client,
+            release.torrent_url,
+            limiter=_limiter,
+            limit=MAX_TORRENT_METADATA_BYTES,
         )
-        response.raise_for_status()
-        content = response.content
-        if len(content) > MAX_TORRENT_METADATA_BYTES:
-            raise ValueError("torrent metadata exceeds 4 MiB safety limit")
-        return content
 
 
 indexer = NyaaIndexer()

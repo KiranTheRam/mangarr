@@ -143,7 +143,9 @@ class Chapter(Base):
     # Comma-separated enabled direct sources whose latest successful chapter
     # listing contains this exact number.  Metadata-only/catalogue rows remain
     # visible while the UI can honestly say that no linked source serves them.
-    available_sources: Mapped[str] = mapped_column(String, default="")
+    available_sources: Mapped[str | None] = mapped_column(
+        String, nullable=True, default=None
+    )
 
     series: Mapped[Series] = relationship(back_populates="chapters")
 

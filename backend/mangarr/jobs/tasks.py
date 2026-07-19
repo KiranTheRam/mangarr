@@ -7,6 +7,7 @@ import binascii
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -376,7 +377,9 @@ async def update_chapters(
         apply_metadata_rows(existing.values(), rows, series.title)
 
     for number, chapter in existing.items():
-        chapter.available_sources = ",".join(sorted(availability.get(number, set())))
+        current = ",".join(sorted(availability.get(number, set())))
+        if chapter.available_sources != current:
+            chapter.available_sources = current
 
     await session.commit()
     return added
@@ -615,11 +618,14 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
                 # explicit one-time search (e.g. "search for missing" at add
                 # time): runs even for unmonitored series, whose chapters carry
                 # monitored=False — the user asked for the missing content now
-                torrent_coverage = await auto_grab_best_torrent(session, series, values)
+                torrent_grab = await auto_grab_best_torrent(session, series, values)
                 await grab_missing_chapters(
                     session, series, values, only_monitored=False,
                     chapter_cache=chapter_cache,
-                    exclude_numbers=torrent_coverage,
+                    exclude_numbers=(torrent_grab.coverage if torrent_grab else None),
+                    allowed_series_download_id=(
+                        torrent_grab.download_id if torrent_grab else None
+                    ),
                 )
     except Exception:
         # this runs as a fire-and-forget task: without this, the exception
@@ -770,21 +776,47 @@ async def enqueue_torrent(
     return dl
 
 
+@dataclass(frozen=True)
+class AutomaticTorrentGrab:
+    download_id: int
+    coverage: set[float]
+
+
 async def auto_grab_best_torrent(
     session: AsyncSession, series: Series, values: dict[str, str]
-) -> set[float]:
+) -> AutomaticTorrentGrab | None:
     """Inspect Nyaa metadata and queue one best-coverage add-time release.
 
-    Returns the chapter numbers that the selected torrent is expected to
-    cover.  The caller excludes those from direct grabs in the same setup pass
-    while still queueing direct downloads for every uncovered chapter.
+    Returns the new download id and its expected chapter coverage. The id lets
+    the caller distinguish this torrent from an older series-level download;
+    older in-flight packs must continue to block duplicate direct grabs.
     """
     if (
         values.get("qbittorrent_enabled") != "true"
         or not series.root_folder
         or not registry.enabled_torrent_indexers(values)
     ):
-        return set()
+        return None
+    existing_download = await session.scalar(
+        select(Download.id)
+        .where(
+            Download.series_id == series.id,
+            Download.chapter_id.is_(None),
+            Download.status.in_([
+                DownloadStatus.QUEUED,
+                DownloadStatus.DOWNLOADING,
+                DownloadStatus.IMPORTING,
+            ]),
+        )
+        .limit(1)
+    )
+    if existing_download is not None:
+        log.info(
+            "automatic torrent search skipped for %r: series download %d is in flight",
+            series.title,
+            existing_download,
+        )
+        return None
     try:
         max_gib = int(values.get("torrent_auto_max_size_gib", "30"))
         min_seeders = int(values.get("torrent_auto_min_seeders", "1"))
@@ -797,17 +829,27 @@ async def auto_grab_best_torrent(
         )
     except Exception as exc:
         log.warning("automatic torrent search failed for %r: %s", series.title, exc)
-        return set()
+        return None
     if selection is None:
-        log.info("automatic torrent search found no inspectable coverage for %r", series.title)
-        return set()
+        if not any(chapter.volume is not None for chapter in series.chapters):
+            log.info(
+                "automatic torrent search found no exact chapter coverage for %r; "
+                "volume-only releases cannot be scored without a chapter-to-volume map",
+                series.title,
+            )
+        else:
+            log.info(
+                "automatic torrent search found no inspectable coverage for %r",
+                series.title,
+            )
+        return None
     try:
-        await enqueue_torrent(
+        download = await enqueue_torrent(
             session, series, selection.release.magnet, selection.release.title, values
         )
     except Exception as exc:
         log.warning("automatic torrent grab failed for %r: %s", series.title, exc)
-        return set()
+        return None
     log.info(
         "automatic torrent selected %r for %r: %d chapter(s), %d seeder(s), %.2f GiB",
         selection.release.title,
@@ -816,7 +858,10 @@ async def auto_grab_best_torrent(
         selection.release.seeders,
         selection.release.size_bytes / 1024**3,
     )
-    return set(selection.coverage)
+    return AutomaticTorrentGrab(
+        download_id=download.id,
+        coverage=set(selection.coverage),
+    )
 
 
 # --------------------------------------------------------- direct downloads
@@ -1133,6 +1178,7 @@ async def grab_missing_chapters(
     only_monitored: bool = True,
     chapter_cache: ChapterListCache | None = None,
     exclude_numbers: set[float] | None = None,
+    allowed_series_download_id: int | None = None,
 ) -> int:
     """Queue missing monitored chapters from linked direct sources.
 
@@ -1142,7 +1188,7 @@ async def grab_missing_chapters(
     (explicit user-requested search) also grabs unmonitored missing chapters.
     """
     result = await session.execute(
-        select(Download.chapter_id).where(
+        select(Download.id, Download.chapter_id).where(
             Download.series_id == series.id,
             Download.status.in_([
                 DownloadStatus.QUEUED,
@@ -1151,8 +1197,14 @@ async def grab_missing_chapters(
             ]),
         )
     )
-    active = {row[0] for row in result.all()}
-    if None in active and exclude_numbers is None:
+    active_rows = result.all()
+    active_chapters = {
+        chapter_id for _, chapter_id in active_rows if chapter_id is not None
+    }
+    series_downloads = {
+        download_id for download_id, chapter_id in active_rows if chapter_id is None
+    }
+    if series_downloads and series_downloads != {allowed_series_download_id}:
         # a series-level download (e.g. a Nyaa volume pack) is in flight — its
         # chapter coverage is unknown until it imports, so grabbing per-chapter
         # now would duplicate everything
@@ -1164,7 +1216,7 @@ async def grab_missing_chapters(
         c for c in series.chapters
         if (c.monitored or not only_monitored)
         and not c.downloaded
-        and c.id not in active
+        and c.id not in active_chapters
         and c.number not in excluded
     ]
     if not wanted:

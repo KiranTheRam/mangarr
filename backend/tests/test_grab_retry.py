@@ -2,6 +2,7 @@
 caching, against a real (in-memory) database."""
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -157,6 +158,24 @@ async def test_series_level_download_still_blocks_grabs(db_session, monkeypatch)
     assert await grab_missing_chapters(db_session, series, {}) == 0
 
 
+async def test_empty_exclusions_do_not_bypass_series_download_guard(db_session, monkeypatch):
+    series = await _make_series(db_session, [1])
+    source = FakeSource([1])
+    _use_source(monkeypatch, source)
+    db_session.add(Download(
+        series_id=series.id,
+        chapter_id=None,
+        kind=DownloadKind.TORRENT,
+        status=DownloadStatus.DOWNLOADING,
+        source_name="nyaa",
+    ))
+    await db_session.commit()
+
+    assert await grab_missing_chapters(
+        db_session, series, {}, exclude_numbers=set()
+    ) == 0
+
+
 async def test_chapter_cache_shared_between_update_and_grab(db_session, monkeypatch):
     """One monitor pass must fetch each source's chapter list once, not once
     per consumer."""
@@ -174,6 +193,11 @@ async def test_chapter_cache_shared_between_update_and_grab(db_session, monkeypa
     assert queued == 2
     assert source.list_calls == 1
     assert all(ch.available_sources == "fake" for ch in series.chapters)
+
+
+async def test_unrefreshed_chapter_availability_is_unknown(db_session):
+    series = await _make_series(db_session, [1])
+    assert series.chapters[0].available_sources is None
 
 
 async def test_successful_refresh_clears_stale_source_availability(db_session, monkeypatch):
@@ -208,17 +232,22 @@ async def test_new_torrent_coverage_allows_uncovered_direct_grabs(db_session, mo
     series = await _make_series(db_session, [1, 2])
     source = FakeSource([1, 2])
     _use_source(monkeypatch, source)
-    db_session.add(Download(
+    torrent = Download(
         series_id=series.id,
         chapter_id=None,
         kind=DownloadKind.TORRENT,
         status=DownloadStatus.DOWNLOADING,
         source_name="nyaa",
-    ))
+    )
+    db_session.add(torrent)
     await db_session.commit()
 
     queued = await grab_missing_chapters(
-        db_session, series, {}, exclude_numbers={1.0}
+        db_session,
+        series,
+        {},
+        exclude_numbers={1.0},
+        allowed_series_download_id=torrent.id,
     )
 
     assert queued == 1
@@ -250,12 +279,13 @@ async def test_auto_torrent_grab_returns_inspected_coverage(db_session, tmp_path
 
     async def fake_enqueue(session, selected_series, magnet, title, values):
         captured["enqueued"] = (selected_series.id, magnet, title)
+        return SimpleNamespace(id=321)
 
     monkeypatch.setattr(tasks, "select_best_torrent", fake_select)
     monkeypatch.setattr(tasks, "enqueue_torrent", fake_enqueue)
     monkeypatch.setattr(tasks.registry, "enabled_torrent_indexers", lambda values: [object()])
 
-    coverage = await auto_grab_best_torrent(
+    grab = await auto_grab_best_torrent(
         db_session,
         series,
         {
@@ -265,10 +295,37 @@ async def test_auto_torrent_grab_returns_inspected_coverage(db_session, tmp_path
         },
     )
 
-    assert coverage == {1.0, 2.5}
+    assert grab is not None
+    assert grab.download_id == 321
+    assert grab.coverage == {1.0, 2.5}
     assert captured["max_size"] == 30 * 1024**3
     assert captured["min_seeders"] == 1
     assert captured["enqueued"] == (series.id, release.magnet, release.title)
+
+
+async def test_auto_torrent_skips_when_series_download_is_active(
+    db_session, tmp_path, monkeypatch
+):
+    series = await _make_series(db_session, [1])
+    series.root_folder = RootFolder(path=str(tmp_path))
+    db_session.add(Download(
+        series_id=series.id,
+        chapter_id=None,
+        kind=DownloadKind.TORRENT,
+        status=DownloadStatus.DOWNLOADING,
+        source_name="nyaa",
+    ))
+    await db_session.commit()
+    monkeypatch.setattr(tasks.registry, "enabled_torrent_indexers", lambda values: [object()])
+
+    async def unexpected_select(*args, **kwargs):
+        raise AssertionError("selection must not run while a series torrent is active")
+
+    monkeypatch.setattr(tasks, "select_best_torrent", unexpected_select)
+
+    assert await auto_grab_best_torrent(
+        db_session, series, {"qbittorrent_enabled": "true"}
+    ) is None
 
 
 async def test_active_direct_download_removed_by_user_is_not_completed(

@@ -23,7 +23,7 @@ export interface Chapter {
   monitored: boolean;
   downloaded: boolean;
   file_path: string;
-  available_sources: string;
+  available_sources: string | null;
 }
 
 export interface Series {
