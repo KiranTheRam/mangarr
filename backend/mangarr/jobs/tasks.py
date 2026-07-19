@@ -696,9 +696,13 @@ def torrent_save_path(base: str, category: str) -> str | None:
     return f"/{category}" if base == "/" else f"{base}/{category}"
 
 
-async def enqueue_torrent(
-    session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
-) -> Download:
+
+async def submit_torrent(magnet: str, values: dict[str, str]) -> str:
+    """Submit a magnet to qBittorrent and return its normalized info hash.
+
+    Kept separate from the database row creation so a failed torrent can be
+    submitted again without replacing its Activity entry.
+    """
     torrent_hash = magnet_btih_hex(magnet)
     if not torrent_hash:
         raise ValueError("magnet link must include a valid btih info hash")
@@ -717,6 +721,13 @@ async def enqueue_torrent(
         await client.add_magnet(magnet, category=category, save_path=save_path)
     finally:
         await client.close()
+    return torrent_hash
+
+
+async def enqueue_torrent(
+    session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
+) -> Download:
+    torrent_hash = await submit_torrent(magnet, values)
     dl = Download(
         series_id=series.id if series else None,
         kind=DownloadKind.TORRENT,
