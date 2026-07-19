@@ -536,28 +536,42 @@ function ChapterMetadataModal({
           }}
         />
       </div>
-      <label style={{ display: "block", marginBottom: 8 }}>
-        <input type="checkbox" checked={titleLocked} onChange={(event) => setTitleLocked(event.target.checked)} />{" "}
-        Keep this title during future refreshes
-      </label>
-      <label style={{ display: "block" }}>
-        <input type="checkbox" checked={volumeLocked} onChange={(event) => setVolumeLocked(event.target.checked)} />{" "}
-        Keep this volume during future refreshes/resyncs
-      </label>
-      <label style={{ display: "block", marginTop: 16 }}>
-        <input
-          type="checkbox"
-          checked={excluded}
-          onChange={(event) => setExcluded(event.target.checked)}
-        />{" "}
-        Exclude this chapter
-      </label>
-      <div style={{ color: "var(--text-dim)", fontSize: 13, marginTop: 4 }}>
-        Excluded chapters stay visible here so you can restore them, but do not count as
-        missing and are skipped by refreshes, searches, scans, and downloads.
+      <div className={`chapter-exclusion${excluded ? " active" : ""}`}>
+        <label className="chapter-edit-option chapter-exclusion-toggle">
+          <input
+            type="checkbox"
+            checked={excluded}
+            onChange={(event) => setExcluded(event.target.checked)}
+          />
+          <span>
+            <strong>Exclude this chapter</strong>
+            <small>
+              Keep it visible so it can be restored, but skip it when calculating missing
+              chapters and during refreshes, searches, scans, and downloads.
+            </small>
+          </span>
+        </label>
+      </div>
+      <div className="chapter-lock-options" aria-label="Metadata refresh options">
+        <label className="chapter-edit-option">
+          <input
+            type="checkbox"
+            checked={titleLocked}
+            onChange={(event) => setTitleLocked(event.target.checked)}
+          />
+          <span>Keep this title during future refreshes</span>
+        </label>
+        <label className="chapter-edit-option">
+          <input
+            type="checkbox"
+            checked={volumeLocked}
+            onChange={(event) => setVolumeLocked(event.target.checked)}
+          />
+          <span>Keep this volume during future refreshes/resyncs</span>
+        </label>
       </div>
       {save.isError && <div className="error-banner">{(save.error as Error).message}</div>}
-      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+      <div className="modal-actions chapter-edit-actions">
         <button className="btn" onClick={onClose}>Cancel</button>
         <button className="btn primary" disabled={save.isPending || (volume !== "" && Number(volume) < 1)} onClick={() => save.mutate()}>
           {save.isPending ? "Saving…" : "Save"}
@@ -803,26 +817,29 @@ export default function SeriesDetail() {
     <table className="data-table card-table chapter-table">
       <thead>
         <tr>
-          <th style={{ width: 42 }}>
-            <input
-              type="checkbox"
-              title="Select every chapter shown here"
-              checked={
-                chapters.some((c) => !c.excluded)
-                && chapters.filter((c) => !c.excluded).every((c) => selectedChapters.has(c.id))
-              }
-              onChange={(e) => {
-                const ids = chapters.filter((c) => !c.excluded).map((c) => c.id);
-                setSelectedChapters((current) => {
-                  const next = new Set(current);
-                  for (const id of ids) {
-                    if (e.target.checked) next.add(id);
-                    else next.delete(id);
-                  }
-                  return next;
-                });
-              }}
-            />
+          <th className="chapter-select-all" style={{ width: 42 }}>
+            <label className="chapter-select-all-label">
+              <input
+                type="checkbox"
+                aria-label="Select every chapter shown here"
+                checked={
+                  chapters.some((c) => !c.excluded)
+                  && chapters.filter((c) => !c.excluded).every((c) => selectedChapters.has(c.id))
+                }
+                onChange={(e) => {
+                  const ids = chapters.filter((c) => !c.excluded).map((c) => c.id);
+                  setSelectedChapters((current) => {
+                    const next = new Set(current);
+                    for (const id of ids) {
+                      if (e.target.checked) next.add(id);
+                      else next.delete(id);
+                    }
+                    return next;
+                  });
+                }}
+              />
+              <span>Select all chapters in this section</span>
+            </label>
           </th>
           <th style={{ width: 36 }}></th>
           <th style={{ width: 130 }}>Chapter</th>

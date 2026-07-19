@@ -68,6 +68,12 @@ class TestContentProxy:
         with pytest.raises(ValueError, match="download_proxy_url is required"):
             validate({"source_mangadex_proxy_enabled": "true"})
 
+    def test_disabled_source_does_not_require_proxy_url(self):
+        validate({
+            "source_mangadex_enabled": "false",
+            "source_mangadex_proxy_enabled": "true",
+        })
+
     @pytest.mark.parametrize("url", ["192.168.1.28:8888", "socks5://localhost:1080"])
     def test_proxy_url_requires_supported_scheme(self, url):
         with pytest.raises(ValueError, match="valid http"):

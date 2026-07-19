@@ -148,3 +148,21 @@ async def test_runtime_settings_select_only_content_sources(monkeypatch):
     )
     assert registry.DIRECT_SOURCES["mangadex"].content_proxy_enabled is False
     assert registry.DIRECT_SOURCES["viz"].content_proxy_enabled is False
+
+
+async def test_runtime_settings_ignore_proxy_flag_for_disabled_source(monkeypatch):
+    values = dict(settings_service.DEFAULTS)
+    values["download_proxy_url"] = "http://192.168.1.28:8888"
+    values["source_mangafire_enabled"] = "false"
+    values["source_mangafire_proxy_enabled"] = "true"
+
+    async def get_all(_session):
+        return values
+
+    monkeypatch.setattr(registry.settings_service, "get_all", get_all)
+
+    await registry.apply_settings(None)
+
+    source = registry.DIRECT_SOURCES["mangafire"]
+    assert source.content_proxy_enabled is False
+    assert source.content_proxy_url == ""

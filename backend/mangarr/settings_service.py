@@ -131,7 +131,11 @@ def validate(values: dict[str, str]) -> None:
             )
 
     proxy_enabled = any(
-        values.get(f"source_{name}_proxy_enabled") == "true"
+        values.get(
+            f"source_{name}_enabled",
+            DEFAULTS[f"source_{name}_enabled"],
+        ) == "true"
+        and values.get(f"source_{name}_proxy_enabled") == "true"
         for name in CONTENT_SOURCE_NAMES
     )
     if proxy_enabled and not values.get("download_proxy_url"):
