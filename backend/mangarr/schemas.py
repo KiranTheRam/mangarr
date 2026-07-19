@@ -58,8 +58,13 @@ class SeriesOut(BaseModel):
     total_chapters: int | None
     total_volumes: int | None
     added_at: datetime
+    # main (whole-numbered) chapters only — these define "fully downloaded"
     chapter_count: int = 0
     downloaded_count: int = 0
+    # decimal chapters (60.5 …): searched for like any other, but excluded
+    # from the counts above so a missing special never blocks completion
+    special_count: int = 0
+    special_downloaded_count: int = 0
 
 
 class SeriesDetailOut(SeriesOut):

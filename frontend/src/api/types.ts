@@ -45,8 +45,12 @@ export interface Series {
   total_chapters: number | null;
   total_volumes: number | null;
   added_at: string;
+  // main (whole-numbered) chapters only — these define "fully downloaded"
   chapter_count: number;
   downloaded_count: number;
+  // decimal chapters (60.5 …), tracked and searched but never blocking completion
+  special_count: number;
+  special_downloaded_count: number;
 }
 
 export interface SeriesDetail extends Series {

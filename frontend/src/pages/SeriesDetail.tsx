@@ -937,6 +937,13 @@ export default function SeriesDetail() {
                 <span>
                   {series.downloaded_count} / {series.chapter_count} chapters
                 </span>
+                {series.special_count > 0 && (
+                  <span
+                    title="Decimal chapters (60.5 …) are specials — searched for like any other chapter, but they don't count toward completion"
+                  >
+                    {series.special_downloaded_count} / {series.special_count} specials
+                  </span>
+                )}
                 {series.total_volumes && <span>{series.total_volumes} volumes</span>}
               </div>
             </div>
