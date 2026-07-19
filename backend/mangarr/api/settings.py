@@ -27,7 +27,8 @@ async def update_settings(
     # ignore masked secrets that the user did not change
     to_save = {k: v for k, v in body.items() if v != MASK}
     try:
-        settings_service.validate(to_save)
+        current = await settings_service.get_all(session)
+        settings_service.validate({**current, **to_save})
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     await settings_service.set_many(session, to_save)

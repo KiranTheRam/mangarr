@@ -173,6 +173,15 @@ const SOURCE_HINTS: Record<string, string> = {
   nyaa: "Sent to the download client below and imported when complete.",
 };
 
+const CONTENT_SOURCES = new Set([
+  "mangaplus",
+  "mangadex",
+  "mangafire",
+  "weebcentral",
+  "tcbscans",
+  "asura",
+]);
+
 /** Ordered, toggleable source list — stored as the comma-separated
  * source_priority setting, but never hand-edited as text. */
 function SourcePriority({
@@ -183,7 +192,12 @@ function SourcePriority({
   setForm: (f: SettingsType) => void;
 }) {
   const known = Object.keys(form)
-    .filter((k) => k.startsWith("source_") && k.endsWith("_enabled"))
+    .filter(
+      (k) =>
+        k.startsWith("source_") &&
+        k.endsWith("_enabled") &&
+        !k.endsWith("_proxy_enabled"),
+    )
     .map((k) => k.slice("source_".length, -"_enabled".length));
   const order = (form.source_priority ?? "")
     .split(",")
@@ -220,11 +234,32 @@ function SourcePriority({
               </button>
             </span>
             <span className="priority-name">{SOURCE_LABELS[name] ?? name}</span>
-            {SOURCE_HINTS[name] && <span className="priority-hint">{SOURCE_HINTS[name]}</span>}
-            <Toggle
-              on={enabled}
-              onChange={(v) => setForm({ ...form, [`source_${name}_enabled`]: v ? "true" : "false" })}
-            />
+            <span className="priority-hint">{SOURCE_HINTS[name] ?? ""}</span>
+            {CONTENT_SOURCES.has(name) && (
+              <span className="priority-toggle" title="Proxy chapter page/image downloads">
+                <span>Proxy</span>
+                <Toggle
+                  on={form[`source_${name}_proxy_enabled`] === "true"}
+                  label={`Proxy ${SOURCE_LABELS[name] ?? name} content downloads`}
+                  onChange={(v) =>
+                    setForm({
+                      ...form,
+                      [`source_${name}_proxy_enabled`]: v ? "true" : "false",
+                    })
+                  }
+                />
+              </span>
+            )}
+            <span className="priority-toggle">
+              <span>Enabled</span>
+              <Toggle
+                on={enabled}
+                label={`${enabled ? "Disable" : "Enable"} ${SOURCE_LABELS[name] ?? name}`}
+                onChange={(v) =>
+                  setForm({ ...form, [`source_${name}_enabled`]: v ? "true" : "false" })
+                }
+              />
+            </span>
           </div>
         );
       })}
@@ -331,6 +366,20 @@ export default function Settings() {
           <p className="section-hint">
             Chapters are grabbed from the highest-priority enabled source that has them — use the
             arrows to reorder.
+          </p>
+          <div className="form-row">
+            <label>Content proxy URL</label>
+            <input
+              type="text"
+              placeholder="http://192.168.1.28:8888"
+              value={form.download_proxy_url ?? ""}
+              onChange={set("download_proxy_url")}
+            />
+          </div>
+          <p className="section-hint">
+            Proxy applies only to chapter page/image downloads for checked sources. Discovery,
+            metadata, authentication, and page manifests remain direct. A checked source fails
+            rather than retrying directly when the proxy is unavailable.
           </p>
           <SourcePriority form={form} setForm={setForm} />
         </div>

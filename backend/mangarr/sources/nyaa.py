@@ -62,7 +62,8 @@ class NyaaIndexer(TorrentIndexer):
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT}, timeout=30, follow_redirects=True
+            headers={"User-Agent": USER_AGENT}, timeout=30, trust_env=False,
+            follow_redirects=True,
         )
 
     async def search(self, query: str) -> list[TorrentRelease]:

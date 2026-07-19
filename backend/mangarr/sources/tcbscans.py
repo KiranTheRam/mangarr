@@ -36,6 +36,7 @@ class TCBScansSource(DirectSource):
                 "Referer": f"{BASE_URL}/",
             },
             timeout=60,
+            trust_env=False,
             follow_redirects=True,
         )
         self._catalog: list[SourceSeries] = []

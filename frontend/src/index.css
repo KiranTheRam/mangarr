@@ -1082,7 +1082,7 @@ h4.link-text:hover {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-width: 560px;
+  max-width: 760px;
 }
 .priority-row {
   display: flex;
@@ -1117,10 +1117,15 @@ h4.link-text:hover {
   color: var(--text-faint);
   font-size: 12px;
 }
-.priority-row .toggle {
-  margin-left: auto;
+.priority-toggle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1;
 }
-
 /* ==========================================================================
    Mobile (≤ 768px) — the desktop layout is untouched above this line.
    Navigation moves to a bottom tab bar, tables become stacked cards,
