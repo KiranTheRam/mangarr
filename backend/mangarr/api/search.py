@@ -1,8 +1,8 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TypeVar
+from typing import Annotated, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -114,21 +114,33 @@ async def _find_direct_source_ids(
 @router.get("/releases", response_model=list[ReleaseOut])
 async def search_releases(
     series_id: int | None = None,
-    chapter_id: int | None = None,
+    chapter_id: Annotated[list[int], Query()] = [],  # noqa: B006 — FastAPI copies it
+    include_torrents: bool = True,
     session: AsyncSession = Depends(get_session),
 ):
     """Interactive search across direct sources and torrent indexers.
 
-    With chapter_id, direct results are restricted to that chapter. With
-    series_id only, direct results are missing local chapters that sources can
-    serve, plus torrent releases for the series.
+    Repeat chapter_id to scope the search to a specific set of chapters
+    (`?chapter_id=1&chapter_id=2`), so a batch of missing chapters can be
+    searched in one pass instead of one modal at a time. With series_id only,
+    direct results are the missing local chapters that sources can serve.
+
+    Torrent releases cover the whole series and cannot be tied to a chapter, so
+    a caller after specific chapters can drop them with include_torrents=false.
     """
-    chapter = None
-    if chapter_id is not None:
-        chapter = await session.get(Chapter, chapter_id)
-        if chapter is None:
+    # chapters keyed by number when the search is scoped; None means series-wide
+    selected: dict[float, Chapter] | None = None
+    if chapter_id:
+        found = (
+            await session.execute(select(Chapter).where(Chapter.id.in_(set(chapter_id))))
+        ).scalars().all()
+        if len(found) != len(set(chapter_id)):
             raise HTTPException(404, "Chapter not found")
-        series_id = chapter.series_id
+        series_ids = {ch.series_id for ch in found}
+        if len(series_ids) > 1:
+            raise HTTPException(422, "All chapters must belong to the same series")
+        selected = {ch.number: ch for ch in found}
+        series_id = series_ids.pop()
     if series_id is None:
         raise HTTPException(422, "series_id or chapter_id required")
 
@@ -166,13 +178,16 @@ async def search_releases(
             for sc in source_chapters:
                 if (src.name, sc.external_id) in direct_seen:
                     continue
-                local_chapter = chapter if chapter is not None else local_chapters.get(sc.number)
-                if local_chapter is None:
-                    continue
-                if chapter is not None and sc.number != chapter.number:
-                    continue
-                if chapter is None and local_chapter.downloaded:
-                    continue
+                if selected is not None:
+                    # scoped: exactly the requested chapters, downloaded or not
+                    # (re-grabbing a chapter you already have is a valid ask)
+                    local_chapter = selected.get(sc.number)
+                    if local_chapter is None:
+                        continue
+                else:
+                    local_chapter = local_chapters.get(sc.number)
+                    if local_chapter is None or local_chapter.downloaded:
+                        continue
                 direct_seen.add((src.name, sc.external_id))
                 out.append(
                     ReleaseOut(
@@ -187,7 +202,9 @@ async def search_releases(
                     )
                 )
                 added_for_source += 1
-                if chapter is None and added_for_source >= 60:
+                # a scoped search is already bounded by the chapters asked for;
+                # only the open-ended series-wide one needs a ceiling
+                if selected is None and added_for_source >= 60:
                     break
         return out
 
@@ -199,7 +216,7 @@ async def search_releases(
     for part in direct_parts:
         releases.extend(part)
 
-    if values["qbittorrent_enabled"] == "true":
+    if include_torrents and values["qbittorrent_enabled"] == "true":
         async def torrent_releases_for_indexer(indexer) -> list[ReleaseOut]:
             out: list[ReleaseOut] = []
             torrent_seen: set[str] = set()

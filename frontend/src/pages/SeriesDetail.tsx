@@ -31,21 +31,37 @@ import { sanitizeDescription } from "../sanitize";
 
 function InteractiveSearch({
   seriesId,
-  chapterId,
+  chapterIds,
+  includeTorrents = true,
   title,
   onClose,
 }: {
   seriesId: number;
-  chapterId?: number;
+  // scope the search to these chapters; empty/undefined searches the whole
+  // series (which the API already narrows to the missing chapters)
+  chapterIds?: number[];
+  includeTorrents?: boolean;
   title: string;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
-  const params = chapterId != null ? `chapter_id=${chapterId}` : `series_id=${seriesId}`;
+  const params = useMemo(() => {
+    const q = new URLSearchParams();
+    if (chapterIds && chapterIds.length > 0) {
+      for (const id of chapterIds) q.append("chapter_id", String(id));
+    } else {
+      q.set("series_id", String(seriesId));
+    }
+    if (!includeTorrents) q.set("include_torrents", "false");
+    return q.toString();
+  }, [seriesId, chapterIds, includeTorrents]);
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["releases", params],
     queryFn: () => api.get<Release[]>(`/search/releases?${params}`),
   });
+  // only a single-chapter search can imply the target chapter; for anything
+  // wider the API tags every direct result with its own chapter_id
+  const soleChapterId = chapterIds?.length === 1 ? chapterIds[0] : undefined;
 
   const [activeSource, setActiveSource] = useState("");
   const [selectedDirect, setSelectedDirect] = useState<Set<string>>(() => new Set());
@@ -59,10 +75,10 @@ function InteractiveSearch({
   );
   const directReleases = visibleReleases.filter((release) => release.kind === "direct");
   const directSelectable = directReleases.filter(
-    (release) => (release.chapter_id ?? chapterId) != null,
+    (release) => (release.chapter_id ?? soleChapterId) != null,
   );
   const releaseKey = (release: Release) =>
-    `${release.source_name}:${release.external_id}:${release.chapter_id ?? chapterId ?? ""}`;
+    `${release.source_name}:${release.external_id}:${release.chapter_id ?? soleChapterId ?? ""}`;
   const selectedVisibleDirect = directSelectable.filter((release) =>
     selectedDirect.has(releaseKey(release)),
   );
@@ -79,7 +95,7 @@ function InteractiveSearch({
 
   const grabRelease = (release: Release) => {
     if (release.kind === "direct") {
-      const directChapterId = release.chapter_id ?? chapterId;
+      const directChapterId = release.chapter_id ?? soleChapterId;
       if (directChapterId == null) {
         throw new Error("Direct release is not linked to a local chapter");
       }
@@ -205,7 +221,7 @@ function InteractiveSearch({
                 <tr key={`${r.source_name}-${r.external_id || r.magnet || i}`}>
                   {directSelectable.length > 0 && (
                     <td className="cell-select">
-                      {r.kind === "direct" && (r.chapter_id ?? chapterId) != null && (
+                      {r.kind === "direct" && (r.chapter_id ?? soleChapterId) != null && (
                         <input
                           type="checkbox"
                           checked={selectedDirect.has(releaseKey(r))}
@@ -232,7 +248,7 @@ function InteractiveSearch({
                       disabled={
                         grab.isPending ||
                         grabSelected.isPending ||
-                        (r.kind === "direct" && (r.chapter_id ?? chapterId) == null)
+                        (r.kind === "direct" && (r.chapter_id ?? soleChapterId) == null)
                       }
                       onClick={() => grab.mutate(r)}
                     >
@@ -542,7 +558,14 @@ export default function SeriesDetail() {
   const seriesId = Number(id);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [search, setSearch] = useState<{ chapterId?: number; title: string } | null>(null);
+  const [search, setSearch] = useState<{
+    chapterIds?: number[];
+    includeTorrents?: boolean;
+    title: string;
+  } | null>(null);
+  const [selectedChapters, setSelectedChapters] = useState<Set<number>>(() => new Set());
+  // anchor for shift-click range selection, in displayed chapter order
+  const [lastPicked, setLastPicked] = useState<number | null>(null);
   const [editingChapter, setEditingChapter] = useState<Chapter | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   // mobile: the synopsis is clamped to a few lines; tapping it toggles the full text
@@ -681,6 +704,57 @@ export default function SeriesDetail() {
     ? groupByVolume(series.chapters)
     : [{ volume: null, chapters: [...series.chapters].sort((a, b) => b.number - a.number) }];
 
+  // chapters in the order they are rendered — the basis for shift-click ranges
+  const orderedChapters = groups.flatMap((g) => g.chapters);
+  const missingChapters = orderedChapters.filter((c) => !c.downloaded);
+  const selectedList = orderedChapters.filter((c) => selectedChapters.has(c.id));
+  const selectedIds = selectedList.map((c) => c.id);
+
+  const setSelection = (ids: number[]) => setSelectedChapters(new Set(ids));
+  const clearSelection = () => {
+    setSelectedChapters(new Set());
+    setLastPicked(null);
+  };
+
+  /** Click toggles one chapter; shift-click extends from the last one picked,
+   * which is how you grab "everything missing in this stretch" in one go. */
+  const pickChapter = (chapter: Chapter, extend: boolean) => {
+    setSelectedChapters((current) => {
+      const next = new Set(current);
+      const anchor = lastPicked == null ? -1 : orderedChapters.findIndex((c) => c.id === lastPicked);
+      const index = orderedChapters.findIndex((c) => c.id === chapter.id);
+      if (extend && anchor >= 0 && index >= 0) {
+        const [from, to] = anchor < index ? [anchor, index] : [index, anchor];
+        // a range follows the anchor's new state, so shift-click can deselect too
+        const selecting = !current.has(chapter.id);
+        for (const c of orderedChapters.slice(from, to + 1)) {
+          if (selecting) next.add(c.id);
+          else next.delete(c.id);
+        }
+      } else if (next.has(chapter.id)) {
+        next.delete(chapter.id);
+      } else {
+        next.add(chapter.id);
+      }
+      return next;
+    });
+    setLastPicked(chapter.id);
+  };
+
+  const searchSelected = () => {
+    if (selectedIds.length === 0) return;
+    setSearch({
+      chapterIds: selectedIds,
+      // the picked chapters are the whole point; series-wide torrent packs
+      // would just bury them
+      includeTorrents: false,
+      title:
+        selectedIds.length === 1
+          ? `${series.title} ${chapterLabel(selectedList[0].number, selectedList[0].volume)}`
+          : `${series.title} — ${selectedIds.length} chapters`,
+    });
+  };
+
   const groupKey = (volume: number | null) => (volume === null ? "none" : String(volume));
   const allCollapsed =
     hasVolumes && groups.every(({ volume }) => collapsed[groupKey(volume)] ?? false);
@@ -711,6 +785,24 @@ export default function SeriesDetail() {
     <table className="data-table card-table chapter-table">
       <thead>
         <tr>
+          <th style={{ width: 42 }}>
+            <input
+              type="checkbox"
+              title="Select every chapter shown here"
+              checked={chapters.every((c) => selectedChapters.has(c.id))}
+              onChange={(e) => {
+                const ids = chapters.map((c) => c.id);
+                setSelectedChapters((current) => {
+                  const next = new Set(current);
+                  for (const id of ids) {
+                    if (e.target.checked) next.add(id);
+                    else next.delete(id);
+                  }
+                  return next;
+                });
+              }}
+            />
+          </th>
           <th style={{ width: 36 }}></th>
           <th style={{ width: 130 }}>Chapter</th>
           <th>Title</th>
@@ -720,7 +812,16 @@ export default function SeriesDetail() {
       </thead>
       <tbody>
         {chapters.map((ch) => (
-          <tr key={ch.id}>
+          <tr key={ch.id} className={selectedChapters.has(ch.id) ? "row-selected" : undefined}>
+            <td className="cell-select">
+              <input
+                type="checkbox"
+                checked={selectedChapters.has(ch.id)}
+                title="Shift-click to select a range"
+                onClick={(e) => pickChapter(ch, e.shiftKey)}
+                onChange={() => {}}
+              />
+            </td>
             <td className="cell-monitor">
               <button
                 className={`monitor-toggle${ch.monitored ? " on" : ""}`}
@@ -777,7 +878,8 @@ export default function SeriesDetail() {
                 title="Interactive search"
                 onClick={() =>
                   setSearch({
-                    chapterId: ch.id,
+                    chapterIds: [ch.id],
+                    includeTorrents: false,
                     title: `${series.title} ${chapterLabel(ch.number, ch.volume)}`,
                   })
                 }
@@ -833,7 +935,27 @@ export default function SeriesDetail() {
         </button>
         <button
           className="btn"
-          title="Search direct sources and torrent indexers for this series"
+          title={
+            missingChapters.length === 0
+              ? "Every chapter is already downloaded"
+              : `Search direct sources for the ${missingChapters.length} chapter(s) you don't have yet`
+          }
+          disabled={missingChapters.length === 0}
+          onClick={() =>
+            setSearch({
+              chapterIds: missingChapters.map((c) => c.id),
+              includeTorrents: false,
+              title: `${series.title} — ${missingChapters.length} missing chapter${
+                missingChapters.length === 1 ? "" : "s"
+              }`,
+            })
+          }
+        >
+          🔍 Search Missing
+        </button>
+        <button
+          className="btn"
+          title="Search direct sources and torrent indexers for this series, including whole-volume packs"
           onClick={() => setSearch({ title: `${series.title} (all releases)` })}
         >
           🔍 Search Releases
@@ -976,6 +1098,47 @@ export default function SeriesDetail() {
           </div>
         </div>
 
+        {series.chapters.length > 0 && (
+          <div className="chapter-selection">
+            <span className="selection-count">
+              {selectedIds.length > 0 ? `${selectedIds.length} selected` : "Select chapters"}
+            </span>
+            <button
+              className="btn sm"
+              disabled={missingChapters.length === 0}
+              onClick={() => setSelection(missingChapters.map((c) => c.id))}
+            >
+              Select missing ({missingChapters.length})
+            </button>
+            {selectedIds.length > 0 && (
+              <>
+                <button className="btn sm" onClick={clearSelection}>
+                  Clear
+                </button>
+                <button
+                  className="btn sm"
+                  title="Monitor the selected chapters"
+                  disabled={toggleChapter.isPending}
+                  onClick={() => toggleChapter.mutate({ chapterIds: selectedIds, monitored: true })}
+                >
+                  🔖 Monitor
+                </button>
+                <button
+                  className="btn sm"
+                  title="Stop monitoring the selected chapters"
+                  disabled={toggleChapter.isPending}
+                  onClick={() => toggleChapter.mutate({ chapterIds: selectedIds, monitored: false })}
+                >
+                  ◻ Unmonitor
+                </button>
+                <button className="btn primary sm" onClick={searchSelected}>
+                  🔍 Search {selectedIds.length} selected
+                </button>
+              </>
+            )}
+            <span className="selection-hint">Shift-click a checkbox to select a range</span>
+          </div>
+        )}
         {series.chapters.length === 0 ? (
           <p style={{ color: "var(--text-dim)" }}>
             No chapters found yet — sources may still be syncing. Use Refresh to retry.
@@ -1058,7 +1221,8 @@ export default function SeriesDetail() {
       {search && (
         <InteractiveSearch
           seriesId={seriesId}
-          chapterId={search.chapterId}
+          chapterIds={search.chapterIds}
+          includeTorrents={search.includeTorrents}
           title={search.title}
           onClose={() => setSearch(null)}
         />
