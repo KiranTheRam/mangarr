@@ -97,6 +97,75 @@ async def rl_request(
     return resp  # type: ignore[return-value]
 
 
+async def rl_get_limited_bytes(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    limit: int,
+    limiter: RateLimiter | None = None,
+    retries: int = 4,
+    max_wait: float = 60.0,
+    **kwargs,
+) -> bytes:
+    """Rate-limited streaming GET whose memory use is bounded by ``limit``.
+
+    Content-Length is rejected up front when present, while incremental reads
+    enforce the same ceiling for chunked or dishonest responses. Retry and
+    back-off behavior mirrors :func:`rl_request`.
+    """
+    for attempt in range(retries + 1):
+        if limiter is not None:
+            await limiter.acquire()
+        retry_wait: float | None = None
+        try:
+            async with client.stream("GET", url, **kwargs) as response:
+                if response.status_code in _RETRY_STATUS and attempt < retries:
+                    retry_wait = _retry_after_seconds(response)
+                    if retry_wait is None:
+                        retry_wait = min(2.0 ** attempt, max_wait)
+                    retry_wait = min(retry_wait, max_wait)
+                else:
+                    response.raise_for_status()
+                    raw_length = response.headers.get("Content-Length")
+                    if raw_length:
+                        try:
+                            declared_length = int(raw_length)
+                        except ValueError:
+                            declared_length = 0
+                        if declared_length > limit:
+                            raise ValueError(
+                                f"response exceeds {limit} byte safety limit"
+                            )
+                    content = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(content) + len(chunk) > limit:
+                            raise ValueError(
+                                f"response exceeds {limit} byte safety limit"
+                            )
+                        content.extend(chunk)
+                    return bytes(content)
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            if attempt >= retries:
+                raise
+            retry_wait = min(2.0 ** attempt, max_wait)
+            log.warning(
+                "GET %s network error (%s); retrying in %.0fs",
+                url,
+                exc.__class__.__name__,
+                retry_wait,
+            )
+        if retry_wait is not None:
+            log.warning(
+                "GET %s retrying in %.0fs (attempt %d/%d)",
+                url,
+                retry_wait,
+                attempt + 1,
+                retries,
+            )
+            await asyncio.sleep(retry_wait)
+    raise RuntimeError(f"GET {url} exhausted retries")
+
+
 ILLEGAL_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 

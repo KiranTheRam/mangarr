@@ -12,7 +12,7 @@ DEFAULTS: dict[str, str] = {
     # Source priority: comma-separated source names, first = preferred.
     # Fast scanlation sources (tcbscans) ahead of archive sources so new
     # chapters are grabbed as soon as they appear.
-    "source_priority": "mangaplus,tcbscans,mangadex,weebcentral,asura,viz,wikipedia,nyaa",
+    "source_priority": "mangaplus,tcbscans,mangadex,mangafire,weebcentral,asura,viz,wikipedia,nyaa",
     # MangaDex credentials (personal API client)
     "mangadex_client_id": "",
     "mangadex_client_secret": "",
@@ -25,6 +25,10 @@ DEFAULTS: dict[str, str] = {
     "qbittorrent_password": "",
     "qbittorrent_category": "mangarr",
     "qbittorrent_enabled": "false",
+    # Automatic add-time torrent selection inspects .torrent metadata first,
+    # then chooses one seeded release with the most missing-chapter coverage.
+    "torrent_auto_max_size_gib": "30",
+    "torrent_auto_min_seeders": "1",
     # Downloads root shared by mangarr and qBittorrent. The category is
     # appended unless the path already ends with it (backward compatibility
     # for installations that stored the final category directory here).
@@ -36,6 +40,7 @@ DEFAULTS: dict[str, str] = {
     "import_mode": "hardlink",
     # Sources on/off
     "source_mangadex_enabled": "true",
+    "source_mangafire_enabled": "true",
     "source_weebcentral_enabled": "true",
     "source_tcbscans_enabled": "true",
     "source_asura_enabled": "true",
@@ -91,6 +96,18 @@ def validate(values: dict[str, str]) -> None:
             raise ValueError("monitor_interval_minutes must be a whole number") from None
         if minutes < 1:
             raise ValueError("monitor_interval_minutes must be at least 1")
+    for key, minimum in (
+        ("torrent_auto_max_size_gib", 1),
+        ("torrent_auto_min_seeders", 0),
+    ):
+        if key not in values:
+            continue
+        try:
+            number = int(values[key])
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a whole number") from None
+        if number < minimum:
+            raise ValueError(f"{key} must be at least {minimum}")
 
 
 async def get_all(session: AsyncSession) -> dict[str, str]:

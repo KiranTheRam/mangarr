@@ -1,4 +1,10 @@
-from mangarr.sources.nyaa import parse_rss, parse_size
+import httpx
+import pytest
+import respx
+
+from mangarr.sources import nyaa as nyaa_module
+from mangarr.sources.base import TorrentRelease
+from mangarr.sources.nyaa import NyaaIndexer, parse_rss, parse_size
 
 RSS_FIXTURE = """<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:nyaa="https://nyaa.si/xmlns/nyaa" version="2.0">
@@ -60,6 +66,7 @@ class TestParseRss:
         assert first.source_name == "nyaa"
         assert first.title == "Ashita no Joe (Tomorrow's Joe) v01-v13 (Digital)"
         assert first.url == "https://nyaa.si/view/1000001"
+        assert first.torrent_url == "https://nyaa.si/download/1000001.torrent"
         assert first.seeders == 42
         assert first.leechers == 3
         assert first.size_bytes == int(2.5 * 1024**3)
@@ -70,3 +77,28 @@ class TestParseRss:
             "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn="
         )
         assert " " not in magnet
+
+
+@respx.mock
+async def test_torrent_metadata_stream_enforces_size_limit(monkeypatch):
+    torrent_url = "https://nyaa.si/download/oversized.torrent"
+    respx.get(torrent_url).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"Transfer-Encoding": "chunked"},
+            content=b"12345",
+        )
+    )
+    monkeypatch.setattr(nyaa_module, "MAX_TORRENT_METADATA_BYTES", 4)
+    indexer = NyaaIndexer()
+    release = TorrentRelease(
+        source_name="nyaa",
+        title="Series",
+        magnet="magnet:test",
+        torrent_url=torrent_url,
+    )
+    try:
+        with pytest.raises(ValueError, match="safety limit"):
+            await indexer.get_torrent_metadata(release)
+    finally:
+        await indexer._client.aclose()

@@ -39,3 +39,19 @@ class TestMonitorInterval:
     def test_zero_rejected(self):
         with pytest.raises(ValueError, match="at least 1"):
             validate({"monitor_interval_minutes": "0"})
+
+
+class TestAutomaticTorrentLimits:
+    def test_defaults_are_valid(self):
+        validate({
+            "torrent_auto_max_size_gib": "30",
+            "torrent_auto_min_seeders": "1",
+        })
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nope"])
+    def test_size_limit_must_be_positive_integer(self, value):
+        with pytest.raises(ValueError, match="torrent_auto_max_size_gib"):
+            validate({"torrent_auto_max_size_gib": value})
+
+    def test_zero_seeders_can_be_explicitly_allowed(self):
+        validate({"torrent_auto_min_seeders": "0"})
