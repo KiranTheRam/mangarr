@@ -59,8 +59,24 @@ export function Modal({
   );
 }
 
-export function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
-  return <button type="button" className={`toggle${on ? " on" : ""}`} onClick={() => onChange(!on)} />;
+export function Toggle({
+  on,
+  onChange,
+  label,
+}: {
+  on: boolean;
+  onChange: (v: boolean) => void;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      className={`toggle${on ? " on" : ""}`}
+      aria-label={label}
+      aria-pressed={on}
+      onClick={() => onChange(!on)}
+    />
+  );
 }
 
 export function formatBytes(bytes: number): string {

@@ -31,7 +31,8 @@ class MangaDexSource(DirectSource):
         language: str = "en",
     ) -> None:
         self._client = client or httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT}, timeout=60, follow_redirects=True
+            headers={"User-Agent": USER_AGENT}, timeout=60, trust_env=False,
+            follow_redirects=True,
         )
         self._access_token: str | None = None
         self._refresh_token: str | None = None

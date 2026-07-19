@@ -56,6 +56,7 @@ class MangaPlusSource(DirectSource):
                 "Session-Token": self._session_token,
             },
             timeout=60,
+            trust_env=False,
             follow_redirects=True,
         )
         self._catalog: list[SourceSeries] = []

@@ -29,6 +29,7 @@ class WeebCentralSource(DirectSource):
         self._client = client or httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT, "Referer": f"{BASE_URL}/"},
             timeout=60,
+            trust_env=False,
             follow_redirects=True,
         )
 

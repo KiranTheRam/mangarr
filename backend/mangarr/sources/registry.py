@@ -41,6 +41,13 @@ async def apply_settings(session: AsyncSession) -> dict[str, str]:
         password=values["mangadex_password"],
         language=values["mangadex_language"],
     )
+    proxy_url = values["download_proxy_url"].strip()
+    for name, source in DIRECT_SOURCES.items():
+        source.content_proxy_enabled = (
+            name in settings_service.CONTENT_SOURCE_NAMES
+            and values.get(f"source_{name}_proxy_enabled") == "true"
+        )
+        source.content_proxy_url = proxy_url if source.content_proxy_enabled else ""
     return values
 
 

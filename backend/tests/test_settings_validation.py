@@ -55,3 +55,26 @@ class TestAutomaticTorrentLimits:
 
     def test_zero_seeders_can_be_explicitly_allowed(self):
         validate({"torrent_auto_min_seeders": "0"})
+
+
+class TestContentProxy:
+    def test_http_proxy_with_selected_source_is_valid(self):
+        validate({
+            "download_proxy_url": "http://192.168.1.28:8888",
+            "source_mangadex_proxy_enabled": "true",
+        })
+
+    def test_selected_source_requires_proxy_url(self):
+        with pytest.raises(ValueError, match="download_proxy_url is required"):
+            validate({"source_mangadex_proxy_enabled": "true"})
+
+    @pytest.mark.parametrize("url", ["192.168.1.28:8888", "socks5://localhost:1080"])
+    def test_proxy_url_requires_supported_scheme(self, url):
+        with pytest.raises(ValueError, match="valid http"):
+            validate({"download_proxy_url": url})
+
+    def test_no_proxy_url_is_valid_when_all_sources_are_direct(self):
+        validate({
+            "download_proxy_url": "",
+            "source_mangadex_proxy_enabled": "false",
+        })

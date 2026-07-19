@@ -60,6 +60,10 @@ class DirectSource(ABC):
     """A site we can search, list chapters on, and pull page images from."""
 
     name: str
+    # Configured at runtime by registry.apply_settings(). Only page/image
+    # bytes use this; source API and metadata clients remain direct.
+    content_proxy_enabled: bool = False
+    content_proxy_url: str = ""
     # per-source proactive limiter for page-image fetches (separate from the
     # HTML/API limiter so images can be pulled a bit faster). Sources override.
     image_limiter: RateLimiter | None = None

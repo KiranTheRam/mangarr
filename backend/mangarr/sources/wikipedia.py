@@ -193,7 +193,8 @@ class WikipediaSource(DirectSource):
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT}, timeout=30, follow_redirects=True
+            headers={"User-Agent": USER_AGENT}, timeout=30, trust_env=False,
+            follow_redirects=True,
         )
         self._metadata_cache: dict[str, tuple[float, list[ChapterMetadata]]] = {}
 

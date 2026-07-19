@@ -32,6 +32,11 @@ async def download_chapter_to_cbz(
 ) -> None:
     """Fetches all pages of a chapter and writes the CBZ to dest_path.
     progress_cb(done, total) is called as pages finish."""
+    if source.content_proxy_enabled and not source.content_proxy_url:
+        # Never turn a proxy configuration error into a direct request. This
+        # can only happen if the database was edited outside the settings API.
+        raise RuntimeError(f"{source.name} content proxy is enabled but has no URL")
+
     page_urls = await source.get_pages(chapter_external_id)
     if not page_urls:
         raise RuntimeError(f"{source.name} returned no pages for chapter {chapter.number}")
@@ -49,9 +54,17 @@ async def download_chapter_to_cbz(
     done = 0
     sem = asyncio.Semaphore(PAGE_CONCURRENCY)
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": USER_AGENT}, timeout=120, follow_redirects=True
-    ) as client:
+    client_options = {
+        "headers": {"User-Agent": USER_AGENT},
+        "timeout": 120,
+        "follow_redirects": True,
+        # Unchecked means direct even if the container inherits HTTP_PROXY.
+        "trust_env": False,
+    }
+    if source.content_proxy_enabled:
+        client_options["proxy"] = source.content_proxy_url
+
+    async with httpx.AsyncClient(**client_options) as client:
 
         async def fetch(i: int, url: str) -> None:
             nonlocal done

@@ -31,6 +31,7 @@ class AsuraSource(DirectSource):
                 "Referer": f"{SITE_URL}/",
             },
             timeout=60,
+            trust_env=False,
             follow_redirects=True,
         )
 

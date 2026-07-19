@@ -5,6 +5,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Setting
 
+CONTENT_SOURCE_NAMES = (
+    "mangaplus",
+    "mangadex",
+    "mangafire",
+    "weebcentral",
+    "tcbscans",
+    "asura",
+)
+
 DEFAULTS: dict[str, str] = {
     # Media management
     "naming_template": "{series} - Ch. {chapter:04.1f}",
@@ -52,6 +61,10 @@ DEFAULTS: dict[str, str] = {
     "source_wikipedia_enabled": "true",
     # Official metadata-only source for VIZ-licensed properties.
     "source_viz_enabled": "true",
+    # Optional HTTP(S) proxy used only for chapter page/image bytes. Source
+    # discovery, metadata, authentication, and page manifests stay direct.
+    "download_proxy_url": "",
+    **{f"source_{name}_proxy_enabled": "false" for name in CONTENT_SOURCE_NAMES},
     # Jobs
     "monitor_interval_minutes": "60",
     # Library
@@ -74,6 +87,7 @@ def validate(values: dict[str, str]) -> None:
     template fails every download at rename time, and a non-numeric monitor
     interval would abort scheduler startup. Raises ValueError."""
     from .library.naming import chapter_filename
+    from urllib.parse import urlsplit
 
     for key in ("naming_template", "naming_template_no_volume"):
         if key not in values:
@@ -108,6 +122,22 @@ def validate(values: dict[str, str]) -> None:
             raise ValueError(f"{key} must be a whole number") from None
         if number < minimum:
             raise ValueError(f"{key} must be at least {minimum}")
+
+    if "download_proxy_url" in values and values["download_proxy_url"]:
+        parsed = urlsplit(values["download_proxy_url"])
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(
+                "download_proxy_url must be a valid http:// or https:// proxy URL"
+            )
+
+    proxy_enabled = any(
+        values.get(f"source_{name}_proxy_enabled") == "true"
+        for name in CONTENT_SOURCE_NAMES
+    )
+    if proxy_enabled and not values.get("download_proxy_url"):
+        raise ValueError(
+            "download_proxy_url is required when a source content proxy is enabled"
+        )
 
 
 async def get_all(session: AsyncSession) -> dict[str, str]:
