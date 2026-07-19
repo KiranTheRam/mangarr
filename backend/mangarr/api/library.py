@@ -84,6 +84,11 @@ def _folders_of(series: Series) -> list[Path]:
     return resolve_folders(_root_of(series), series, [f.path for f in series.extra_folders])
 
 
+def _active_chapters(series: Series) -> list[Chapter]:
+    """Chapters visible to library workflows; excluded rows are tombstones."""
+    return [chapter for chapter in series.chapters if not chapter.excluded]
+
+
 def _canonical_path(path: str | Path) -> str:
     """Stable path key for comparing API input against discovered media files."""
     try:
@@ -130,7 +135,7 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
             if found:
                 series.folder_name = found
                 folders = _folders_of(series)
-        result = scan_series(series, list(series.chapters), folders)
+        result = scan_series(series, _active_chapters(series), folders)
         await session.commit()
         return ScanResultOut(
             folder=", ".join(str(f) for f in folders),
@@ -157,7 +162,7 @@ async def scan_all():
 async def _plan(session: AsyncSession, series: Series):
     values = await settings_service.get_all(session)
     return plan_renames(
-        series, list(series.chapters),
+        series, _active_chapters(series),
         values["naming_template"], values["naming_template_no_volume"],
     )
 
@@ -184,7 +189,7 @@ async def rename_apply(
     if body.chapter_ids is not None:
         wanted = set(body.chapter_ids)
         items = [i for i in items if wanted & set(i.chapter_ids)]
-    outcomes = apply_renames(items, {c.id: c for c in series.chapters})
+    outcomes = apply_renames(items, {c.id: c for c in _active_chapters(series)})
     await session.commit()
     return [
         RenameOutcomeOut(
@@ -204,7 +209,7 @@ async def series_files(series_id: int, session: AsyncSession = Depends(get_sessi
     for folder in _folders_of(series):
         if folder.exists():
             media.extend(find_media_files(folder))
-    result = match_files(media, list(series.chapters))
+    result = match_files(media, _active_chapters(series))
     out: list[SeriesFileOut] = []
     for mf in result.matched:
         out.append(SeriesFileOut(
@@ -227,7 +232,7 @@ async def map_file(
     series_id: int, body: FileMapIn, session: AsyncSession = Depends(get_session)
 ):
     series = await _load(session, series_id)
-    chapter = next((c for c in series.chapters if c.id == body.chapter_id), None)
+    chapter = next((c for c in _active_chapters(series) if c.id == body.chapter_id), None)
     if chapter is None:
         raise HTTPException(404, "Chapter not found")
     media_path = _require_series_media_path(series, body.file_path)
@@ -242,7 +247,7 @@ async def cleanup_plan(series_id: int, session: AsyncSession = Depends(get_sessi
 
     series = await _load(session, series_id)
     values = await settings_service.get_all(session)
-    plan = analyze(series, list(series.chapters), _folders_of(series),
+    plan = analyze(series, _active_chapters(series), _folders_of(series),
                    values["naming_template"], values["naming_template_no_volume"])
 
     def out(f):
@@ -263,7 +268,7 @@ async def cleanup_apply(
     from ..library.cleanup import apply_cleanup
 
     series = await _load(session, series_id)
-    result = apply_cleanup(series, list(series.chapters), _folders_of(series), body.delete)
+    result = apply_cleanup(series, _active_chapters(series), _folders_of(series), body.delete)
     await session.commit()
     return CleanupResultOut(
         deleted=result.deleted, repointed=result.repointed,
@@ -285,7 +290,7 @@ async def map_file_range(
     lo, hi = sorted((body.from_number, body.to_number))
     volume = parse_volume_number(media_path.stem)
     mapped = 0
-    for ch in series.chapters:
+    for ch in _active_chapters(series):
         if lo <= ch.number <= hi:
             ch.downloaded = True
             ch.file_path = str(media_path)
@@ -436,12 +441,14 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     try:
         active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
         series = await _load(session, series_id)
-        locked_metadata = {
+        preserved_metadata = {
             ch.number: (
                 ch.title, ch.volume, ch.title_source, ch.volume_source,
-                ch.title_locked, ch.volume_locked,
+                ch.title_locked, ch.volume_locked, ch.excluded, ch.monitored,
+                ch.downloaded, ch.file_path, ch.released_at, ch.available_sources,
             )
-            for ch in series.chapters if ch.title_locked or ch.volume_locked
+            for ch in series.chapters
+            if ch.excluded or ch.title_locked or ch.volume_locked
         }
         values = await registry.apply_settings(session)
         await session.execute(sa_delete(Download).where(
@@ -459,23 +466,35 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
         # must survive the rebuild — recreate it rather than dropping the
         # very metadata the lock promised to keep
         present = {ch.number for ch in series.chapters}
-        for number in locked_metadata:
+        for number, saved in preserved_metadata.items():
             if number not in present:
                 series.chapters.append(
-                    Chapter(number=number, monitored=series.monitored)
+                    Chapter(number=number, monitored=saved[7], excluded=saved[6])
                 )
         for ch in series.chapters:
-            saved = locked_metadata.get(ch.number)
+            saved = preserved_metadata.get(ch.number)
             if saved is None:
                 continue
-            title, volume, title_source, volume_source, title_locked, volume_locked = saved
+            (
+                title, volume, title_source, volume_source,
+                title_locked, volume_locked, excluded, monitored,
+                downloaded, file_path, released_at, available_sources,
+            ) = saved
+            if excluded:
+                ch.title, ch.volume = title, volume
+                ch.title_source, ch.volume_source = title_source, volume_source
+                ch.title_locked, ch.volume_locked = title_locked, volume_locked
+                ch.excluded, ch.monitored = True, monitored
+                ch.downloaded, ch.file_path = downloaded, file_path
+                ch.released_at, ch.available_sources = released_at, available_sources
+                continue
             if title_locked:
                 ch.title, ch.title_source, ch.title_locked = title, title_source, True
             if volume_locked:
                 ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
         await session.commit()
         scan = await _scan_now(session, series)
-        return ResyncOut(chapters=len(series.chapters), matched_chapters=scan)
+        return ResyncOut(chapters=len(_active_chapters(series)), matched_chapters=scan)
     finally:
         lock.release()
 
@@ -502,7 +521,7 @@ def _run_resync(
     changed = 0
     diff: list[tuple[float, int | None, int | None]] = []
     for ch in sorted(chapters, key=lambda c: c.number):
-        if getattr(ch, "volume_locked", False):
+        if ch.excluded or getattr(ch, "volume_locked", False):
             continue
         new_volume = volume_map.get(ch.number)
         if ch.volume != new_volume:
@@ -516,6 +535,8 @@ def _run_resync(
 
     before: dict[int, str] = {}
     for ch in chapters:
+        if ch.excluded:
+            continue
         if not ch.downloaded or not ch.file_path:
             continue
         before[ch.id] = ch.file_path
@@ -525,14 +546,18 @@ def _run_resync(
                 and file_volume != ch.volume:
             ch.downloaded = False
             ch.file_path = ""
-    scan_series(series, list(chapters), _folders_of(series))
+    scan_series(series, [ch for ch in chapters if not ch.excluded], _folders_of(series))
 
     repointed = sum(
         1 for ch in chapters
-        if ch.downloaded and ch.file_path and before.get(ch.id, ch.file_path) != ch.file_path
+        if not ch.excluded
+        and ch.downloaded and ch.file_path
+        and before.get(ch.id, ch.file_path) != ch.file_path
     )
-    cleared = sum(1 for ch in chapters if ch.id in before and not ch.downloaded)
-    assigned = sum(1 for ch in chapters if ch.volume is not None)
+    cleared = sum(
+        1 for ch in chapters if not ch.excluded and ch.id in before and not ch.downloaded
+    )
+    assigned = sum(1 for ch in chapters if not ch.excluded and ch.volume is not None)
     return assigned, changed, repointed, cleared, diff
 
 
@@ -543,6 +568,7 @@ def _chapter_copies(chapters):
         Chapter(id=ch.id, series_id=ch.series_id, number=ch.number,
                 volume=ch.volume, volume_source=ch.volume_source,
                 volume_locked=ch.volume_locked,
+                excluded=ch.excluded,
                 downloaded=ch.downloaded, file_path=ch.file_path)
         for ch in chapters
     ]
@@ -572,7 +598,7 @@ async def resync_volumes_preview(series_id: int, session: AsyncSession = Depends
         if not cleaned:
             continue
         refined = refine_volume_map_with_disk(series, cleaned)
-        copies = _chapter_copies(series.chapters)
+        copies = _chapter_copies(_active_chapters(series))
         assigned, changed, repointed, cleared, diff = _run_resync(
             series, copies, refined, entry_sources
         )
@@ -632,7 +658,7 @@ async def resync_volumes(
         # volume archives on disk anchor the chapters the source can't place
         volume_map = refine_volume_map_with_disk(series, volume_map)
         assigned, changed, repointed, cleared, _ = _run_resync(
-            series, list(series.chapters), volume_map, map_sources
+            series, _active_chapters(series), volume_map, map_sources
         )
         await session.commit()
         return VolumeResyncOut(
@@ -645,7 +671,7 @@ async def resync_volumes(
 
 async def _scan_now(session: AsyncSession, series: Series) -> int:
     from ..library.scanner import scan_series
-    result = scan_series(series, list(series.chapters), _folders_of(series))
+    result = scan_series(series, _active_chapters(series), _folders_of(series))
     await session.commit()
     return result.matched_chapters
 

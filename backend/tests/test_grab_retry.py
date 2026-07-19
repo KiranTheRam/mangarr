@@ -99,6 +99,24 @@ async def test_grabs_missing_chapters(db_session, monkeypatch):
     assert queued == 2
 
 
+async def test_excluded_chapters_are_not_grabbed(db_session, monkeypatch):
+    series = await _make_series(db_session, [1, 2])
+    series.chapters[0].excluded = True
+    await db_session.commit()
+    source = FakeSource([1, 2])
+    _use_source(monkeypatch, source)
+
+    queued = await grab_missing_chapters(db_session, series, {})
+
+    assert queued == 1
+    direct = (
+        await db_session.execute(
+            select(Download).where(Download.kind == DownloadKind.DIRECT)
+        )
+    ).scalar_one()
+    assert direct.chapter_id == series.chapters[1].id
+
+
 async def test_recent_failure_blocks_the_source(db_session, monkeypatch):
     series = await _make_series(db_session, [1])
     source = FakeSource([1])
@@ -214,6 +232,24 @@ async def test_successful_refresh_clears_stale_source_availability(db_session, m
         1.0: "fake",
         2.0: "",
     }
+
+
+async def test_refresh_does_not_mutate_excluded_chapter(db_session, monkeypatch):
+    series = await _make_series(db_session, [1])
+    chapter = series.chapters[0]
+    chapter.excluded = True
+    chapter.title = "Keep me"
+    chapter.volume = 7
+    chapter.available_sources = "old-source"
+    await db_session.commit()
+    source = FakeSource([1])
+    _use_source(monkeypatch, source)
+
+    await update_chapters(db_session, series, {})
+
+    assert chapter.title == "Keep me"
+    assert chapter.volume == 7
+    assert chapter.available_sources == "old-source"
 
 
 async def test_refresh_clears_availability_from_disabled_sources(db_session, monkeypatch):
@@ -371,4 +407,37 @@ async def test_active_direct_download_removed_by_user_is_not_completed(
 
     assert dl.status == DownloadStatus.FAILED
     assert dl.error == REMOVED_BY_USER
+    assert chapter.downloaded is False
+
+
+async def test_queued_direct_download_is_stopped_after_chapter_exclusion(
+    db_session, tmp_path, monkeypatch
+):
+    root = RootFolder(path=str(tmp_path))
+    series = Series(
+        title="Test Series",
+        sort_title="test series",
+        root_folder=root,
+        folder_name="Test Series",
+    )
+    chapter = Chapter(number=1.0, monitored=True, excluded=True)
+    series.chapters.append(chapter)
+    db_session.add(series)
+    await db_session.commit()
+    dl = Download(
+        series_id=series.id,
+        chapter_id=chapter.id,
+        kind=DownloadKind.DIRECT,
+        status=DownloadStatus.QUEUED,
+        source_name="fake",
+        payload="c1",
+    )
+    db_session.add(dl)
+    await db_session.commit()
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource([1]))
+
+    await tasks._run_direct_download(db_session, dl)
+
+    assert dl.status == DownloadStatus.FAILED
+    assert "excluded" in dl.error
     assert chapter.downloaded is False

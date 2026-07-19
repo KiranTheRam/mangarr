@@ -32,6 +32,7 @@ class ChapterOut(BaseModel):
     volume_source: str
     title_locked: bool
     volume_locked: bool
+    excluded: bool
     monitored: bool
     downloaded: bool
     file_path: str
@@ -128,6 +129,7 @@ class ChapterMetadataIn(BaseModel):
     volume: int | None = Field(default=None, ge=1)
     title_locked: bool = True
     volume_locked: bool = True
+    excluded: bool | None = None
 
 
 class MetadataResult(BaseModel):

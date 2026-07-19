@@ -132,7 +132,12 @@ async def search_releases(
     selected: dict[float, Chapter] | None = None
     if chapter_id:
         found = (
-            await session.execute(select(Chapter).where(Chapter.id.in_(set(chapter_id))))
+            await session.execute(
+                select(Chapter).where(
+                    Chapter.id.in_(set(chapter_id)),
+                    Chapter.excluded == False,  # noqa: E712
+                )
+            )
         ).scalars().all()
         if len(found) != len(set(chapter_id)):
             raise HTTPException(404, "Chapter not found")
@@ -158,7 +163,7 @@ async def search_releases(
     links = {sl.source_name: sl for sl in series.source_links}
     alt_titles = split_alt_titles(series.alt_titles)
     queries = title_queries(series.title, alt_titles)
-    local_chapters = {ch.number: ch for ch in series.chapters}
+    local_chapters = {ch.number: ch for ch in series.chapters if not ch.excluded}
 
     async def direct_releases_for_source(src: DirectSource) -> list[ReleaseOut]:
         out: list[ReleaseOut] = []

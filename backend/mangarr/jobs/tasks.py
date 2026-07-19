@@ -266,6 +266,8 @@ async def update_chapters(
     chapter_cache: ChapterListCache | None = None,
 ) -> int:
     """Union chapter lists from linked sources into the DB. Returns # new."""
+    # Keep excluded rows in this lookup as tombstones: sources may continue to
+    # advertise them, but refreshes must neither recreate nor mutate them.
     existing = {c.number: c for c in series.chapters}
     added = 0
     links = {sl.source_name: sl for sl in series.source_links}
@@ -278,6 +280,7 @@ async def update_chapters(
             if name in claimable_sources
         }
         for number, chapter in existing.items()
+        if not chapter.excluded
     }
     for src in enabled_sources:
         link = links.get(src.name)
@@ -309,6 +312,8 @@ async def update_chapters(
                 availability[sc.number] = set()
                 added += 1
             else:
+                if ch.excluded:
+                    continue
                 apply_volume(ch, sc.volume, sc.source_name)
                 apply_title(ch, sc.title, sc.source_name, series.title)
             availability.setdefault(sc.number, set()).add(src.name)
@@ -335,7 +340,8 @@ async def update_chapters(
                     availability[number] = set()
                     added += 1
                 elif ch.released_at is None and released_at is not None:
-                    ch.released_at = released_at
+                    if not ch.excluded:
+                        ch.released_at = released_at
 
     # Backfill volume numbers for chapters that came from sources without
     # volume data, and add placeholder chapter rows for explicit volume-map
@@ -344,7 +350,7 @@ async def update_chapters(
     # feed has no readable entries because chapters are external or removed.
     needs_volume_map = (
         added
-        or any(c.volume is None for c in existing.values())
+        or any(c.volume is None for c in existing.values() if not c.excluded)
         or _has_internal_number_gap(existing)
     )
     if needs_volume_map:
@@ -354,6 +360,8 @@ async def update_chapters(
         # sources never claimed — those fall back to the "disk-inferred" label
         volume_map = refine_volume_map_with_disk(series, volume_map)
         for number, ch in existing.items():
+            if ch.excluded:
+                continue
             if number in volume_map:
                 apply_volume(ch, volume_map[number],
                              map_sources.get(number, "disk-inferred"))
@@ -374,9 +382,15 @@ async def update_chapters(
         if isinstance(rows, BaseException):
             log.warning("chapter metadata failed on %s for %r: %s", src.name, series.title, rows)
             continue
-        apply_metadata_rows(existing.values(), rows, series.title)
+        apply_metadata_rows(
+            (chapter for chapter in existing.values() if not chapter.excluded),
+            rows,
+            series.title,
+        )
 
     for number, chapter in existing.items():
+        if chapter.excluded:
+            continue
         current = ",".join(sorted(availability.get(number, set())))
         if chapter.available_sources != current:
             chapter.available_sources = current
@@ -393,7 +407,7 @@ def _has_internal_number_gap(chapters: dict[float, Chapter], threshold: int = 3)
     """
     numbers = sorted(
         int(number) for number in chapters
-        if number > 0 and number == int(number)
+        if number > 0 and number == int(number) and not chapters[number].excluded
     )
     return any(b - a > threshold for a, b in zip(numbers, numbers[1:]))
 
@@ -411,9 +425,10 @@ def _add_volume_map_gap_chapters(
     source. That keeps MangaDex's all-language aggregate useful for licensed
     gaps without turning it into a speculative chapter generator.
     """
-    if not existing or not volume_map:
+    active_numbers = [number for number, chapter in existing.items() if not chapter.excluded]
+    if not active_numbers or not volume_map:
         return 0
-    low, high = min(existing), max(existing)
+    low, high = min(active_numbers), max(active_numbers)
     added = 0
     for number, volume in sorted(volume_map.items()):
         if number in existing or number < low or number > high or number <= 0:
@@ -513,7 +528,7 @@ def refine_volume_map_with_disk(
     disk_volumes = disk_volume_numbers(series)
     if not disk_volumes:
         return reconcile_decimal_volumes(
-            volume_map, (c.number for c in series.chapters)
+            volume_map, (c.number for c in series.chapters if not c.excluded)
         )
     finished = series.status in (SeriesStatus.FINISHED, SeriesStatus.CANCELLED)
     complete = bool(
@@ -524,16 +539,20 @@ def refine_volume_map_with_disk(
         if series.total_chapters and series.total_volumes else None
     )
     mapping = distribute_over_disk_volumes(
-        volume_map, [c.number for c in series.chapters], disk_volumes,
+        volume_map, [c.number for c in series.chapters if not c.excluded], disk_volumes,
         complete=complete, fallback_rate=fallback_rate,
     )
-    return reconcile_decimal_volumes(mapping, (c.number for c in series.chapters))
+    return reconcile_decimal_volumes(
+        mapping, (c.number for c in series.chapters if not c.excluded)
+    )
 
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
     """Clear downloaded state for chapters whose recorded media file is gone."""
     missing = 0
     for chapter in series.chapters:
+        if chapter.excluded:
+            continue
         if not chapter.downloaded:
             continue
         if not chapter.file_path or not Path(chapter.file_path).is_file():
@@ -554,7 +573,7 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     folders = _series_folders(series)
     if not folders:
         return
-    scan_series(series, list(series.chapters), folders)
+    scan_series(series, [chapter for chapter in series.chapters if not chapter.excluded], folders)
     await session.commit()
 
 
@@ -822,7 +841,7 @@ async def auto_grab_best_torrent(
         min_seeders = int(values.get("torrent_auto_min_seeders", "1"))
         selection = await select_best_torrent(
             series,
-            list(series.chapters),
+            [chapter for chapter in series.chapters if not chapter.excluded],
             registry.enabled_torrent_indexers(values),
             max_size_bytes=max_gib * 1024**3,
             min_seeders=min_seeders,
@@ -831,7 +850,11 @@ async def auto_grab_best_torrent(
         log.warning("automatic torrent search failed for %r: %s", series.title, exc)
         return None
     if selection is None:
-        if not any(chapter.volume is not None for chapter in series.chapters):
+        if not any(
+            chapter.volume is not None
+            for chapter in series.chapters
+            if not chapter.excluded
+        ):
             log.info(
                 "automatic torrent search found no exact chapter coverage for %r; "
                 "volume-only releases cannot be scored without a chapter-to-volume map",
@@ -890,9 +913,9 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     series = await _load_series(session, dl.series_id) if dl.series_id else None
     chapter = await session.get(Chapter, dl.chapter_id) if dl.chapter_id else None
     source = registry.DIRECT_SOURCES.get(source_name)
-    if series is None or chapter is None or source is None:
+    if series is None or chapter is None or chapter.excluded or source is None:
         dl.status = DownloadStatus.FAILED
-        dl.error = "series/chapter/source no longer exists"
+        dl.error = "series/chapter/source no longer exists or chapter is excluded"
         await session.commit()
         return
     series_id = series.id
@@ -922,6 +945,11 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
                 return
             last_cancel_check = time.monotonic()
             await _raise_if_download_removed(session, download_id)
+            excluded = await session.scalar(
+                select(Chapter.excluded).where(Chapter.id == chapter_id)
+            )
+            if excluded:
+                raise DownloadCancelled("chapter was excluded")
 
     claimed = await session.execute(
         sa_update(Download)
@@ -990,16 +1018,23 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
                     "download cancelled so the queue can continue"
                 )
         await ensure_not_cancelled(force=True)
-    except DownloadCancelled:
+    except DownloadCancelled as cancel_exc:
         await session.rollback()
         if dest is not None and not dest_preexisted:
             for path in (dest, dest.with_suffix(".cbz.partial")):
                 try:
                     if path.exists():
                         path.unlink()
-                except OSError as exc:
-                    log.warning("could not remove cancelled download artifact %s: %s", path, exc)
-        log.info("direct download %d cancelled by user", download_id)
+                except OSError as os_exc:
+                    log.warning("could not remove cancelled download artifact %s: %s", path, os_exc)
+        current = await session.get(Download, download_id)
+        if current is not None and not (
+            current.status == DownloadStatus.FAILED and current.error == REMOVED_BY_USER
+        ):
+            current.status = DownloadStatus.FAILED
+            current.error = str(cancel_exc)
+            await session.commit()
+        log.info("direct download %d cancelled: %s", download_id, cancel_exc)
         return
     except Exception as exc:
         log.exception("direct download %d failed", download_id)
@@ -1119,7 +1154,9 @@ async def _import_torrent(
         return
     try:
         imported = import_torrent_payload(
-            content_path, series, list(series.chapters), Path(series.root_folder.path),
+            content_path, series,
+            [chapter for chapter in series.chapters if not chapter.excluded],
+            Path(series.root_folder.path),
             values["naming_template"], values["naming_template_no_volume"],
             import_mode=values.get("import_mode", "hardlink"),
         )
@@ -1157,7 +1194,7 @@ async def _import_torrent(
         elif volume is not None:
             # a volume archive covers every chapter assigned to that volume
             for ch in series.chapters:
-                if ch.volume == volume and not ch.downloaded:
+                if not ch.excluded and ch.volume == volume and not ch.downloaded:
                     ch.downloaded = True
                     ch.file_path = str(dest)
     dl.status = DownloadStatus.DONE
@@ -1214,7 +1251,8 @@ async def grab_missing_chapters(
     excluded = exclude_numbers or set()
     wanted = [
         c for c in series.chapters
-        if (c.monitored or not only_monitored)
+        if not c.excluded
+        and (c.monitored or not only_monitored)
         and not c.downloaded
         and c.id not in active_chapters
         and c.number not in excluded

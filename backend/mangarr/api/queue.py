@@ -134,6 +134,10 @@ async def retry_failed_download(
         raise HTTPException(404, "Download not found")
     if dl.status != DownloadStatus.FAILED:
         raise HTTPException(409, "Only failed downloads can be retried")
+    if dl.chapter_id is not None:
+        chapter = await session.get(Chapter, dl.chapter_id)
+        if chapter is None or chapter.excluded:
+            raise HTTPException(409, "Excluded chapters cannot be retried")
 
     if dl.kind == DownloadKind.TORRENT:
         values = await registry.apply_settings(session)
@@ -170,7 +174,7 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
 
     if body.chapter_id is not None and body.source_name and body.external_id:
         chapter = await session.get(Chapter, body.chapter_id)
-        if chapter is None:
+        if chapter is None or chapter.excluded:
             raise HTTPException(404, "Chapter not found")
         series = await session.get(Series, chapter.series_id)
         dl = await enqueue_direct(

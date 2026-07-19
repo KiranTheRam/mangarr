@@ -39,6 +39,8 @@ class _Counts(NamedTuple):
 def _count_chapters(chapters: Iterable[Chapter]) -> _Counts:
     totals = [0, 0, 0, 0]
     for c in chapters:
+        if c.excluded:
+            continue
         offset = 2 if is_special_chapter(c.number) else 0
         totals[offset] += 1
         if c.downloaded:
@@ -92,7 +94,9 @@ async def list_series(session: AsyncSession = Depends(get_session)):
             func.sum(case((special, 0), else_=downloaded)),
             func.sum(case((special, 1), else_=0)),
             func.sum(case((special, downloaded), else_=0)),
-        ).group_by(Chapter.series_id)
+        )
+        .where(Chapter.excluded == False)  # noqa: E712
+        .group_by(Chapter.series_id)
     )
     for series_id, *totals in rows.all():
         counts[series_id] = _Counts(*(int(t or 0) for t in totals))
@@ -268,6 +272,8 @@ async def update_chapter_metadata(
         chapter.volume_source = "manual" if body.volume is not None else ""
     chapter.title_locked = body.title_locked
     chapter.volume_locked = body.volume_locked
+    if body.excluded is not None:
+        chapter.excluded = body.excluded
     await session.commit()
     await session.refresh(chapter)
     return chapter

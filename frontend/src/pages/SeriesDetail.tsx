@@ -498,12 +498,14 @@ function ChapterMetadataModal({
   const [volume, setVolume] = useState(chapter.volume == null ? "" : String(chapter.volume));
   const [titleLocked, setTitleLocked] = useState(chapter.title_locked);
   const [volumeLocked, setVolumeLocked] = useState(chapter.volume_locked);
+  const [excluded, setExcluded] = useState(chapter.excluded);
   const save = useMutation({
     mutationFn: () => api.put(`/series/${seriesId}/chapters/${chapter.id}/metadata`, {
       title,
       volume: volume.trim() === "" ? null : Number(volume),
       title_locked: titleLocked,
       volume_locked: volumeLocked,
+      excluded,
     }),
     onSuccess: () => {
       onSaved();
@@ -542,6 +544,18 @@ function ChapterMetadataModal({
         <input type="checkbox" checked={volumeLocked} onChange={(event) => setVolumeLocked(event.target.checked)} />{" "}
         Keep this volume during future refreshes/resyncs
       </label>
+      <label style={{ display: "block", marginTop: 16 }}>
+        <input
+          type="checkbox"
+          checked={excluded}
+          onChange={(event) => setExcluded(event.target.checked)}
+        />{" "}
+        Exclude this chapter
+      </label>
+      <div style={{ color: "var(--text-dim)", fontSize: 13, marginTop: 4 }}>
+        Excluded chapters stay visible here so you can restore them, but do not count as
+        missing and are skipped by refreshes, searches, scans, and downloads.
+      </div>
       {save.isError && <div className="error-banner">{(save.error as Error).message}</div>}
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
         <button className="btn" onClick={onClose}>Cancel</button>
@@ -706,8 +720,9 @@ export default function SeriesDetail() {
 
   // chapters in the order they are rendered — the basis for shift-click ranges
   const orderedChapters = groups.flatMap((g) => g.chapters);
-  const missingChapters = orderedChapters.filter((c) => !c.downloaded);
-  const selectedList = orderedChapters.filter((c) => selectedChapters.has(c.id));
+  const activeChapters = orderedChapters.filter((c) => !c.excluded);
+  const missingChapters = activeChapters.filter((c) => !c.downloaded);
+  const selectedList = activeChapters.filter((c) => selectedChapters.has(c.id));
   const selectedIds = selectedList.map((c) => c.id);
 
   const setSelection = (ids: number[]) => setSelectedChapters(new Set(ids));
@@ -728,9 +743,12 @@ export default function SeriesDetail() {
         // a range follows the anchor's new state, so shift-click can deselect too
         const selecting = !current.has(chapter.id);
         for (const c of orderedChapters.slice(from, to + 1)) {
+          if (c.excluded) continue;
           if (selecting) next.add(c.id);
           else next.delete(c.id);
         }
+      } else if (chapter.excluded) {
+        return next;
       } else if (next.has(chapter.id)) {
         next.delete(chapter.id);
       } else {
@@ -764,7 +782,7 @@ export default function SeriesDetail() {
   // how many chapters share each file — a file used by >1 chapter is a
   // whole-volume archive (those chapters have no individual file of their own)
   const fileCounts: Record<string, number> = {};
-  for (const c of series.chapters) {
+  for (const c of activeChapters) {
     if (c.file_path) fileCounts[c.file_path] = (fileCounts[c.file_path] ?? 0) + 1;
   }
   const isVolumeArchive = (path: string) => (fileCounts[path] ?? 0) > 1;
@@ -789,9 +807,12 @@ export default function SeriesDetail() {
             <input
               type="checkbox"
               title="Select every chapter shown here"
-              checked={chapters.every((c) => selectedChapters.has(c.id))}
+              checked={
+                chapters.some((c) => !c.excluded)
+                && chapters.filter((c) => !c.excluded).every((c) => selectedChapters.has(c.id))
+              }
               onChange={(e) => {
-                const ids = chapters.map((c) => c.id);
+                const ids = chapters.filter((c) => !c.excluded).map((c) => c.id);
                 setSelectedChapters((current) => {
                   const next = new Set(current);
                   for (const id of ids) {
@@ -812,11 +833,15 @@ export default function SeriesDetail() {
       </thead>
       <tbody>
         {chapters.map((ch) => (
-          <tr key={ch.id} className={selectedChapters.has(ch.id) ? "row-selected" : undefined}>
+          <tr
+            key={ch.id}
+            className={`${selectedChapters.has(ch.id) ? "row-selected " : ""}${ch.excluded ? "row-excluded" : ""}` || undefined}
+          >
             <td className="cell-select">
               <input
                 type="checkbox"
-                checked={selectedChapters.has(ch.id)}
+                checked={!ch.excluded && selectedChapters.has(ch.id)}
+                disabled={ch.excluded}
                 title="Shift-click to select a range"
                 onClick={(e) => pickChapter(ch, e.shiftKey)}
                 onChange={() => {}}
@@ -825,7 +850,8 @@ export default function SeriesDetail() {
             <td className="cell-monitor">
               <button
                 className={`monitor-toggle${ch.monitored ? " on" : ""}`}
-                title={ch.monitored ? "Monitored" : "Unmonitored"}
+                title={ch.excluded ? "Excluded chapters cannot be monitored" : ch.monitored ? "Monitored" : "Unmonitored"}
+                disabled={ch.excluded}
                 onClick={() =>
                   toggleChapter.mutate({ chapterIds: [ch.id], monitored: !ch.monitored })
                 }
@@ -857,7 +883,11 @@ export default function SeriesDetail() {
               {ch.title || "—"}
             </td>
             <td className="cell-status">
-              {ch.downloaded ? (
+              {ch.excluded ? (
+                <span className="pill gray" title="Ignored by counts, refreshes, searches, scans, and downloads">
+                  Excluded
+                </span>
+              ) : ch.downloaded ? (
                 <span className="pill green" title={ch.file_path}>
                   Downloaded
                 </span>
@@ -878,14 +908,15 @@ export default function SeriesDetail() {
             <td className="cell-actions">
               <button
                 className="btn icon-btn"
-                title={`Edit title and volume${ch.volume_source ? ` (volume source: ${ch.volume_source})` : ""}`}
+                title={`Edit title, volume, and exclusion${ch.volume_source ? ` (volume source: ${ch.volume_source})` : ""}`}
                 onClick={() => setEditingChapter(ch)}
               >
                 ✏️
               </button>
               <button
                 className="btn icon-btn"
-                title="Interactive search"
+                title={ch.excluded ? "Excluded chapters are skipped by searches" : "Interactive search"}
+                disabled={ch.excluded}
                 onClick={() =>
                   setSearch({
                     chapterIds: [ch.id],
@@ -1169,11 +1200,12 @@ export default function SeriesDetail() {
           {groups.map(({ volume, chapters }) => {
             const key = groupKey(volume);
             const isCollapsed = collapsed[key] ?? false;
-            const downloaded = chapters.filter((c) => c.downloaded).length;
-            const allMonitored = chapters.every((c) => c.monitored);
+            const included = chapters.filter((c) => !c.excluded);
+            const downloaded = included.filter((c) => c.downloaded).length;
+            const allMonitored = included.length > 0 && included.every((c) => c.monitored);
             // the single archive file backing this volume, if it is one
             const files = new Set(
-              chapters.filter((c) => c.downloaded && c.file_path).map((c) => c.file_path),
+              included.filter((c) => c.downloaded && c.file_path).map((c) => c.file_path),
             );
             const archiveFile =
               files.size === 1 && isVolumeArchive([...files][0]) ? [...files][0] : null;
@@ -1186,11 +1218,12 @@ export default function SeriesDetail() {
                   <span className="chevron">{isCollapsed ? "▸" : "▾"}</span>
                   <button
                     className={`monitor-toggle${allMonitored ? " on" : ""}`}
-                    title={allMonitored ? "Unmonitor this volume" : "Monitor this volume"}
+                    title={included.length === 0 ? "Every chapter in this volume is excluded" : allMonitored ? "Unmonitor this volume" : "Monitor this volume"}
+                    disabled={included.length === 0}
                     onClick={(e) => {
                       e.stopPropagation();
                       toggleChapter.mutate({
-                        chapterIds: chapters.map((c) => c.id),
+                        chapterIds: included.map((c) => c.id),
                         monitored: !allMonitored,
                       });
                     }}
@@ -1212,9 +1245,9 @@ export default function SeriesDetail() {
                     <h4>{volume === null ? "Chapters without volume" : `Volume ${volume}`}</h4>
                   )}
                   <span
-                    className={`pill ${downloaded === chapters.length ? "green" : "gray"}`}
+                    className={`pill ${included.length > 0 && downloaded === included.length ? "green" : "gray"}`}
                   >
-                    {downloaded} / {chapters.length}
+                    {downloaded} / {included.length}
                   </span>
                 </div>
                 {revealed[`v${key}`] && archiveFile && (
@@ -1261,7 +1294,7 @@ export default function SeriesDetail() {
       {showFiles && (
         <FilesModal
           seriesId={seriesId}
-          chapters={series.chapters}
+          chapters={activeChapters}
           onClose={() => setShowFiles(false)}
           onChanged={invalidate}
         />

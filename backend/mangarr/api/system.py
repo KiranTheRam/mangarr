@@ -15,9 +15,17 @@ router = APIRouter(tags=["system"])
 @router.get("/system/status", response_model=SystemStatus)
 async def system_status(session: AsyncSession = Depends(get_session)):
     series_count = (await session.execute(select(func.count(Series.id)))).scalar_one()
-    chapter_count = (await session.execute(select(func.count(Chapter.id)))).scalar_one()
+    chapter_count = (
+        await session.execute(
+            select(func.count(Chapter.id)).where(Chapter.excluded == False)  # noqa: E712
+        )
+    ).scalar_one()
     downloaded = (
-        await session.execute(select(func.sum(cast(Chapter.downloaded, Integer))))
+        await session.execute(
+            select(func.sum(cast(Chapter.downloaded, Integer))).where(
+                Chapter.excluded == False  # noqa: E712
+            )
+        )
     ).scalar_one() or 0
     queue_count = (
         await session.execute(
@@ -45,6 +53,7 @@ async def wanted(limit: int = 100, session: AsyncSession = Depends(get_session))
         .where(
             Chapter.monitored == True,  # noqa: E712
             Chapter.downloaded == False,  # noqa: E712
+            Chapter.excluded == False,  # noqa: E712
             Series.monitored == True,  # noqa: E712
         )
         .order_by(Series.title, Chapter.number)

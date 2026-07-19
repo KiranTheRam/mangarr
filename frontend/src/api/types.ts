@@ -20,6 +20,7 @@ export interface Chapter {
   volume_source: string;
   title_locked: boolean;
   volume_locked: boolean;
+  excluded: boolean;
   monitored: boolean;
   downloaded: boolean;
   file_path: string;
