@@ -229,6 +229,7 @@ async def select_best_torrent(
 ) -> TorrentSelection | None:
     # This selector is used by the explicit add-time "Search now" flow, which
     # intentionally searches even when the new series itself is unmonitored.
+    chapters = [c for c in chapters if not c.excluded]
     wanted = {c.number for c in chapters if not c.downloaded}
     if not wanted or not indexers:
         return None

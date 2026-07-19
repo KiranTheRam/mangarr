@@ -136,6 +136,9 @@ class Chapter(Base):
     volume_source: Mapped[str] = mapped_column(String, default="")
     title_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     volume_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Excluded chapters remain as tombstones so a future source refresh does
+    # not recreate them. Every other workflow treats them as absent.
+    excluded: Mapped[bool] = mapped_column(Boolean, default=False)
     monitored: Mapped[bool] = mapped_column(Boolean, default=True)
     downloaded: Mapped[bool] = mapped_column(Boolean, default=False)
     file_path: Mapped[str] = mapped_column(String, default="")

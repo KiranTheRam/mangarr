@@ -659,6 +659,10 @@ table.data-table {
   background: rgba(94, 129, 172, 0.12);
 }
 
+.chapter-table tr.row-excluded {
+  opacity: 0.58;
+}
+
 /* ---------- forms / settings ---------- */
 
 .settings-section {

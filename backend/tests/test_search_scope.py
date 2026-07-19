@@ -79,6 +79,20 @@ async def test_series_wide_search_returns_only_missing_chapters(db_session, fake
     assert _numbers(releases) == [2.0, 4.0]
 
 
+async def test_searches_treat_excluded_chapters_as_nonexistent(db_session, fake_sources):
+    series = await _series(db_session)
+    excluded = next(c for c in series.chapters if c.number == 2.0)
+    excluded.excluded = True
+    await db_session.commit()
+
+    releases = await search.search_releases(series_id=series.id, session=db_session)
+    assert _numbers(releases) == [1.0, 3.0, 4.0]
+
+    with pytest.raises(HTTPException) as exc:
+        await search.search_releases(chapter_id=[excluded.id], session=db_session)
+    assert exc.value.status_code == 404
+
+
 async def test_scoped_search_returns_exactly_the_requested_chapters(db_session, fake_sources):
     series = await _series(db_session)
     wanted = [c.id for c in series.chapters if c.number in (2.0, 4.0)]
