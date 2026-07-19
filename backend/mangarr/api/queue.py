@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
 from ..download.qbittorrent import QbtClient
-from ..jobs.tasks import REMOVED_BY_USER, enqueue_direct, enqueue_torrent, magnet_btih_hex
+from ..jobs.tasks import (
+    REMOVED_BY_USER,
+    enqueue_direct,
+    enqueue_torrent,
+    magnet_btih_hex,
+    submit_torrent,
+)
 from ..models import (
     Chapter,
     Download,
@@ -116,6 +122,46 @@ async def remove_many_from_queue(
     if not body.ids:
         raise HTTPException(422, "No download ids given")
     return QueueRemoveOut(removed=await _remove_downloads(session, body.ids))
+
+
+@router.post("/queue/{download_id}/retry", response_model=QueueItemOut)
+async def retry_failed_download(
+    download_id: int, session: AsyncSession = Depends(get_session)
+):
+    """Retry a failed Activity item using its original source payload."""
+    dl = await session.get(Download, download_id)
+    if dl is None:
+        raise HTTPException(404, "Download not found")
+    if dl.status != DownloadStatus.FAILED:
+        raise HTTPException(409, "Only failed downloads can be retried")
+
+    if dl.kind == DownloadKind.TORRENT:
+        values = await registry.apply_settings(session)
+        if values["qbittorrent_enabled"] != "true":
+            raise HTTPException(400, "qBittorrent is not enabled in settings")
+        try:
+            dl.torrent_hash = await submit_torrent(dl.payload, values)
+        except Exception as exc:
+            raise HTTPException(502, f"qBittorrent error: {exc}") from exc
+        dl.status = DownloadStatus.DOWNLOADING
+    else:
+        dl.status = DownloadStatus.QUEUED
+
+    dl.progress = 0.0
+    dl.error = ""
+    session.add(HistoryEvent(
+        series_id=dl.series_id,
+        chapter_id=dl.chapter_id,
+        event="retried",
+        source_name=dl.source_name,
+        detail=dl.title,
+    ))
+    await session.commit()
+
+    series = await session.get(Series, dl.series_id) if dl.series_id else None
+    out = QueueItemOut.model_validate(dl)
+    out.series_title = series.title if series else ""
+    return out
 
 
 @router.post("/queue/grab", response_model=QueueItemOut, status_code=201)

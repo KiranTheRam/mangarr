@@ -18,6 +18,11 @@ function Queue() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["queue"] }),
   });
 
+  const retry = useMutation({
+    mutationFn: (id: number) => api.post(`/queue/${id}/retry`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["queue"] }),
+  });
+
   const removeSelected = useMutation({
     mutationFn: (ids: number[]) => api.post("/queue/remove", { ids }),
     onSuccess: () => {
@@ -76,7 +81,7 @@ function Queue() {
             <th style={{ width: 90 }}>Type</th>
             <th style={{ width: 110 }}>Status</th>
             <th style={{ width: 180 }}>Progress</th>
-            <th style={{ width: 60 }}></th>
+            <th style={{ width: 96 }}></th>
           </tr>
         </thead>
         <tbody>
@@ -113,14 +118,28 @@ function Queue() {
                 </div>
               </td>
               <td className="cell-remove">
-                <button
-                  className="btn icon-btn"
-                  title="Remove"
-                  disabled={remove.isPending}
-                  onClick={() => remove.mutate(item.id)}
-                >
-                  ✕
-                </button>
+                <div className="queue-actions">
+                  {item.status === "failed" && (
+                    <button
+                      className="btn icon-btn"
+                      title="Retry download"
+                      aria-label={`Retry ${item.title || item.series_title}`}
+                      disabled={retry.isPending}
+                      onClick={() => retry.mutate(item.id)}
+                    >
+                      ↻
+                    </button>
+                  )}
+                  <button
+                    className="btn icon-btn"
+                    title="Remove"
+                    aria-label={`Remove ${item.title || item.series_title}`}
+                    disabled={remove.isPending}
+                    onClick={() => remove.mutate(item.id)}
+                  >
+                    ✕
+                  </button>
+                </div>
               </td>
             </tr>
           ))}

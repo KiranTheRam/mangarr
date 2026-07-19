@@ -267,6 +267,12 @@ input[type="checkbox"] {
   padding: 6px 9px;
 }
 
+.queue-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 /* ---------- poster grid ---------- */
 
 .poster-grid {
