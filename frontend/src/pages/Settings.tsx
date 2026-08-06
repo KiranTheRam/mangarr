@@ -1,7 +1,12 @@
 import { useEffect, useState, type ChangeEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { ApiKey, RootFolder, Settings as SettingsType } from "../api/types";
+import type {
+  ApiKey,
+  KavitaTestResult,
+  RootFolder,
+  Settings as SettingsType,
+} from "../api/types";
 import { FolderBrowser } from "../components/FolderBrowser";
 import { Spinner, Toggle, Toolbar } from "../components/common";
 
@@ -356,6 +361,164 @@ function ProxySettings({
   );
 }
 
+function parseLibraryMap(raw: string | undefined): Record<string, number> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Kavita connection: credentials, scan granularity, and which Kavita library
+ * each mangarr root folder feeds. Libraries come from the live server so the
+ * mapping is a pick-list rather than hand-typed ids. */
+function KavitaSettings({
+  form,
+  setForm,
+  set,
+  setBool,
+  savedUrl,
+}: {
+  form: SettingsType;
+  setForm: (f: SettingsType) => void;
+  set: (key: string) => (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
+  setBool: (key: string) => (v: boolean) => void;
+  savedUrl: string;
+}) {
+  const [testResult, setTestResult] = useState<string | null>(null);
+  const { data: rootFolders } = useQuery({
+    queryKey: ["rootfolders"],
+    queryFn: () => api.get<RootFolder[]>("/rootfolders"),
+  });
+
+  // Load libraries from the saved connection (not the in-progress form) so
+  // typing in the URL field does not fire a request per keystroke.
+  const configured = form.kavita_enabled === "true" && !!savedUrl;
+  const { data: loaded } = useQuery({
+    queryKey: ["kavita-libraries", savedUrl],
+    queryFn: () => api.post<KavitaTestResult>("/settings/kavita/test", { url: savedUrl }),
+    enabled: configured,
+    retry: false,
+    staleTime: Infinity,
+  });
+
+  const [tested, setTested] = useState<KavitaTestResult | null>(null);
+  const test = useMutation({
+    mutationFn: () =>
+      api.post<KavitaTestResult>("/settings/kavita/test", {
+        url: form.kavita_url,
+        api_key: form.kavita_api_key,
+      }),
+    onSuccess: (d) => {
+      setTested(d);
+      setTestResult(`✔ Connected — Kavita ${d.version}, ${d.libraries.length} librar${d.libraries.length === 1 ? "y" : "ies"}`);
+    },
+    onError: (e) => setTestResult(`✖ ${(e as Error).message}`),
+  });
+
+  const libraries = tested?.libraries ?? loaded?.libraries ?? [];
+  const map = parseLibraryMap(form.kavita_library_map);
+
+  const setMapping = (rootId: number, libraryId: string) => {
+    const next = { ...map };
+    if (libraryId) next[String(rootId)] = Number(libraryId);
+    else delete next[String(rootId)];
+    setForm({
+      ...form,
+      kavita_library_map: Object.keys(next).length ? JSON.stringify(next) : "",
+    });
+  };
+
+  return (
+    <div className="settings-section">
+      <h3>Connect — Kavita</h3>
+      <p className="section-hint">
+        Trigger a Kavita scan after chapters are imported so new downloads appear in the reader
+        right away. Create an API key in Kavita under Settings → Account → API Key.
+      </p>
+      <div className="form-row">
+        <label>Enabled</label>
+        <Toggle on={form.kavita_enabled === "true"} onChange={setBool("kavita_enabled")} />
+      </div>
+      <div className="form-row">
+        <label>URL</label>
+        <input
+          type="text"
+          inputMode="url"
+          autoCapitalize="none"
+          autoCorrect="off"
+          placeholder="http://kavita:5000"
+          value={form.kavita_url ?? ""}
+          onChange={set("kavita_url")}
+        />
+      </div>
+      <div className="form-row">
+        <label>API key</label>
+        <input type="password" value={form.kavita_api_key ?? ""} onChange={set("kavita_api_key")} />
+      </div>
+      <div className="form-row">
+        <label>Scan scope</label>
+        <select value={form.kavita_scan_mode ?? "series"} onChange={set("kavita_scan_mode")}>
+          <option value="series">Series (falls back to library for new series)</option>
+          <option value="library">Whole library every time</option>
+        </select>
+      </div>
+      <p className="section-hint">
+        A series scan only walks the affected series folder. Kavita cannot scan a series it has
+        never seen, so the first import for a newly added series always scans its whole library.
+      </p>
+      <div className="form-row">
+        <label></label>
+        <button
+          className="btn"
+          onClick={() => test.mutate()}
+          disabled={test.isPending || !form.kavita_url}
+        >
+          Test Connection
+        </button>
+        {testResult && (
+          <span
+            style={{ fontSize: 13, color: testResult.startsWith("✔") ? "var(--success)" : "var(--danger)" }}
+          >
+            {testResult}
+          </span>
+        )}
+      </div>
+      <h4 style={{ margin: "16px 0 4px", fontSize: 14 }}>Library mapping</h4>
+      <p className="section-hint">
+        Which Kavita library each root folder belongs to. Leave on “Match by path” unless mangarr
+        and Kavita mount the library at paths with nothing in common.
+      </p>
+      {libraries.length === 0 && (
+        <p className="section-hint">
+          Test the connection to load the libraries available for mapping.
+        </p>
+      )}
+      {rootFolders?.map((rf) => (
+        <div className="form-row" key={rf.id}>
+          <label style={{ width: "auto", flex: 1, minWidth: 0, wordBreak: "break-all" }}>
+            {rf.path}
+          </label>
+          <select
+            value={map[String(rf.id)] ?? ""}
+            onChange={(e) => setMapping(rf.id, e.target.value)}
+            disabled={libraries.length === 0}
+          >
+            <option value="">Match by path</option>
+            {libraries.map((lib) => (
+              <option value={lib.id} key={lib.id}>
+                {lib.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function Settings() {
   const queryClient = useQueryClient();
   const { data: saved, isLoading } = useQuery({
@@ -578,6 +741,14 @@ export default function Settings() {
             )}
           </div>
         </div>
+
+        <KavitaSettings
+          form={form}
+          setForm={setForm}
+          set={set}
+          setBool={setBool}
+          savedUrl={saved.kavita_url ?? ""}
+        />
 
         <div className="settings-section">
           <h3>Connect — Webhook</h3>

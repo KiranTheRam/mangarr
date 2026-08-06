@@ -50,6 +50,10 @@ design; it is the automation half of your manga stack.
   per-chapter interactive search included.
 - **Output** — one CBZ per chapter, `ComicInfo.xml` embedded, Komga/Kavita
   naming: `Series Title/Series Title - Vol. 01 Ch. 0021.cbz`.
+- **Kavita scans** — optionally tell Kavita to scan after an import, so new
+  chapters appear in the reader immediately. Scans the affected series when
+  Kavita already knows it, and the whole library when it does not (a series
+  mangarr just created).
 - ***arr-style API** — everything under `/api/v1` with `X-Api-Key` auth.
 
 ## Quick start (Docker)
@@ -94,6 +98,27 @@ to a qBittorrent instance you already run:
    Mangarr see the same path, Mangarr can import completed downloads and
    hardlink them into `/media/manga` without duplicating data while the
    torrent continues seeding.
+
+### Triggering Kavita scans
+
+Kavita only picks up new CBZ files when it scans. To have imports show up in
+the reader immediately:
+
+1. In Kavita, go to **Settings → Account** and copy the **API Key**.
+2. In Mangarr, go to **Settings → Connect — Kavita**, turn it on, enter
+   Kavita's URL (e.g. `http://kavita:5000`) and the API key, then select
+   **Test Connection** — this also loads Kavita's libraries.
+3. Check the **Library mapping** rows. Mangarr matches a root folder to a
+   Kavita library by folder name, so `/media/manga` finds a library at
+   `/data/manga` even when the containers mount it differently. Pick a library
+   explicitly if the two paths have nothing in common.
+
+**Scan scope** decides how much Kavita re-reads. *Series* scans only the
+affected series folder, which is much cheaper on a large library; Kavita
+cannot scan a series it has never indexed, so the first import for a newly
+added series always scans its whole library. *Whole library every time* skips
+the lookup. Bursts of imports are batched into a single scan, and a Kavita
+that is down or misconfigured never fails a download.
 
 ## Using an existing library
 

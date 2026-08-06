@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import notifications
+from .. import kavita, notifications
 from ..chapter_metadata import (
     apply_metadata_rows,
     apply_title,
@@ -669,6 +669,19 @@ async def scan_all_series() -> None:
                     log.warning("library scan failed for series %d: %s", series_id, exc)
 
 
+def _notify_kavita(values: dict[str, str], series: Series) -> None:
+    """Ask Kavita to scan the library this series' files live in.
+
+    Kavita names a series from what its parser reads on disk, which is usually
+    the folder name — but a scanned-in folder can also carry a localized or
+    alternate title, so every name mangarr knows is offered as a candidate.
+    """
+    if series.root_folder is None:
+        return
+    titles = [series.title, series.folder_name, *split_alt_titles(series.alt_titles)]
+    kavita.notify_import(values, series.root_folder_id, series.root_folder.path, titles)
+
+
 async def _load_series(session: AsyncSession, series_id: int) -> Series | None:
     from sqlalchemy.orm import selectinload
 
@@ -1064,6 +1077,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     ))
     await session.commit()
     notifications.notify_import(values, series.id, f"Chapter {chapter.number:g}")
+    _notify_kavita(values, series)
 
 
 # --------------------------------------------------------------- qbt sync
@@ -1206,6 +1220,7 @@ async def _import_torrent(
     ))
     await session.commit()
     notifications.notify_import(values, series.id, f"{len(imported)} file(s) from torrent")
+    _notify_kavita(values, series)
 
 
 # ------------------------------------------------------------ monitor loop

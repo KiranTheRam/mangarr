@@ -3,6 +3,18 @@ export interface RootFolder {
   path: string;
 }
 
+export interface KavitaLibrary {
+  id: number;
+  name: string;
+  folders: string[];
+}
+
+export interface KavitaTestResult {
+  ok: boolean;
+  version: string;
+  libraries: KavitaLibrary[];
+}
+
 export interface SourceLink {
   id: number;
   source_name: string;
