@@ -1,6 +1,6 @@
 import pytest
 
-from mangarr.settings_service import validate
+from mangarr.settings_service import DEFAULTS, SECRET_KEYS, validate
 
 
 class TestNamingTemplates:
@@ -84,3 +84,25 @@ class TestContentProxy:
             "download_proxy_url": "",
             "source_mangadex_proxy_enabled": "false",
         })
+
+
+class TestKavita:
+    def test_defaults_are_valid(self):
+        validate(dict(DEFAULTS))
+
+    def test_settings_validation_covers_kavita(self):
+        # the whole-settings entry point must reach the Kavita rules, not just
+        # the module's own validator
+        with pytest.raises(ValueError, match="kavita_url is required"):
+            validate({"kavita_enabled": "true", "kavita_url": "", "kavita_api_key": "k"})
+
+    def test_valid_connection_accepted(self):
+        validate({
+            "kavita_enabled": "true",
+            "kavita_url": "http://kavita:5000",
+            "kavita_api_key": "k",
+            "kavita_library_map": '{"1": 3}',
+        })
+
+    def test_api_key_is_masked_like_other_secrets(self):
+        assert "kavita_api_key" in SECRET_KEYS

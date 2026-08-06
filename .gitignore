@@ -24,3 +24,7 @@ data/
 
 # Env
 .env
+
+# Local credentials used for manual testing — never commit
+kavita_creds.txt
+*_creds.txt

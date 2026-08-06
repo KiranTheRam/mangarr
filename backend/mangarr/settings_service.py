@@ -74,11 +74,21 @@ DEFAULTS: dict[str, str] = {
     "webhook_enabled": "false",
     "webhook_url": "",
     "webhook_secret": "",
+    # Kavita: ask the reader to scan after imports so new chapters appear
+    # without waiting for its own scheduled scan.
+    "kavita_enabled": "false",
+    "kavita_url": "",
+    "kavita_api_key": "",
+    # "series" scans just the affected series when Kavita already knows it
+    # (falling back to its library otherwise); "library" always scans whole.
+    "kavita_scan_mode": "series",
+    # JSON {"<root_folder_id>": <kavita library id>}; empty = match by path
+    "kavita_library_map": "",
 }
 
 SECRET_KEYS = {
     "mangadex_client_secret", "mangadex_password", "qbittorrent_password",
-    "webhook_secret",
+    "webhook_secret", "kavita_api_key",
 }
 
 
@@ -142,6 +152,10 @@ def validate(values: dict[str, str]) -> None:
         raise ValueError(
             "download_proxy_url is required when a source content proxy is enabled"
         )
+
+    from .kavita import validate_settings as validate_kavita
+
+    validate_kavita(values)
 
 
 async def get_all(session: AsyncSession) -> dict[str, str]:
