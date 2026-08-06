@@ -114,11 +114,12 @@ the reader immediately:
    explicitly if the two paths have nothing in common.
 
 **Scan scope** decides how much Kavita re-reads. *Series* scans only the
-affected series folder, which is much cheaper on a large library; Kavita
-cannot scan a series it has never indexed, so the first import for a newly
-added series always scans its whole library. *Whole library every time* skips
-the lookup. Bursts of imports are batched into a single scan, and a Kavita
-that is down or misconfigured never fails a download.
+affected series folder, which is much cheaper on a large library. Kavita cannot
+scan a series it has never indexed, so the first import for a newly added
+series scans its whole library — as does a title Kavita holds more than once,
+since guessing between them could scan the wrong one. *Whole library every
+time* skips the lookup. Bursts of imports are batched into a single scan, and a
+Kavita that is down or misconfigured never fails a download.
 
 ## Using an existing library
 

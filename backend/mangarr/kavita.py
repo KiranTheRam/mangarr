@@ -146,16 +146,20 @@ class KavitaClient:
         )
 
     async def find_series_id(self, library_id: int, titles: list[str]) -> int | None:
-        """Kavita's series id for the first title that matches exactly.
+        """Kavita's series id for the first title that matches unambiguously.
 
         Kavita's search is fuzzy, so results are re-checked against the
-        requested titles: a near-miss must not send a scan to the wrong series.
+        requested title: a near-miss must not send a scan to the wrong series.
+        A title matching more than one series in the library is treated as no
+        match — scanning the wrong one would leave the new chapters
+        undiscovered, while giving up here falls back to a library scan that
+        finds them.
         """
-        wanted = {normalize_title(t) for t in titles if t.strip()}
-        if not wanted:
-            return None
         for title in titles:
             if not title.strip():
+                continue
+            wanted = normalize_title(title)
+            if not wanted:
                 continue
             try:
                 resp = await self._request(
@@ -165,6 +169,7 @@ class KavitaClient:
                 results = (resp.json() or {}).get("series") or []
             except (KavitaError, ValueError):
                 return None
+            matches: set[int] = set()
             for row in results:
                 if int(row.get("libraryId", 0)) != library_id:
                     continue
@@ -172,8 +177,16 @@ class KavitaClient:
                     row.get("name"), row.get("originalName"),
                     row.get("localizedName"), row.get("sortName"),
                 )
-                if any(normalize_title(str(n)) in wanted for n in names if n):
-                    return int(row["seriesId"])
+                if any(normalize_title(str(n)) == wanted for n in names if n):
+                    matches.add(int(row["seriesId"]))
+            if len(matches) == 1:
+                return matches.pop()
+            if len(matches) > 1:
+                log.info(
+                    "%r matches %d Kavita series in library %d; scanning the "
+                    "library instead of guessing", title, len(matches), library_id
+                )
+                return None
         return None
 
 
@@ -330,8 +343,8 @@ async def run_scans(values: dict[str, str], requests: set[ScanRequest]) -> None:
             if prefer_series:
                 series_id = await client.find_series_id(library_id, list(request.titles))
             if series_id is None:
-                # unknown to Kavita (a series mangarr just created) — only a
-                # library scan can discover its folder
+                # unknown to Kavita (a series mangarr just created) or an
+                # ambiguous title — only a library scan is guaranteed to find it
                 library_scans.add(library_id)
             else:
                 series_scans.add((library_id, series_id))

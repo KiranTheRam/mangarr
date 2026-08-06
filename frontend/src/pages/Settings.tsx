@@ -467,7 +467,8 @@ function KavitaSettings({
       </div>
       <p className="section-hint">
         A series scan only walks the affected series folder. Kavita cannot scan a series it has
-        never seen, so the first import for a newly added series always scans its whole library.
+        never seen, so the first import for a newly added series scans its whole library — as does
+        a title Kavita holds more than once, since guessing between them could scan the wrong one.
       </p>
       <div className="form-row">
         <label></label>

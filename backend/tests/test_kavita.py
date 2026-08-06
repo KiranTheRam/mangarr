@@ -393,3 +393,21 @@ async def test_an_import_arriving_during_a_scan_is_not_dropped(monkeypatch):
     release.set()
     await asyncio.sleep(0.4)
     assert {call.request.url.params["libraryId"] for call in lib_scan.calls} == {"3", "5"}
+
+
+@respx.mock
+async def test_a_title_held_twice_by_kavita_is_treated_as_no_match():
+    """Scanning the wrong duplicate would leave the new chapters undiscovered;
+    giving up here means a library scan, which always finds them."""
+    mock_auth()
+    respx.get(f"{BASE}/api/Search/search").mock(return_value=Response(200, json={
+        "series": [
+            {"seriesId": 11, "name": "Berserk", "libraryId": 3},
+            {"seriesId": 12, "name": "Berserk", "libraryId": 3},
+        ]
+    }))
+    client = kavita.KavitaClient(BASE, "key")
+    try:
+        assert await client.find_series_id(3, ["Berserk"]) is None
+    finally:
+        await client.close()
