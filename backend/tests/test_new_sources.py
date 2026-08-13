@@ -8,6 +8,30 @@ from mangarr.sources.tcbscans import BASE_URL as TCB_URL, TCBScansSource
 
 # ------------------------------------------------------------------ MangaPlus
 
+def _pb_varint(value: int) -> bytes:
+    out = bytearray()
+    while value > 0x7f:
+        out.append((value & 0x7f) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _pb_int(number: int, value: int) -> bytes:
+    return _pb_varint(number << 3) + _pb_varint(value)
+
+
+def _pb_bytes(number: int, value: bytes) -> bytes:
+    return _pb_varint((number << 3) | 2) + _pb_varint(len(value)) + value
+
+
+def _pb_text(number: int, value: str) -> bytes:
+    return _pb_bytes(number, value.encode())
+
+
+def _pb_response(success_field: int, payload: bytes) -> bytes:
+    return _pb_bytes(1, _pb_bytes(success_field, payload))
+
 def test_xor_decrypt_roundtrip():
     key = "a1b2c3d4"
     plain = b"the quick brown fox jumps over 13 lazy dogs"
@@ -23,8 +47,10 @@ def test_xor_decrypt_empty_key_is_identity():
 @respx.mock
 async def test_mangaplus_error_raises():
     src = MangaPlusSource(client=httpx.AsyncClient())
+    popup = _pb_text(1, "Account Banned")
+    error = _pb_bytes(2, popup)
     respx.get(f"{MP_API}/title_detailV3").respond(
-        json={"error": {"englishPopup": {"subject": "Account Banned"}}}
+        content=_pb_bytes(2, error)
     )
     with pytest.raises(MangaPlusError, match="Account Banned"):
         await src.list_chapters("100294")
@@ -33,24 +59,17 @@ async def test_mangaplus_error_raises():
 @respx.mock
 async def test_mangaplus_list_chapters():
     src = MangaPlusSource(client=httpx.AsyncClient())
+    chapter_1 = _pb_int(2, 1001) + _pb_text(3, "#1") + _pb_text(4, "Start")
+    chapter_2 = _pb_int(2, 1002) + _pb_text(3, "#2")
+    chapter_50 = _pb_int(2, 1050) + _pb_text(3, "#50") + _pb_text(4, "Latest")
+    group = (
+        _pb_bytes(2, chapter_1)
+        + _pb_bytes(2, chapter_2)
+        + _pb_bytes(4, chapter_50)
+    )
+    detail = _pb_bytes(28, group)
     respx.get(f"{MP_API}/title_detailV3").respond(
-        json={
-            "success": {
-                "titleDetailView": {
-                    "chapterListGroup": [
-                        {
-                            "firstChapterList": [
-                                {"chapterId": 1001, "name": "#1", "subTitle": "Start"},
-                                {"chapterId": 1002, "name": "#2", "subTitle": ""},
-                            ],
-                            "lastChapterList": [
-                                {"chapterId": 1050, "name": "#50", "subTitle": "Latest"},
-                            ],
-                        }
-                    ]
-                }
-            }
-        }
+        content=_pb_response(8, detail)
     )
     chapters = await src.list_chapters("100294")
     assert [c.number for c in chapters] == [1.0, 2.0, 50.0]
@@ -61,21 +80,54 @@ async def test_mangaplus_list_chapters():
 @respx.mock
 async def test_mangaplus_get_pages_smuggles_key():
     src = MangaPlusSource(client=httpx.AsyncClient())
-    respx.get(f"{MP_API}/manga_viewer").respond(
-        json={
-            "success": {
-                "mangaViewer": {
-                    "pages": [
-                        {"mangaPage": {"imageUrl": "https://cdn/x/1.jpg", "encryptionKey": "ab12"}},
-                        {"bannerList": {}},  # ad page, no mangaPage → skipped
-                        {"mangaPage": {"imageUrl": "https://cdn/x/2.jpg"}},  # no key
-                    ]
-                }
-            }
-        }
+    manga_page_1 = _pb_text(1, "https://cdn/x/1.jpg") + _pb_text(5, "ab12")
+    manga_page_2 = _pb_text(1, "https://cdn/x/2.jpg")
+    viewer = (
+        _pb_bytes(1, _pb_bytes(1, manga_page_1))
+        + _pb_bytes(1, _pb_bytes(2, b""))  # banner page
+        + _pb_bytes(1, _pb_bytes(1, manga_page_2))
+        + _pb_text(19, "viewer-token")
+    )
+    respx.get(f"{MP_API}/manga_viewer_v3").respond(
+        content=_pb_response(10, viewer)
     )
     pages = await src.get_pages("1001")
-    assert pages == ["https://cdn/x/1.jpg#mangarr_key=ab12", "https://cdn/x/2.jpg"]
+    assert pages == [
+        "https://cdn/x/1.jpg#mangarr_key=ab12&mangarr_vw_token=viewer-token",
+        "https://cdn/x/2.jpg#mangarr_vw_token=viewer-token",
+    ]
+
+
+@respx.mock
+async def test_mangaplus_download_page_sends_viewer_token_and_decrypts():
+    source = MangaPlusSource(client=httpx.AsyncClient())
+    encrypted = _xor_decrypt(b"image bytes", "ab12")
+    route = respx.get("https://cdn/x/1.jpg").respond(content=encrypted)
+
+    content = await source.download_page(
+        httpx.AsyncClient(),
+        "https://cdn/x/1.jpg#mangarr_key=ab12&mangarr_vw_token=viewer-token",
+    )
+
+    assert content == b"image bytes"
+    assert route.calls[0].request.headers["Plus-Vw-Token"] == "viewer-token"
+
+
+@respx.mock
+async def test_mangaplus_search_decodes_protobuf_catalog():
+    src = MangaPlusSource(client=httpx.AsyncClient())
+    english = _pb_int(1, 100) + _pb_text(2, "One Piece") + _pb_int(7, 0)
+    spanish = _pb_int(1, 200) + _pb_text(2, "Otro") + _pb_int(7, 1)
+    catalog = _pb_bytes(1, _pb_bytes(2, english) + _pb_bytes(2, spanish))
+    respx.get(f"{MP_API}/title_list/allV2").respond(
+        content=_pb_response(25, catalog)
+    )
+
+    results = await src.search_series("one piece")
+
+    assert [(item.external_id, item.title) for item in results] == [
+        ("100", "One Piece")
+    ]
 
 
 # ---------------------------------------------------------------------- Asura
