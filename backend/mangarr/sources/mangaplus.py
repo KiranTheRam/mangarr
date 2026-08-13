@@ -1,9 +1,9 @@
 """MANGA Plus by SHUEISHA — the official free same-day source for Shonen
 Jump titles (One Piece, Kagurabachi, Dandadan, Jujutsu Kaisen…).
 
-Uses the app's web API with ?format=json (no protobuf needed). Page images
-are XOR-encrypted with a per-image hex key returned alongside each page; the
-key is smuggled through the page URL fragment and applied in download_page.
+Uses the public web API's protobuf responses. Page images are XOR-encrypted
+with a per-image hex key returned alongside each page; the key is smuggled
+through the page URL fragment and applied in download_page.
 
 Notes:
 - Only the first few and latest few chapters of each title are free; older
@@ -15,14 +15,17 @@ Notes:
 
 import secrets
 import time
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 
 from ..util import RateLimiter, normalize_title, parse_chapter_number, rl_request
+from ._mangaplus_proto import ProtobufDecodeError, decode_response
 from .base import DirectSource, SourceChapter, SourceSeries
 
 API_URL = "https://jumpg-webapi.tokyo-cdn.com/api"
 KEY_FRAGMENT = "#mangarr_key="
+VIEWER_TOKEN_HEADER = "Plus-Vw-Token"
 # language codes in the title list; English is 0 or unset
 _ENGLISH = (0, None)
 
@@ -46,13 +49,12 @@ class MangaPlusSource(DirectSource):
     name = "mangaplus"
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        # MangaPlus rejects requests without a device secret in the
-        # Session-Token header ("Account Banned"); the app generates this
-        # client-side, so a random per-instance value is enough.
+        # The public web app supplies an opaque per-browser session identifier.
         self._session_token = secrets.token_hex(8)
         self._client = client or httpx.AsyncClient(
             headers={
-                "User-Agent": "okhttp/4.9.0",
+                "Accept": "application/x-protobuf",
+                "User-Agent": "Mangarr/1.0",
                 "Session-Token": self._session_token,
             },
             timeout=60,
@@ -63,17 +65,17 @@ class MangaPlusSource(DirectSource):
         self._catalog_at = 0.0
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        query = {"format": "json", "os": "android", "os_ver": "32", "app_ver": "40"}
-        query.update(params or {})
         resp = await rl_request(
             self._client, "GET", f"{API_URL}{path}", limiter=_limiter,
-            params=query, headers={"Session-Token": self._session_token},
+            params=params, headers={"Session-Token": self._session_token},
         )
         resp.raise_for_status()
-        body = resp.json()
+        try:
+            body = decode_response(resp.content)
+        except ProtobufDecodeError as exc:
+            raise MangaPlusError("Invalid MangaPlus API response") from exc
         if "error" in body:
-            popup = (body["error"] or {}).get("englishPopup") or {}
-            raise MangaPlusError(popup.get("subject") or "MangaPlus API error")
+            raise MangaPlusError(body["error"] or "MangaPlus API error")
         return body.get("success") or {}
 
     async def _load_catalog(self) -> list[SourceSeries]:
@@ -157,7 +159,7 @@ class MangaPlusSource(DirectSource):
 
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         data = await self._get(
-            "/manga_viewer",
+            "/manga_viewer_v3",
             params={
                 "chapter_id": chapter_external_id,
                 "split": "yes",
@@ -165,6 +167,7 @@ class MangaPlusSource(DirectSource):
             },
         )
         viewer = data.get("mangaViewer") or {}
+        viewer_token = viewer.get("vwToken") or ""
         urls = []
         for page in viewer.get("pages") or []:
             manga_page = page.get("mangaPage") if isinstance(page, dict) else None
@@ -174,14 +177,25 @@ class MangaPlusSource(DirectSource):
             if not image_url:
                 continue
             key = manga_page.get("encryptionKey")
-            urls.append(f"{image_url}{KEY_FRAGMENT}{key}" if key else image_url)
+            fragment = {}
+            if key:
+                fragment["mangarr_key"] = key
+            if viewer_token:
+                fragment["mangarr_vw_token"] = viewer_token
+            urls.append(f"{image_url}#{urlencode(fragment)}" if fragment else image_url)
         return urls
 
     async def download_page(self, client: httpx.AsyncClient, url: str) -> bytes:
         # the per-page XOR key is smuggled in the URL fragment; strip it, fetch
         # (rate-limited + back-off), then decrypt
-        real_url, _, key = url.partition(KEY_FRAGMENT)
-        resp = await rl_request(client, "GET", real_url, limiter=_image_limiter)
+        real_url, _, raw_fragment = url.partition("#")
+        fragment = parse_qs(raw_fragment)
+        key = (fragment.get("mangarr_key") or [""])[0]
+        viewer_token = (fragment.get("mangarr_vw_token") or [""])[0]
+        headers = {VIEWER_TOKEN_HEADER: viewer_token} if viewer_token else None
+        resp = await rl_request(
+            client, "GET", real_url, limiter=_image_limiter, headers=headers
+        )
         resp.raise_for_status()
         return _xor_decrypt(resp.content, key) if key else resp.content
 
