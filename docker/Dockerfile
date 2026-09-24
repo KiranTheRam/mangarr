@@ -1,8 +1,8 @@
 # ---- frontend build ----
 FROM node:22-alpine AS frontend
 WORKDIR /build
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install --no-fund --no-audit
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-fund --no-audit
 COPY frontend/ ./
 # vite.config outDir points at ../backend/static; keep it inside /build
 RUN npm run build -- --outDir /build/static
