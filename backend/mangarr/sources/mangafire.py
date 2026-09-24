@@ -3,6 +3,8 @@
 The public site is a JavaScript application, but its reader uses a compact
 JSON API for title search, chapter lists, and page URLs.  Using that API is
 both less brittle and substantially cheaper than scraping rendered HTML.
+Every API call carries a ``vrf`` token computed by the site's own signing
+script (see ``_mangafire_vrf``).
 """
 
 import re
@@ -13,6 +15,7 @@ import httpx
 
 from .. import USER_AGENT
 from ..util import RateLimiter, rl_request
+from ._mangafire_vrf import MangaFireSigner
 from .base import DirectSource, SourceChapter, SourceSeries
 
 BASE_URL = "https://mangafire.to"
@@ -50,11 +53,26 @@ def canonical_chapter_number(api_number: float, title: str) -> float:
     return api_number
 
 
+def _token_rejected(response: httpx.Response) -> bool:
+    if response.status_code != 403:
+        return False
+    try:
+        message = str(response.json().get("message") or "")
+    except (ValueError, AttributeError):
+        return False
+    return "token" in message.lower()
+
+
 class MangaFireSource(DirectSource):
     name = "mangafire"
     image_limiter = _image_limiter
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        signer: MangaFireSigner | None = None,
+    ) -> None:
+        self._signer = signer or MangaFireSigner(BASE_URL)
         self._client = client or httpx.AsyncClient(
             headers={
                 "User-Agent": USER_AGENT,
@@ -68,11 +86,21 @@ class MangaFireSource(DirectSource):
         )
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        response = await rl_request(
-            self._client, "GET", f"{API_URL}{path}", limiter=_limiter, params=params
-        )
+        response = await self._signed_get(path, params)
+        if _token_rejected(response):
+            # the site shipped a new build (new signing keys) since the
+            # module was loaded; reload it and try once more
+            self._signer.invalidate()
+            response = await self._signed_get(path, params)
         response.raise_for_status()
         return response.json()
+
+    async def _signed_get(self, path: str, params: dict | None) -> httpx.Response:
+        query = dict(params or {})
+        query["vrf"] = await self._signer.sign(self._client, path, params)
+        return await rl_request(
+            self._client, "GET", f"{API_URL}{path}", limiter=_limiter, params=query
+        )
 
     def image_headers(self) -> dict:
         return {"Referer": f"{BASE_URL}/"}
