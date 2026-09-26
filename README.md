@@ -29,6 +29,9 @@ design; it is the automation half of your manga stack.
     new-chapter use case. **Off by default**: the API bans datacenter IPs, so
     it only works from a residential IP (e.g. a home server). Enable it in
     Settings once you've confirmed it reaches the API from your host.
+  - **WEBTOON** (official) — English WEBTOON Originals. Only episodes that
+    are currently free are listed (coin-locked Daily Pass / Fast Pass
+    episodes are skipped), so it's most useful for ongoing series.
   - **TCB Scans** (scraper) — fastest scanlations of the big Jump titles,
     usually within hours. Small catalog of major series only.
   - **MangaDex** (API) — huge, well-tagged archive; supplies volume data. Works
@@ -37,6 +40,9 @@ design; it is the automation half of your manga stack.
   - **MangaFire** (API) — broad English archive and an additional direct source
     for decimal-numbered bonus and special chapters.
   - **WeebCentral** (scraper) — broad catalog, no account needed.
+  - **Atsumaru** (API) — broad archive of manga, manhwa, and manhua. Where
+    several groups translated a chapter, the best-rated one is used. Recent
+    uploads are AVIF images, which Kavita and Komga read natively.
   - **Asura Scans** (API) — Korean/Chinese webtoons and manhwa (not Japanese
     manga). Skips locked early-access (premium) chapters automatically.
   - **Nyaa.si** (torrents) — Literature/English-translated category, sent to

@@ -160,10 +160,12 @@ function ApiKeys() {
 
 const SOURCE_LABELS: Record<string, string> = {
   mangaplus: "MangaPlus",
+  webtoons: "WEBTOON",
   tcbscans: "TCB Scans",
   mangadex: "MangaDex",
   mangafire: "MangaFire",
   weebcentral: "WeebCentral",
+  atsumaru: "Atsumaru",
   asura: "Asura Scans",
   viz: "VIZ (official metadata)",
   wikipedia: "Wikipedia (metadata)",
@@ -172,7 +174,9 @@ const SOURCE_LABELS: Record<string, string> = {
 
 const SOURCE_HINTS: Record<string, string> = {
   mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
+  webtoons: "Official WEBTOON Originals. Only episodes that are currently free (no coins) are listed.",
   mangafire: "Broad English archive coverage, including many bonus and decimal chapters.",
+  atsumaru: "Broad archive of manga, manhwa, and manhua; picks the best-rated scanlation of each chapter.",
   viz: "Exact printed-volume mappings for VIZ-licensed series; does not download chapters.",
   wikipedia: "Chapter titles and printed-volume tables for publishers not covered by VIZ.",
   nyaa: "Sent to the download client below and imported when complete.",
@@ -180,9 +184,11 @@ const SOURCE_HINTS: Record<string, string> = {
 
 const CONTENT_SOURCES = new Set([
   "mangaplus",
+  "webtoons",
   "mangadex",
   "mangafire",
   "weebcentral",
+  "atsumaru",
   "tcbscans",
   "asura",
 ]);

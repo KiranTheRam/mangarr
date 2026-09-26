@@ -7,9 +7,11 @@ from .models import Setting
 
 CONTENT_SOURCE_NAMES = (
     "mangaplus",
+    "webtoons",
     "mangadex",
     "mangafire",
     "weebcentral",
+    "atsumaru",
     "tcbscans",
     "asura",
 )
@@ -19,9 +21,9 @@ DEFAULTS: dict[str, str] = {
     "naming_template": "{series} - Ch. {chapter:04.1f}",
     "naming_template_no_volume": "{series} - Ch. {chapter:04.1f}",
     # Source priority: comma-separated source names, first = preferred.
-    # Fast scanlation sources (tcbscans) ahead of archive sources so new
-    # chapters are grabbed as soon as they appear.
-    "source_priority": "mangaplus,tcbscans,mangadex,mangafire,weebcentral,asura,viz,wikipedia,nyaa",
+    # Official sources first, then fast scanlation sources (tcbscans) ahead
+    # of archive sources so new chapters are grabbed as soon as they appear.
+    "source_priority": "mangaplus,webtoons,tcbscans,mangadex,mangafire,weebcentral,atsumaru,asura,viz,wikipedia,nyaa",
     # MangaDex credentials (personal API client)
     "mangadex_client_id": "",
     "mangadex_client_secret": "",
@@ -51,6 +53,9 @@ DEFAULTS: dict[str, str] = {
     "source_mangadex_enabled": "true",
     "source_mangafire_enabled": "true",
     "source_weebcentral_enabled": "true",
+    "source_atsumaru_enabled": "true",
+    # Official WEBTOON Originals; only currently-free episodes are listed
+    "source_webtoons_enabled": "true",
     "source_tcbscans_enabled": "true",
     "source_asura_enabled": "true",
     # MangaPlus needs a residential IP (bans datacenters); off until the user
