@@ -179,7 +179,7 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
             raise HTTPException(404, "Chapter not found")
         series = await session.get(Series, chapter.series_id)
         dl = await enqueue_direct(
-            session, series, chapter, body.source_name, body.external_id
+            session, series, chapter, body.source_name, body.external_id, group=body.group
         )
     elif body.magnet:
         if values["qbittorrent_enabled"] != "true":

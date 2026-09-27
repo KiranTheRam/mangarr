@@ -2,16 +2,18 @@ import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, appVersion } from "../api/client";
 import type { QueueItem } from "../api/types";
+import { paletteShortcut } from "./CommandPalette";
 
 const items = [
   { to: "/", label: "Library", icon: "▦" },
   { to: "/add", label: "Add New", icon: "+" },
+  { to: "/calendar", label: "Calendar", icon: "◷" },
   { to: "/activity", label: "Activity", icon: "⇅" },
   { to: "/wanted", label: "Wanted", icon: "!" },
   { to: "/settings", label: "Settings", icon: "⚙" },
 ];
 
-export default function Sidebar() {
+export default function Sidebar({ onSearch }: { onSearch: () => void }) {
   const { data: queue } = useQuery({
     queryKey: ["queue"],
     queryFn: () => api.get<QueueItem[]>("/queue"),
@@ -24,6 +26,11 @@ export default function Sidebar() {
         <img className="logo-mark" src="/mangarr-icon.svg" alt="" />
         mangarr
       </div>
+      <button type="button" className="sidebar-search" onClick={onSearch}>
+        <span className="icon">⌕</span>
+        Go to…
+        <kbd>{paletteShortcut}</kbd>
+      </button>
       <nav>
         {items.map((item) => (
           <NavLink

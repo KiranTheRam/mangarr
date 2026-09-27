@@ -27,7 +27,10 @@ import {
   RenameModal,
   SourcesModal,
 } from "../components/LibraryTools";
+import { AutomationModal, monitorModeLabel } from "../components/SeriesAutomation";
+import { RelatedTitles } from "../components/RelatedTitles";
 import { sanitizeDescription } from "../sanitize";
+import { sourceLabel } from "../sources";
 
 function InteractiveSearch({
   seriesId,
@@ -103,6 +106,7 @@ function InteractiveSearch({
         chapter_id: directChapterId,
         source_name: release.source_name,
         external_id: release.external_id,
+        group: release.group,
       });
     }
     return api.post("/queue/grab", {
@@ -469,6 +473,15 @@ function VolumeResyncModal({
   );
 }
 
+/** Downloaded-pill tooltip: the file, and where Mangarr got it from. */
+function downloadedTitle(ch: Chapter): string {
+  const origin =
+    ch.file_source === "volume-merge" ? "merged into a volume archive" :
+    ch.file_source ? `from ${sourceLabel(ch.file_source)}${ch.file_group ? ` (${ch.file_group})` : ""}` :
+    "found on disk";
+  return `${ch.file_path}\n${origin}`;
+}
+
 function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: Chapter[] }[] {
   const byVolume = new Map<number | null, Chapter[]>();
   for (const ch of chapters) {
@@ -604,6 +617,7 @@ export default function SeriesDetail() {
   const [showFiles, setShowFiles] = useState(false);
   const [showSources, setShowSources] = useState(false);
   const [showCleanup, setShowCleanup] = useState(false);
+  const [showAutomation, setShowAutomation] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [volumeResult, setVolumeResult] = useState<VolumeResyncResult | null>(null);
   const [resyncPreview, setResyncPreview] = useState<VolumeResyncPreview | null>(null);
@@ -905,7 +919,7 @@ export default function SeriesDetail() {
                   Excluded
                 </span>
               ) : ch.downloaded ? (
-                <span className="pill green" title={ch.file_path}>
+                <span className="pill green" title={downloadedTitle(ch)}>
                   Downloaded
                 </span>
               ) : ch.available_sources === null ? (
@@ -1020,6 +1034,13 @@ export default function SeriesDetail() {
         </button>
         <button
           className="btn"
+          title="Monitoring mode, source order, scanlation groups, upgrades, and volume merging"
+          onClick={() => setShowAutomation(true)}
+        >
+          ⚙ Automation
+        </button>
+        <button
+          className="btn"
           title={series.monitored ? "Stop automatically grabbing new chapters" : "Automatically grab new chapters"}
           onClick={() => toggleMonitor.mutate()}
           disabled={toggleMonitor.isPending}
@@ -1125,6 +1146,24 @@ export default function SeriesDetail() {
                   </span>
                 )}
                 {series.total_volumes && <span>{series.total_volumes} volumes</span>}
+                {series.cadence_label && (
+                  <span title="Release rhythm from MangaUpdates release dates">
+                    {series.cadence_label}
+                    {series.next_expected_at &&
+                      ` · next ~${new Date(series.next_expected_at).toLocaleDateString(undefined, {
+                        month: "short",
+                        day: "numeric",
+                        timeZone: "UTC",
+                      })}`}
+                  </span>
+                )}
+                {series.monitored && series.monitor_mode !== "all" && (
+                  <span className="pill blue" title="Which chapters monitoring covers">
+                    {monitorModeLabel(series.monitor_mode, series.monitor_from)}
+                  </span>
+                )}
+                {series.upgrades_enabled && <span className="pill blue">Upgrades</span>}
+                {series.merge_volumes && <span className="pill blue">Merges volumes</span>}
               </div>
             </div>
             <div style={{ marginBottom: 10 }}>
@@ -1155,6 +1194,8 @@ export default function SeriesDetail() {
             <FoldersPanel seriesId={seriesId} onChanged={invalidate} />
           </div>
         </div>
+
+        <RelatedTitles seriesId={seriesId} />
 
         {series.chapters.length > 0 && (
           <div className="chapter-selection">
@@ -1322,6 +1363,13 @@ export default function SeriesDetail() {
           links={series.source_links}
           onClose={() => setShowSources(false)}
           onChanged={invalidate}
+        />
+      )}
+      {showAutomation && (
+        <AutomationModal
+          series={series}
+          onClose={() => setShowAutomation(false)}
+          onSaved={invalidate}
         />
       )}
       {showCleanup && (

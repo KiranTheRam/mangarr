@@ -142,6 +142,11 @@ class MangaUpdatesProvider(MetadataProvider):
             raise
         return self._to_metadata(record)
 
+    async def get_related(self, series_id: int) -> tuple[list[dict], list[dict]]:
+        """Raw `related_series` and `recommendations` of a series record."""
+        record = await self._request("GET", f"/series/{series_id}")
+        return record.get("related_series") or [], record.get("recommendations") or []
+
     async def get_release_data(self, series_id: int) -> ReleaseData:
         """Recent releases for the series (newest first, page size is a fixed
         40 server-side). Cached: the monitor loop calls this every cycle."""

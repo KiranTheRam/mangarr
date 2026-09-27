@@ -37,6 +37,9 @@ export interface Chapter {
   downloaded: boolean;
   file_path: string;
   available_sources: string | null;
+  // where mangarr got the file ("" = adopted from disk) and its scanlation group
+  file_source: string;
+  file_group: string;
 }
 
 export interface Series {
@@ -65,12 +68,45 @@ export interface Series {
   // decimal chapters (60.5 …), tracked and searched but never blocking completion
   special_count: number;
   special_downloaded_count: number;
+  monitor_mode: MonitorMode;
+  monitor_from: number | null;
+}
+
+export type MonitorMode = "all" | "missing" | "future" | "from_chapter" | "latest_volume" | "none";
+
+/** Result of a library mass edit; series listed in `problems` kept their
+ * old root folder (the rest of the edit still applied to them). */
+export interface SeriesEditorResult {
+  updated: number;
+  moved: number;
+  problems: { series_id: number; title: string; detail: string }[];
 }
 
 export interface SeriesDetail extends Series {
   chapters: Chapter[];
   source_links: SourceLink[];
   refreshing: boolean;
+  source_priority: string[];
+  blocked_sources: string[];
+  preferred_groups: string[];
+  blocked_groups: string[];
+  upgrades_enabled: boolean;
+  upgrade_cutoff: string;
+  merge_volumes: boolean;
+  // enabled download sources: global order, and the order grabs use here
+  global_source_order: string[];
+  effective_source_order: string[];
+  // release rhythm from MangaUpdates release dates
+  cadence_days: number | null;
+  cadence_label: string;
+  last_released_at: string | null;
+  next_expected_at: string | null;
+}
+
+export interface SeriesGroup {
+  source_name: string;
+  group: string;
+  chapters: number;
 }
 
 export interface MetadataResult {
@@ -104,6 +140,7 @@ export interface Release {
   chapter_id: number | null;
   chapter_number: number | null;
   external_id: string;
+  group: string;
   url: string;
   magnet: string;
   size_bytes: number;
@@ -276,4 +313,134 @@ export interface FilesystemList {
   path: string;
   parent: string | null;
   entries: FilesystemEntry[];
+}
+
+export interface CalendarRelease {
+  series_id: number;
+  series_title: string;
+  cover_url: string;
+  chapter_id: number;
+  number: number;
+  volume: number | null;
+  title: string;
+  released_at: string;
+  downloaded: boolean;
+  monitored: boolean;
+}
+
+export interface CalendarExpected {
+  series_id: number;
+  series_title: string;
+  cover_url: string;
+  expected_at: string;
+  cadence_days: number;
+  cadence_label: string;
+  last_released_at: string;
+  last_number: number | null;
+  overdue: boolean;
+  monitored: boolean;
+}
+
+export interface CalendarData {
+  released: CalendarRelease[];
+  expected: CalendarExpected[];
+}
+
+export interface RelatedTitle {
+  provider: "anilist" | "mangaupdates";
+  provider_id: string;
+  title: string;
+  english_title: string;
+  alt_titles: string[];
+  cover_url: string;
+  year: number | null;
+  status: string;
+  format: string;
+  relation: string;
+  in_library_series_id: number | null;
+}
+
+export interface RelatedData {
+  relations: RelatedTitle[];
+  recommendations: RelatedTitle[];
+}
+
+export interface ImportFolder {
+  name: string;
+  path: string;
+  file_count: number;
+  query: string;
+}
+
+export interface ImportMatch {
+  candidates: MetadataResult[];
+  best: number | null;
+}
+
+export interface LibraryImportResult {
+  folder_name: string;
+  status: "added" | "exists" | "failed";
+  series_id: number | null;
+  detail: string;
+}
+
+export type ImportListKind = "anilist" | "myanimelist" | "mangadex" | "mangaupdates";
+
+export interface ImportListProvider {
+  kind: ImportListKind;
+  label: string;
+  statuses: Record<string, string>;
+  default_statuses: string[];
+  needs_username: boolean;
+  needs_password: boolean;
+  needs_client_id: boolean;
+}
+
+export interface ImportListConfig {
+  name: string;
+  kind: ImportListKind;
+  enabled: boolean;
+  username: string;
+  password: string;
+  client_id: string;
+  statuses: string[];
+  root_folder_id: number;
+  monitored: boolean;
+  monitor_mode: MonitorMode;
+  search_now: boolean;
+}
+
+export interface ImportList extends ImportListConfig {
+  id: number;
+  last_synced_at: string | null;
+  last_error: string;
+  entry_counts: Record<string, number>;
+}
+
+export interface ImportListEntry {
+  id: number;
+  key: string;
+  title: string;
+  anilist_id: number | null;
+  mangaupdates_id: number | null;
+  status: "added" | "existing" | "failed" | "skipped";
+  detail: string;
+  series_id: number | null;
+  first_seen_at: string;
+}
+
+export interface ImportListPreviewItem {
+  key: string;
+  title: string;
+  cover_url: string;
+  year: number | null;
+  action: "add" | "in_library" | "seen";
+  series_id: number | null;
+}
+
+export interface ImportListSyncResult {
+  fetched: number;
+  added: number;
+  existing: number;
+  failed: number;
 }

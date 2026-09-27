@@ -118,6 +118,27 @@ class MangaDexSource(DirectSource):
                     alts.append(value)
         return title, alts
 
+    async def library_manga(self, statuses: list[str]) -> list[dict]:
+        """Manga records in the account's library with one of `statuses`
+        (reading, plan_to_read, completed, on_hold, dropped, re_reading).
+        Needs the account credentials — the library is private."""
+        if not self.has_credentials:
+            raise RuntimeError("MangaDex account credentials are not configured")
+        data = await self._get("/manga/status")
+        wanted = set(statuses)
+        ids = [mid for mid, status in (data.get("statuses") or {}).items() if status in wanted]
+        records: list[dict] = []
+        for start in range(0, len(ids), 100):
+            batch = ids[start:start + 100]
+            # the default content filter would silently drop mature titles
+            # the user explicitly put in their library
+            page = await self._get("/manga", params={
+                "ids[]": batch, "limit": len(batch),
+                "contentRating[]": ["safe", "suggestive", "erotica", "pornographic"],
+            })
+            records.extend(page.get("data") or [])
+        return records
+
     async def search_series(self, query: str) -> list[SourceSeries]:
         data = await self._get(
             "/manga",
@@ -143,7 +164,7 @@ class MangaDexSource(DirectSource):
         return results
 
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:
-        chapters: dict[float, SourceChapter] = {}
+        chapters: list[SourceChapter] = []
         offset = 0
         while True:
             data = await self._get(
@@ -155,6 +176,7 @@ class MangaDexSource(DirectSource):
                     "order[chapter]": "asc",
                     "contentRating[]": ["safe", "suggestive", "erotica"],
                     "includeExternalUrl": 0,  # skip chapters hosted off-site (unfetchable)
+                    "includes[]": ["scanlation_group"],
                 },
             )
             for ch in data.get("data", []):
@@ -173,22 +195,24 @@ class MangaDexSource(DirectSource):
                     volume = int(float(vol_raw)) if vol_raw else None
                 except ValueError:
                     volume = None
-                # First scanlation group wins per chapter number (feed is ordered)
-                if number not in chapters:
-                    chapters[number] = SourceChapter(
-                        source_name=self.name,
-                        external_id=ch["id"],
-                        number=number,
-                        volume=volume,
-                        title=attrs.get("title") or "",
-                        language=self._language,
-                        url=f"https://mangadex.org/chapter/{ch['id']}",
-                    )
+                # every group's copy is kept, in feed order (the first one
+                # is the default pick when the series prefers no group)
+                chapters.append(SourceChapter(
+                    source_name=self.name,
+                    external_id=ch["id"],
+                    number=number,
+                    volume=volume,
+                    title=attrs.get("title") or "",
+                    language=self._language,
+                    url=f"https://mangadex.org/chapter/{ch['id']}",
+                    group=_group_names(ch),
+                ))
             total = data.get("total", 0)
             offset += 500
             if offset >= total:
                 break
-        return sorted(chapters.values(), key=lambda c: c.number)
+        # stable: copies of one chapter keep their feed order
+        return sorted(chapters, key=lambda c: c.number)
 
     async def get_volume_map(self, external_id: str) -> dict[float, int]:
         """Volume assignments from the aggregate endpoint, across all
@@ -225,6 +249,17 @@ class MangaDexSource(DirectSource):
         chapter = data["chapter"]
         chapter_hash = chapter["hash"]
         return [f"{base}/data/{chapter_hash}/{page}" for page in chapter["data"]]
+
+
+def _group_names(chapter: dict) -> str:
+    """Scanlation group names from a feed entry's expanded relationships;
+    a joint release lists each group."""
+    names = [
+        ((rel.get("attributes") or {}).get("name") or "").strip()
+        for rel in chapter.get("relationships") or []
+        if isinstance(rel, dict) and rel.get("type") == "scanlation_group"
+    ]
+    return " & ".join(name for name in names if name)
 
 
 source = MangaDexSource()

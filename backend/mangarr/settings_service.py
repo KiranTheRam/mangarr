@@ -72,6 +72,13 @@ DEFAULTS: dict[str, str] = {
     **{f"source_{name}_proxy_enabled": "false" for name in CONTENT_SOURCE_NAMES},
     # Jobs
     "monitor_interval_minutes": "60",
+    # Finished series whose monitored chapters are all on disk: "keep"
+    # checking every pass, "slow" down to once per finished_series_check_days,
+    # or "unmonitor" them
+    "finished_series_mode": "slow",
+    "finished_series_check_days": "7",
+    # how often enabled import lists are synced
+    "import_list_sync_hours": "6",
     # Library
     "library_scan_on_add": "true",  # adopt existing on-disk files on add/refresh
     # Outbound webhook fired when chapters are imported (e.g. NextPanel's
@@ -128,6 +135,8 @@ def validate(values: dict[str, str]) -> None:
     for key, minimum in (
         ("torrent_auto_max_size_gib", 1),
         ("torrent_auto_min_seeders", 0),
+        ("finished_series_check_days", 1),
+        ("import_list_sync_hours", 1),
     ):
         if key not in values:
             continue
@@ -137,6 +146,14 @@ def validate(values: dict[str, str]) -> None:
             raise ValueError(f"{key} must be a whole number") from None
         if number < minimum:
             raise ValueError(f"{key} must be at least {minimum}")
+
+    if "finished_series_mode" in values:
+        from .automation import FINISHED_SERIES_MODES
+
+        if values["finished_series_mode"] not in FINISHED_SERIES_MODES:
+            raise ValueError(
+                "finished_series_mode must be one of " + ", ".join(FINISHED_SERIES_MODES)
+            )
 
     if "download_proxy_url" in values and values["download_proxy_url"]:
         parsed = urlsplit(values["download_proxy_url"])

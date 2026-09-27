@@ -1,6 +1,26 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+MonitorMode = Literal["all", "missing", "future", "from_chapter", "latest_volume", "none"]
+
+
+def _names(value):
+    """Stored comma/newline-joined name lists are served as lists."""
+    if isinstance(value, str):
+        from .automation import split_names
+
+        return split_names(value)
+    return value or []
+
+
+def _lines(value):
+    if isinstance(value, str):
+        from .automation import split_lines
+
+        return split_lines(value)
+    return value or []
 
 
 class RootFolderOut(BaseModel):
@@ -37,6 +57,8 @@ class ChapterOut(BaseModel):
     downloaded: bool
     file_path: str
     available_sources: str | None
+    file_source: str = ""
+    file_group: str = ""
 
 
 class SeriesOut(BaseModel):
@@ -67,12 +89,40 @@ class SeriesOut(BaseModel):
     # from the counts above so a missing special never blocks completion
     special_count: int = 0
     special_downloaded_count: int = 0
+    monitor_mode: str = "all"
+    monitor_from: float | None = None
 
 
 class SeriesDetailOut(SeriesOut):
     chapters: list[ChapterOut] = []
     source_links: list[SourceLinkOut] = []
     refreshing: bool = False  # a full refresh is running in the background
+    source_priority: list[str] = []
+    blocked_sources: list[str] = []
+    preferred_groups: list[str] = []
+    blocked_groups: list[str] = []
+    upgrades_enabled: bool = False
+    upgrade_cutoff: str = ""
+    merge_volumes: bool = False
+    # enabled download sources in global priority order, and in the order
+    # grabs try them for this series (override applied, blocked removed)
+    global_source_order: list[str] = []
+    effective_source_order: list[str] = []
+    # release rhythm from MangaUpdates release dates (see release_schedule)
+    cadence_days: float | None = None
+    cadence_label: str = ""
+    last_released_at: datetime | None = None
+    next_expected_at: datetime | None = None
+
+    @field_validator("source_priority", "blocked_sources", mode="before")
+    @classmethod
+    def _split_sources(cls, value):
+        return _names(value)
+
+    @field_validator("preferred_groups", "blocked_groups", mode="before")
+    @classmethod
+    def _split_groups(cls, value):
+        return _lines(value)
 
 
 class AddSeriesIn(BaseModel):
@@ -81,6 +131,9 @@ class AddSeriesIn(BaseModel):
     anilist_id: int | None = None
     root_folder_id: int
     monitored: bool = True
+    monitor_mode: MonitorMode = "all"
+    # first monitored chapter for monitor_mode="from_chapter"
+    monitor_from: float | None = None
     search_now: bool = False
     english_title: str = ""
     alt_titles: list[str] = Field(default_factory=list)
@@ -116,6 +169,65 @@ class SeriesUpdateIn(BaseModel):
     # None + a folder_name update pins implicitly (an explicit folder edit is
     # an explicit choice); pass False to re-enable folder adoption
     folder_pinned: bool | None = None
+    # setting a mode re-applies it to every chapter
+    monitor_mode: MonitorMode | None = None
+    monitor_from: float | None = None
+    # [] restores the global order / unblocks everything
+    source_priority: list[str] | None = None
+    blocked_sources: list[str] | None = None
+    preferred_groups: list[str] | None = None
+    blocked_groups: list[str] | None = None
+    upgrades_enabled: bool | None = None
+    upgrade_cutoff: str | None = None
+    merge_volumes: bool | None = None
+
+
+class SeriesEditorIn(BaseModel):
+    """One change applied to many series at once; None fields are left alone."""
+    series_ids: list[int]
+    monitored: bool | None = None
+    monitor_mode: MonitorMode | None = None
+    monitor_from: float | None = None
+    root_folder_id: int | None = None
+    # with a root folder change: move each series' folder into the new root
+    # (otherwise existing files stay where they are and only new ones land there)
+    move_files: bool = False
+
+
+class SeriesEditorProblemOut(BaseModel):
+    series_id: int
+    title: str
+    detail: str
+
+
+class SeriesEditorOut(BaseModel):
+    updated: int
+    moved: int = 0
+    problems: list[SeriesEditorProblemOut] = []
+
+
+class SeriesBulkIn(BaseModel):
+    series_ids: list[int]
+
+
+class SeriesBulkRefreshIn(SeriesBulkIn):
+    # also queue the missing chapters each series' monitoring wants
+    search_missing: bool = False
+
+
+class SeriesBulkOut(BaseModel):
+    count: int
+
+
+class SeriesGroupOut(BaseModel):
+    """A scanlation group a linked source offers for the series."""
+    source_name: str
+    group: str
+    chapters: int
+
+
+class VolumeMergeOut(BaseModel):
+    merged: list[int]
 
 
 class ChapterMonitorIn(BaseModel):
@@ -156,6 +268,7 @@ class ReleaseOut(BaseModel):
     chapter_id: int | None = None
     chapter_number: float | None = None
     external_id: str = ""  # direct: source chapter id
+    group: str = ""  # direct: scanlation group, when the source says
     url: str = ""
     magnet: str = ""
     size_bytes: int = 0
@@ -168,6 +281,7 @@ class GrabIn(BaseModel):
     chapter_id: int | None = None
     source_name: str | None = None
     external_id: str | None = None
+    group: str = ""
     # torrent grab
     series_id: int | None = None
     magnet: str | None = None
@@ -442,3 +556,155 @@ class FilesystemListOut(BaseModel):
     path: str
     parent: str | None
     entries: list[FilesystemEntryOut]
+
+
+# ---------------------------------------------------------------- calendar
+
+class CalendarReleaseOut(BaseModel):
+    series_id: int
+    series_title: str
+    cover_url: str
+    chapter_id: int
+    number: float
+    volume: int | None
+    title: str
+    released_at: datetime
+    downloaded: bool
+    monitored: bool
+
+
+class CalendarExpectedOut(BaseModel):
+    series_id: int
+    series_title: str
+    cover_url: str
+    expected_at: datetime
+    cadence_days: float
+    cadence_label: str
+    last_released_at: datetime
+    last_number: float | None
+    overdue: bool  # the expected day has passed without a new release
+    monitored: bool
+
+
+class CalendarOut(BaseModel):
+    released: list[CalendarReleaseOut]
+    expected: list[CalendarExpectedOut]
+
+
+# ---------------------------------------------------- related / recommended
+
+class RelatedTitleOut(BaseModel):
+    provider: str  # anilist | mangaupdates — which id adding it would use
+    provider_id: str
+    title: str
+    english_title: str = ""
+    alt_titles: list[str] = []
+    cover_url: str = ""
+    year: int | None = None
+    status: str = "unknown"
+    format: str = ""  # MANGA, ONE_SHOT, NOVEL … when the provider says
+    relation: str  # "Sequel", "Side story", "Recommended" …
+    in_library_series_id: int | None = None
+
+
+class RelatedOut(BaseModel):
+    relations: list[RelatedTitleOut]
+    recommendations: list[RelatedTitleOut]
+
+
+# ------------------------------------------------------------ bulk import
+
+class ImportFolderOut(BaseModel):
+    name: str
+    path: str
+    file_count: int
+    query: str  # the folder name cleaned into a search query
+
+
+class ImportMatchOut(BaseModel):
+    candidates: list[MetadataResult]
+    best: int | None  # index of the confident match, None = needs a human
+
+
+class LibraryImportItemIn(BaseModel):
+    folder_name: str
+    provider: Literal["mangaupdates", "anilist"]
+    provider_id: int
+    # the entry's titles, so a library series from another provider is
+    # recognised as the same manga
+    title: str = ""
+    english_title: str = ""
+    alt_titles: list[str] = Field(default_factory=list)
+
+
+class LibraryImportIn(BaseModel):
+    root_folder_id: int
+    items: list[LibraryImportItemIn]
+    monitored: bool = True
+    monitor_mode: MonitorMode = "all"
+    monitor_from: float | None = None
+    search_now: bool = False
+
+
+class LibraryImportResultOut(BaseModel):
+    folder_name: str
+    status: Literal["added", "exists", "failed"]
+    series_id: int | None = None
+    detail: str = ""
+
+
+# ------------------------------------------------------------ import lists
+
+ImportListKind = Literal["anilist", "myanimelist", "mangadex", "mangaupdates"]
+
+
+class ImportListIn(BaseModel):
+    name: str
+    kind: ImportListKind
+    enabled: bool = True
+    username: str = ""  # AniList / MyAnimeList / MangaUpdates account
+    password: str = ""  # MangaUpdates only (its lists need a login)
+    client_id: str = ""  # MyAnimeList API client id
+    statuses: list[str] = Field(default_factory=list)  # empty = the provider default
+    root_folder_id: int
+    monitored: bool = True
+    monitor_mode: MonitorMode = "all"
+    search_now: bool = False
+
+
+class ImportListOut(ImportListIn):
+    id: int
+    last_synced_at: datetime | None = None
+    last_error: str = ""
+    entry_counts: dict[str, int] = {}
+
+
+class ImportListEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    key: str
+    title: str
+    anilist_id: int | None
+    mangaupdates_id: int | None
+    status: str  # added | existing | failed | skipped
+    detail: str
+    series_id: int | None
+    first_seen_at: datetime
+
+
+class ImportListPreviewItemOut(BaseModel):
+    key: str
+    title: str
+    cover_url: str = ""
+    year: int | None = None
+    # add = a sync would add it; in_library = already there; seen = handled
+    # by an earlier sync (added, skipped, or deleted since)
+    action: Literal["add", "in_library", "seen"]
+    series_id: int | None = None
+
+
+class ImportListSyncOut(BaseModel):
+    fetched: int
+    added: int
+    existing: int
+    failed: int

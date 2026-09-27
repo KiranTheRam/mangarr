@@ -1,6 +1,7 @@
 import httpx
 import respx
 
+from mangarr.automation import select_group_variants
 from mangarr.sources.atsumaru import CDN_URL, SITE_URL, AtsumaruSource
 
 SEARCH_URL = f"{SITE_URL}/collections/manga/documents/search"
@@ -66,8 +67,19 @@ async def test_list_chapters_takes_best_ranked_group_with_pages():
         )
     )
     source = AtsumaruSource()
-    chapters = await source.list_chapters("RxJM9")
+    listing = await source.list_chapters("RxJM9")
 
+    # every group's copy with pages is listed, best-ranked group first
+    assert [(c.number, c.external_id, c.group) for c in listing] == [
+        (1.0, "RxJM9|b1", "Alpha"),
+        (1.0, "RxJM9|a1", "Delta"),
+        (2.0, "RxJM9|c2", "Flame"),
+        (2.0, "RxJM9|d2", ""),
+        (10.5, "RxJM9|e3", ""),
+        (11.0, "RxJM9|f4", ""),
+    ]
+    # with no group preferences the pick is the site's best-ranked copy
+    chapters = select_group_variants(listing)
     assert [(c.number, c.external_id, c.title) for c in chapters] == [
         (1.0, "RxJM9|b1", ""),
         (2.0, "RxJM9|c2", "Chapter 2 - The Fall"),
@@ -75,6 +87,9 @@ async def test_list_chapters_takes_best_ranked_group_with_pages():
         (11.0, "RxJM9|f4", ""),
     ]
     assert chapters[0].url == f"{SITE_URL}/read/RxJM9/b1"
+    # a preferred group wins over the site's ranking
+    preferred = select_group_variants(listing, preferred=["delta"])
+    assert preferred[0].external_id == "RxJM9|a1"
     await source._client.aclose()
 
 

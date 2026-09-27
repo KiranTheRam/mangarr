@@ -24,6 +24,10 @@ class SourceChapter:
     title: str = ""
     language: str = "en"
     url: str = ""
+    # scanlation group(s) behind this copy, when the source says. Sources
+    # that carry several groups' copies of a chapter list every copy, in
+    # their own preference order; automation.select_group_variants picks one.
+    group: str = ""
 
 
 @dataclass
@@ -72,7 +76,9 @@ class DirectSource(ABC):
     async def search_series(self, query: str) -> list[SourceSeries]: ...
 
     @abstractmethod
-    async def list_chapters(self, external_id: str) -> list[SourceChapter]: ...
+    async def list_chapters(self, external_id: str) -> list[SourceChapter]:
+        """Chapters the source serves. May hold several copies of one chapter
+        number (one per scanlation group), best first."""
 
     @abstractmethod
     async def get_pages(self, chapter_external_id: str) -> list[str]:

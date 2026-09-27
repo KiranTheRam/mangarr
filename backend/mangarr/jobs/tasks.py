@@ -15,6 +15,20 @@ from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import kavita, notifications
+from ..automation import (
+    FINISHED_SERIES_MODES,
+    MERGED_FILE_SOURCE,
+    apply_monitor_mode,
+    chapter_is_wanted,
+    finished_and_complete,
+    is_upgrade,
+    mergeable_volumes,
+    needs_threshold_resolution,
+    select_for_series,
+    split_lines,
+    split_names,
+    upgrade_candidates,
+)
 from ..chapter_metadata import (
     apply_metadata_rows,
     apply_title,
@@ -26,7 +40,8 @@ from ..download.direct import download_chapter_to_cbz
 from ..download.qbittorrent import QbtClient
 from ..library.importer import import_torrent_payload
 from ..library.matcher import find_media_files
-from ..library.naming import chapter_path
+from ..library.naming import chapter_path, series_folder, volume_filename
+from ..library.volume_merge import merge_chapter_archives
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
 from ..models import (
@@ -53,6 +68,10 @@ BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 # source failure (which would stop the monitor from ever retrying that
 # chapter on that source)
 REMOVED_BY_USER = "removed by user"
+
+# upgrades share the single direct queue with new chapters; a series that
+# just had upgrades enabled must not flood it in one pass
+UPGRADES_PER_PASS = 25
 
 # a failed grab blocks that (chapter, source) pair, but not forever — sources
 # fix broken chapters, so retry after a while (one request per window is cheap)
@@ -89,15 +108,20 @@ async def _raise_if_download_removed(session: AsyncSession, download_id: int) ->
 
 
 async def _list_chapters_cached(
-    src: DirectSource, external_id: str, cache: ChapterListCache | None
+    src: DirectSource, external_id: str, cache: ChapterListCache | None,
+    series: Series,
 ) -> list[SourceChapter]:
+    """A source's chapter listing, one release per chapter number: `series`
+    applies its scanlation-group preferences (the cache keeps every group's
+    copy, so the selection never leaks between series)."""
     key = (src.name, external_id)
     if cache is not None and key in cache:
-        return cache[key]
-    chapters = await src.list_chapters(external_id)
-    if cache is not None:
-        cache[key] = chapters
-    return chapters
+        chapters = cache[key]
+    else:
+        chapters = await src.list_chapters(external_id)
+        if cache is not None:
+            cache[key] = chapters
+    return select_for_series(chapters, series)
 
 
 # ---------------------------------------------------------------- metadata
@@ -272,7 +296,12 @@ async def update_chapters(
     added = 0
     links = {sl.source_name: sl for sl in series.source_links}
     enabled_sources = registry.enabled_direct_sources(values)
-    claimable_sources = {src.name for src in enabled_sources if src.name in links}
+    # a source this series blocks still contributes chapter numbers and
+    # metadata, but it never serves a grab, so it claims no availability
+    blocked = set(split_names(series.blocked_sources))
+    claimable_sources = {
+        src.name for src in enabled_sources if src.name in links and src.name not in blocked
+    }
     availability = {
         number: {
             name
@@ -287,7 +316,9 @@ async def update_chapters(
         if link is None:
             continue
         try:
-            source_chapters = await _list_chapters_cached(src, link.external_id, chapter_cache)
+            source_chapters = await _list_chapters_cached(
+                src, link.external_id, chapter_cache, series
+            )
         except Exception as exc:
             log.warning("chapter list failed on %s for %r: %s", src.name, series.title, exc)
             continue
@@ -301,7 +332,7 @@ async def update_chapters(
             if ch is None:
                 ch = Chapter(
                     number=sc.number,
-                    monitored=series.monitored,
+                    monitored=chapter_is_wanted(series, sc.number),
                 )
                 apply_volume(ch, sc.volume, sc.source_name)
                 apply_title(ch, sc.title, sc.source_name, series.title)
@@ -316,7 +347,8 @@ async def update_chapters(
                     continue
                 apply_volume(ch, sc.volume, sc.source_name)
                 apply_title(ch, sc.title, sc.source_name, series.title)
-            availability.setdefault(sc.number, set()).add(src.name)
+            if src.name in claimable_sources:
+                availability.setdefault(sc.number, set()).add(src.name)
 
     # MangaUpdates tracks releases even when no direct source serves them
     # yet (or ever) — add those chapters so Wanted reflects reality
@@ -332,7 +364,7 @@ async def update_chapters(
                 if ch is None:
                     ch = Chapter(
                         number=number,
-                        monitored=series.monitored,
+                        monitored=chapter_is_wanted(series, number),
                         released_at=released_at,
                     )
                     series.chapters.append(ch)
@@ -395,6 +427,11 @@ async def update_chapters(
         if chapter.available_sources != current:
             chapter.available_sources = current
 
+    # "future" / "latest volume" chosen before any chapter was known (e.g. at
+    # add time) resolve against the first chapter list that arrives
+    if needs_threshold_resolution(series) and existing:
+        apply_monitor_mode(series, existing.values())
+
     await session.commit()
     return added
 
@@ -436,7 +473,7 @@ def _add_volume_map_gap_chapters(
         ch = Chapter(
             number=number, volume=volume,
             volume_source=(map_sources or {}).get(number, "disk-inferred"),
-            monitored=series.monitored,
+            monitored=chapter_is_wanted(series, number),
         )
         series.chapters.append(ch)
         existing[number] = ch
@@ -607,7 +644,9 @@ async def try_acquire_series_lock(series_id: int) -> asyncio.Lock | None:
     return lock
 
 
-async def refresh_series_full(series_id: int, grab_missing: bool = False) -> None:
+async def refresh_series_full(
+    series_id: int, grab_missing: bool = False, only_monitored: bool = False
+) -> None:
     REFRESHING.add(series_id)
     lock = await acquire_series_lock(series_id)
     try:
@@ -633,7 +672,14 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
                 except Exception as exc:
                     log.warning("library scan failed for series %d: %s", series_id, exc)
             await reconcile_downloaded_files(session, series)
-            if grab_missing:
+            if grab_missing and only_monitored:
+                # an on-demand monitor pass (the library editor's "search
+                # missing"): the series' monitoring mode still decides what is
+                # wanted, so chapters it leaves out stay unwanted
+                await grab_missing_chapters(
+                    session, series, values, chapter_cache=chapter_cache,
+                )
+            elif grab_missing:
                 # explicit one-time search (e.g. "search for missing" at add
                 # time): runs even for unmonitored series, whose chapters carry
                 # monitored=False — the user asked for the missing content now
@@ -699,23 +745,33 @@ async def _load_series(session: AsyncSession, series_id: int) -> Series | None:
 async def enqueue_direct(
     session: AsyncSession, series: Series, chapter: Chapter,
     source_name: str, external_id: str, url: str = "",
-    commit: bool = True,
+    commit: bool = True, group: str = "", upgrade: bool = False,
 ) -> Download:
     """Queue a direct download. `commit=False` lets bulk callers (the monitor)
-    batch many grabs into one commit."""
+    batch many grabs into one commit. `upgrade` marks a grab that replaces
+    the chapter's current file."""
+    title = f"{series.title} - Chapter {chapter.number:g}"
+    if group:
+        title += f" [{group}]"
+    if upgrade:
+        title += " (upgrade)"
     dl = Download(
         series_id=series.id,
         chapter_id=chapter.id,
         kind=DownloadKind.DIRECT,
         status=DownloadStatus.QUEUED,
-        title=f"{series.title} - Chapter {chapter.number:g}",
+        title=title,
         source_name=source_name,
         payload=external_id,
+        release_group=group,
     )
     session.add(dl)
+    detail = url or external_id
+    if upgrade:
+        detail = f"upgrade from {chapter.file_source}: {detail}"
     session.add(HistoryEvent(
         series_id=series.id, chapter_id=chapter.id, event="grabbed",
-        source_name=source_name, detail=url or external_id,
+        source_name=source_name, detail=detail,
     ))
     if commit:
         await session.commit()
@@ -1071,8 +1127,21 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         await session.commit()
         return
 
+    # a file mangarr fetched itself is replaced outright; anything else (the
+    # user's own files, a shared volume archive) stays where it is
+    replaced = chapter.file_path if chapter.downloaded else ""
+    replaced_source = chapter.file_source
+    discard_replaced = bool(
+        replaced and replaced != str(dest)
+        and replaced_source in registry.DIRECT_SOURCES
+        and not any(
+            c.file_path == replaced for c in series.chapters if c.id != chapter.id
+        )
+    )
     chapter.downloaded = True
     chapter.file_path = str(dest)
+    chapter.file_source = source_name
+    chapter.file_group = dl.release_group
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
     dl.error = ""
@@ -1080,7 +1149,21 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         series_id=series.id, chapter_id=chapter.id, event="imported",
         source_name=dl.source_name, detail=str(dest),
     ))
+    if replaced:
+        session.add(HistoryEvent(
+            series_id=series.id, chapter_id=chapter.id, event="upgraded",
+            source_name=dl.source_name,
+            detail=(
+                f"from {replaced_source or 'an existing file'}; previous file "
+                f"{'removed' if discard_replaced else 'kept'}: {replaced}"
+            ),
+        ))
     await session.commit()
+    if discard_replaced:
+        try:
+            Path(replaced).unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not remove replaced file %s: %s", replaced, exc)
     notifications.notify_import(values, series.id, f"Chapter {chapter.number:g}")
     _notify_kavita(values, series)
 
@@ -1208,8 +1291,12 @@ async def _import_torrent(
     _import_path_missing_counts.pop(dl.id, None)
     for dest, chapter, volume in imported:
         if chapter is not None:
+            # a destination that already was this chapter's file keeps its
+            # recorded origin — the import found it rather than placed it
+            if not chapter.downloaded or chapter.file_path != str(dest):
+                chapter.file_path = str(dest)
+                chapter.file_source = "nyaa"
             chapter.downloaded = True
-            chapter.file_path = str(dest)
         elif volume is not None:
             # a volume archive covers every chapter assigned to that volume
             for ch in series.chapters:
@@ -1277,7 +1364,17 @@ async def grab_missing_chapters(
         and c.id not in active_chapters
         and c.number not in excluded
     ]
-    if not wanted:
+    sources = registry.series_direct_sources(values, series)
+    source_order = [src.name for src in sources]
+    upgrades = {
+        number: chapter
+        for number, chapter in upgrade_candidates(
+            series, series.chapters, source_order, registry.DIRECT_SOURCES,
+            skip_ids=active_chapters,
+        ).items()
+        if number not in excluded
+    }
+    if not wanted and not upgrades:
         return 0
 
     # a chapter that recently failed on a source shouldn't be retried there —
@@ -1296,35 +1393,116 @@ async def grab_missing_chapters(
     failed_pairs = {(cid, name) for cid, name in result.all()}
 
     queued = 0
+    upgrades_queued = 0
+    blocked_groups = split_lines(series.blocked_groups)
     links = {sl.source_name: sl for sl in series.source_links}
     remaining = {c.number: c for c in wanted}
-    for src in registry.enabled_direct_sources(values):
-        if not remaining:
+    # sources are walked best-first, so the first one offering a chapter is
+    # the one to grab it from — for missing chapters and upgrades alike
+    for src in sources:
+        if not remaining and not upgrades:
             break
         link = links.get(src.name)
         if link is None:
             continue
         try:
-            source_chapters = await _list_chapters_cached(src, link.external_id, chapter_cache)
+            source_chapters = await _list_chapters_cached(
+                src, link.external_id, chapter_cache, series
+            )
         except Exception as exc:
             log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
             continue
         for sc in source_chapters:
             ch = remaining.get(sc.number)
-            if ch is None or (ch.id, src.name) in failed_pairs:
+            if ch is not None:
+                if (ch.id, src.name) in failed_pairs:
+                    continue
+                remaining.pop(sc.number, None)
+                await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url,
+                                     commit=False, group=sc.group)
+                queued += 1
                 continue
-            remaining.pop(sc.number, None)
+            ch = upgrades.get(sc.number)
+            if (
+                ch is None
+                or upgrades_queued >= UPGRADES_PER_PASS
+                or (ch.id, src.name) in failed_pairs
+                or not is_upgrade(ch, src.name, source_order, blocked_groups)
+            ):
+                continue
+            upgrades.pop(sc.number, None)
             await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url,
-                                 commit=False)
+                                 commit=False, group=sc.group, upgrade=True)
             queued += 1
+            upgrades_queued += 1
+    if upgrades_queued:
+        log.info("monitor: queued %d upgrade(s) for %r", upgrades_queued, series.title)
     if queued:
         await session.commit()
-    else:
+    elif remaining:
         # e.g. only MangaDex is linked but its chapters are all external —
         # say so instead of failing silently
         log.info("monitor: no linked source serves any of the %d missing chapter(s) of %r",
                  len(remaining), series.title)
     return queued
+
+
+async def merge_complete_volumes(
+    session: AsyncSession, series: Series, values: dict[str, str], force: bool = False,
+) -> list[int]:
+    """Pack each closed, fully downloaded volume's chapter files into one
+    volume archive (see automation.mergeable_volumes). Returns the merged
+    volume numbers. The chapter files are removed only after the database
+    points at the archive. `force` runs it for a series that doesn't merge
+    automatically (an explicit "merge now")."""
+    if not (series.merge_volumes or force):
+        return []
+    folders = _series_folders(series)
+    if not folders:
+        return []
+    busy = set((await session.execute(
+        select(Download.chapter_id).where(
+            Download.series_id == series.id,
+            Download.chapter_id.isnot(None),
+            Download.status.in_([
+                DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+            ]),
+        )
+    )).scalars().all())
+    merged: list[int] = []
+    for volume, members in mergeable_volumes(series, series.chapters, busy).items():
+        dest = folders[0] / volume_filename(series_folder(series.title), volume)
+        try:
+            await asyncio.to_thread(
+                merge_chapter_archives,
+                [(c.number, Path(c.file_path)) for c in members],
+                dest, series.title, volume,
+                series.description if volume == 1 else "",
+            )
+        except Exception as exc:
+            log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
+            continue
+        old_paths = [c.file_path for c in members]
+        for chapter in members:
+            chapter.file_path = str(dest)
+            chapter.file_source = MERGED_FILE_SOURCE
+        session.add(HistoryEvent(
+            series_id=series.id, event="merged",
+            detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
+        ))
+        await session.commit()
+        for old in old_paths:
+            if old == str(dest):
+                continue
+            try:
+                Path(old).unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not remove merged chapter file %s: %s", old, exc)
+        merged.append(volume)
+    if merged:
+        log.info("Merged volume(s) %s of %r", merged, series.title)
+        _notify_kavita(values, series)
+    return merged
 
 
 async def recover_interrupted_downloads() -> None:
@@ -1347,6 +1525,26 @@ async def recover_interrupted_downloads() -> None:
             log.info("Requeued %d direct download(s) interrupted by restart", len(stuck))
 
 
+def _checked_within(series: Series, days: int) -> bool:
+    checked = series.last_monitored_at
+    if checked is None:
+        return False
+    if checked.tzinfo is None:  # SQLite returns naive datetimes
+        checked = checked.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - checked < timedelta(days=days)
+
+
+def _finished_series_policy(values: dict[str, str]) -> tuple[str, int]:
+    mode = values.get("finished_series_mode", "slow")
+    if mode not in FINISHED_SERIES_MODES:
+        mode = "slow"
+    try:
+        days = max(1, int(values.get("finished_series_check_days", "7")))
+    except ValueError:
+        days = 7
+    return mode, days
+
+
 async def monitor_all() -> None:
     """Refresh monitored series and grab missing monitored chapters."""
     async with session_scope() as session:
@@ -1365,6 +1563,15 @@ async def monitor_all() -> None:
                     series = await _load_series(session, series_id)
                     if series is None:
                         continue
+                    finished_mode, check_days = _finished_series_policy(values)
+                    if (
+                        finished_mode == "slow"
+                        and _checked_within(series, check_days)
+                        and finished_and_complete(series, series.chapters)
+                    ):
+                        # finished and fully on disk: nothing new is expected,
+                        # so look again only every few days
+                        continue
                     if _metadata_is_stale(series):
                         try:
                             await refresh_series_metadata(session, series)
@@ -1382,6 +1589,27 @@ async def monitor_all() -> None:
                         log.warning("library scan failed for series %d: %s", series_id, exc)
                     await grab_missing_chapters(session, series, values,
                                                 chapter_cache=chapter_cache)
+                    try:
+                        await merge_complete_volumes(session, series, values)
+                    except Exception as exc:
+                        log.warning("volume merge failed for series %d: %s", series_id, exc)
+                        # the rollback expired the series; leave the pass's
+                        # bookkeeping to the next one rather than reload it
+                        await session.rollback()
+                        continue
+                    series.last_monitored_at = datetime.now(timezone.utc)
+                    if (
+                        finished_mode == "unmonitor"
+                        and finished_and_complete(series, series.chapters)
+                    ):
+                        series.monitored = False
+                        session.add(HistoryEvent(
+                            series_id=series.id, event="unmonitored",
+                            detail="series is finished and every monitored chapter is on disk",
+                        ))
+                        log.info("monitor: %r is finished and complete; unmonitored",
+                                 series.title)
+                    await session.commit()
             except Exception:
                 # one broken series must not abort the whole monitor pass
                 log.exception("monitor pass failed for series %d", series_id)

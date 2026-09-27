@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..automation import select_for_series
 from ..db import get_session
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
@@ -39,13 +40,13 @@ async def _gather_limited(
     return list(await asyncio.gather(*(run(item) for item in items)))
 
 
-@router.get("/metadata", response_model=list[MetadataResult])
-async def search_metadata(
-    q: str, provider: str = "mangaupdates", session: AsyncSession = Depends(get_session)
-):
+async def metadata_results(
+    session: AsyncSession, provider: str, query: str, limit: int = 20
+) -> list[MetadataResult]:
+    """Search a metadata provider, marking results already in the library."""
     meta_provider = anilist if provider == "anilist" else mangaupdates
     id_column = Series.anilist_id if provider == "anilist" else Series.mangaupdates_id
-    results = await meta_provider.search(q)
+    results = await meta_provider.search(query, limit=limit)
     in_library = {
         row[0]
         for row in (await session.execute(select(id_column))).all()
@@ -56,7 +57,7 @@ async def search_metadata(
             provider=r.provider,
             provider_id=r.provider_id,
             title=r.title,
-            english_title=english_title(r.title, r.alt_titles, q),
+            english_title=english_title(r.title, r.alt_titles, query),
             alt_titles=r.alt_titles,
             description=r.description,
             status=r.status,
@@ -69,6 +70,13 @@ async def search_metadata(
         )
         for r in results
     ]
+
+
+@router.get("/metadata", response_model=list[MetadataResult])
+async def search_metadata(
+    q: str, provider: str = "mangaupdates", session: AsyncSession = Depends(get_session)
+):
+    return await metadata_results(session, provider, q)
 
 
 def _candidate_matches_series(candidate_titles: list[str], wanted: set[str]) -> bool:
@@ -179,6 +187,10 @@ async def search_releases(
                 source_chapters = await src.list_chapters(external_id)
             except Exception:
                 continue
+            if selected is None:
+                # the open-ended search shows the release a grab would take;
+                # a scoped one lists every group's copy to choose from
+                source_chapters = select_for_series(source_chapters, series)
             added_for_source = 0
             for sc in source_chapters:
                 if (src.name, sc.external_id) in direct_seen:
@@ -199,10 +211,12 @@ async def search_releases(
                         kind="direct",
                         source_name=src.name,
                         title=f"{series.title} - Chapter {sc.number:g}"
-                              + (f" - {sc.title}" if sc.title else ""),
+                              + (f" - {sc.title}" if sc.title else "")
+                              + (f" [{sc.group}]" if sc.group else ""),
                         chapter_id=local_chapter.id,
                         chapter_number=sc.number,
                         external_id=sc.external_id,
+                        group=sc.group,
                         url=sc.url,
                     )
                 )
@@ -213,8 +227,12 @@ async def search_releases(
                     break
         return out
 
+    # the series' own source order first; sources it blocks from automatic
+    # grabs still answer a manual search, last
+    ordered = registry.series_direct_sources(values, series)
+    ordered += [src for src in registry.enabled_direct_sources(values) if src not in ordered]
     direct_parts = await _gather_limited(
-        registry.enabled_direct_sources(values),
+        ordered,
         DIRECT_SEARCH_CONCURRENCY,
         direct_releases_for_source,
     )

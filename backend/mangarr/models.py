@@ -15,7 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
 
 def utcnow() -> datetime:
@@ -74,6 +74,28 @@ class Series(Base):
     # when provider metadata (status, totals, …) was last pulled; the monitor
     # re-refreshes stale series so finished/hiatus states don't rot
     metadata_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # which chapters monitoring covers — see mangarr.automation.MONITOR_MODES.
+    # monitor_from is the chapter-number threshold of the threshold modes;
+    # None for "future"/"latest_volume" means not resolved yet (no chapters)
+    monitor_mode: Mapped[str] = mapped_column(String, default="all")
+    monitor_from: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # per-series grab order: comma-separated source names tried first (the
+    # global order fills in the rest); blocked sources are never grabbed from
+    source_priority: Mapped[str] = mapped_column(Text, default="")
+    blocked_sources: Mapped[str] = mapped_column(Text, default="")
+    # scanlation groups, newline-separated (names may contain commas)
+    preferred_groups: Mapped[str] = mapped_column(Text, default="")
+    blocked_groups: Mapped[str] = mapped_column(Text, default="")
+    # replace mangarr-downloaded chapters when a higher-priority source has
+    # them, until the file comes from upgrade_cutoff (empty = the top source)
+    upgrades_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    upgrade_cutoff: Mapped[str] = mapped_column(String, default="")
+    # pack each complete volume's chapter files into one volume archive
+    merge_volumes: Mapped[bool] = mapped_column(Boolean, default=False)
+    # last scheduled monitor pass; finished, complete series are checked less
+    last_monitored_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -149,8 +171,26 @@ class Chapter(Base):
     available_sources: Mapped[str | None] = mapped_column(
         String, nullable=True, default=None
     )
+    # Provenance of the file at file_path: the direct source (or "nyaa") that
+    # mangarr fetched it from, and the scanlation group when known. Empty for
+    # files adopted from disk, which upgrades and volume merges never touch.
+    file_source: Mapped[str] = mapped_column(String, default="")
+    file_group: Mapped[str] = mapped_column(String, default="")
 
     series: Mapped[Series] = relationship(back_populates="chapters")
+
+    @validates("file_path")
+    def _forget_provenance_of_replaced_file(self, _key: str, value: str) -> str:
+        # provenance describes one file; pointing the chapter at another file
+        # (a scan adoption, a manual map, a cleanup repoint) must not let the
+        # new file inherit it. Writers that keep the same file (rename) or
+        # that know the new file's origin set the fields again afterwards.
+        # read the loaded value directly: attribute access on an expired
+        # instance would lazy-load, which an async session cannot do here
+        if value != self.__dict__.get("file_path"):
+            self.file_source = ""
+            self.file_group = ""
+        return value
 
 
 class DownloadKind(str, enum.Enum):
@@ -182,6 +222,8 @@ class Download(Base):
     title: Mapped[str] = mapped_column(String, default="")  # human-readable release title
     source_name: Mapped[str] = mapped_column(String, default="")
     payload: Mapped[str] = mapped_column(Text, default="")  # source-specific: chapter external id / magnet
+    # scanlation group of the grabbed release, when the source reports one
+    release_group: Mapped[str] = mapped_column(String, default="")
     torrent_hash: Mapped[str] = mapped_column(String, default="")
     progress: Mapped[float] = mapped_column(Float, default=0.0)  # 0..1
     error: Mapped[str] = mapped_column(Text, default="")
@@ -228,3 +270,51 @@ class ApiKey(Base):
     key: Mapped[str] = mapped_column(String, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ImportList(Base):
+    """An external reading list (AniList, MyAnimeList, MangaDex, MangaUpdates)
+    whose new entries are added to the library on each sync."""
+
+    __tablename__ = "import_lists"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    kind: Mapped[str] = mapped_column(String)  # see mangarr.import_lists.PROVIDERS
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # provider settings as JSON: username, password, client_id, statuses
+    config: Mapped[str] = mapped_column(Text, default="{}")
+    # how entries are added
+    root_folder_id: Mapped[int | None] = mapped_column(ForeignKey("root_folders.id"), nullable=True)
+    monitored: Mapped[bool] = mapped_column(Boolean, default=True)
+    monitor_mode: Mapped[str] = mapped_column(String, default="all")
+    search_now: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+
+    entries: Mapped[list[ImportListEntry]] = relationship(
+        back_populates="import_list", cascade="all, delete-orphan"
+    )
+
+
+class ImportListEntry(Base):
+    """Every entry a list has produced, so each is acted on once: deleting a
+    series a list added must not have the next sync add it back."""
+
+    __tablename__ = "import_list_entries"
+    __table_args__ = (UniqueConstraint("list_id", "key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    list_id: Mapped[int] = mapped_column(ForeignKey("import_lists.id"))
+    key: Mapped[str] = mapped_column(String)  # "<provider>:<id>" on the list's own site
+    title: Mapped[str] = mapped_column(String, default="")
+    anilist_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mangaupdates_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # added | existing (was already in the library) | failed (retried next
+    # sync) | skipped (the user dismissed it)
+    status: Mapped[str] = mapped_column(String, default="added")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    series_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    import_list: Mapped[ImportList] = relationship(back_populates="entries")

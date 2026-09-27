@@ -36,7 +36,33 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     # NULL means the chapter has not had source availability evaluated yet;
     # an empty string means a successful refresh found no direct source.
     ("chapters", "available_sources", "VARCHAR", None),
+    ("series", "monitor_mode", "VARCHAR NOT NULL DEFAULT 'all'", None),
+    ("series", "monitor_from", "FLOAT", None),
+    ("series", "source_priority", "TEXT NOT NULL DEFAULT ''", None),
+    ("series", "blocked_sources", "TEXT NOT NULL DEFAULT ''", None),
+    ("series", "preferred_groups", "TEXT NOT NULL DEFAULT ''", None),
+    ("series", "blocked_groups", "TEXT NOT NULL DEFAULT ''", None),
+    ("series", "upgrades_enabled", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("series", "upgrade_cutoff", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "merge_volumes", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("series", "last_monitored_at", "DATETIME", None),
+    ("chapters", "file_source", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("chapters", "file_group", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("downloads", "release_group", "VARCHAR NOT NULL DEFAULT ''", None),
 ]
+
+# Chapters mangarr downloaded before file provenance was tracked: the latest
+# "imported" history event whose path is still the chapter's file names the
+# source. Runs once, when the file_source column is first added.
+_BACKFILL_FILE_SOURCE = """
+UPDATE chapters SET file_source = COALESCE((
+    SELECT h.source_name FROM history h
+    WHERE h.chapter_id = chapters.id AND h.event = 'imported'
+      AND h.detail = chapters.file_path
+    ORDER BY h.id DESC LIMIT 1
+), '')
+WHERE downloaded = 1 AND file_path != ''
+"""
 
 
 async def init_db() -> None:
@@ -51,6 +77,8 @@ async def init_db() -> None:
                 await conn.exec_driver_sql(
                     f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
                 )
+                if (table, column) == ("chapters", "file_source"):
+                    await conn.exec_driver_sql(_BACKFILL_FILE_SOURCE)
             if index:
                 await conn.exec_driver_sql(
                     f"CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table} ({column})"
