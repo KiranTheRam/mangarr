@@ -3,17 +3,9 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import type { Series } from "../api/types";
+import { LibraryEditorBar } from "../components/LibraryEditor";
 import { EmptyState, ErrorNotice, Spinner, Toolbar } from "../components/common";
-
-/** Case-insensitive match against every name we know for the series —
- * canonical (often romaji/Japanese), English, and all alt titles (including
- * native-script ones), so both "kagura" and "カグラバチ" find it. */
-function matchesQuery(series: Series, q: string): boolean {
-  return [series.title, series.english_title, series.alt_titles]
-    .join("\n")
-    .toLowerCase()
-    .includes(q);
-}
+import { matchesQuery } from "../seriesSearch";
 
 interface Filters {
   monitored: "all" | "monitored" | "unmonitored";
@@ -53,12 +45,39 @@ function specialsLabel(s: Series): string | undefined {
   } downloaded (not counted toward completion)`;
 }
 
-function PosterCard({ series }: { series: Series }) {
+/** In selection mode (`selected` set) a click picks the card instead of
+ * opening the series; shift-click extends from the last pick. */
+function PosterCard({
+  series,
+  selected,
+  onPick,
+}: {
+  series: Series;
+  selected?: boolean;
+  onPick?: (shift: boolean) => void;
+}) {
   const navigate = useNavigate();
   const pct =
     series.chapter_count > 0 ? (series.downloaded_count / series.chapter_count) * 100 : 0;
+  const selecting = selected !== undefined;
   return (
-    <div className="poster-card" onClick={() => navigate(`/series/${series.id}`)}>
+    <div
+      className={`poster-card${selecting ? " selecting" : ""}${selected ? " selected" : ""}`}
+      onClick={(e) => (onPick ? onPick(e.shiftKey) : navigate(`/series/${series.id}`))}
+      {...(onPick && {
+        role: "checkbox",
+        "aria-checked": selected,
+        "aria-label": series.title,
+        tabIndex: 0,
+        onKeyDown: (e: React.KeyboardEvent) => {
+          if (e.key === " " || e.key === "Enter") {
+            e.preventDefault();
+            onPick(e.shiftKey);
+          }
+        },
+      })}
+    >
+      {selecting && <div className="poster-check" aria-hidden="true">{selected ? "✓" : ""}</div>}
       {series.cover_url ? (
         <img src={series.cover_url} alt={series.title} loading="lazy" />
       ) : (
@@ -87,6 +106,9 @@ function PosterCard({ series }: { series: Series }) {
 export default function Library() {
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<Filters>(loadFilters);
+  // library editor: null when not selecting
+  const [selected, setSelected] = useState<Set<number> | null>(null);
+  const [lastPicked, setLastPicked] = useState<number | null>(null);
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["series"],
     queryFn: () => api.get<Series[]>("/series"),
@@ -103,6 +125,34 @@ export default function Library() {
     ?.filter((s) => matchesFilters(s, filters))
     .filter((s) => !q || matchesQuery(s, q));
   const filtering = q || filters.monitored !== "all" || filters.status !== "all" || filters.content !== "all";
+  // actions only ever touch what's on screen: a series hidden by a filter
+  // after being picked is not silently edited or removed
+  const selectedVisible = selected ? (filtered ?? []).filter((s) => selected.has(s.id)) : [];
+
+  const pick = (id: number, shift: boolean) => {
+    if (!selected || !filtered) return;
+    const next = new Set(selected);
+    const at = filtered.findIndex((s) => s.id === id);
+    const anchor = lastPicked === null ? -1 : filtered.findIndex((s) => s.id === lastPicked);
+    if (shift && anchor >= 0 && at >= 0) {
+      // extend to the anchor's state across the range, like a file manager
+      const on = selected.has(lastPicked!);
+      for (const s of filtered.slice(Math.min(anchor, at), Math.max(anchor, at) + 1)) {
+        if (on) next.add(s.id);
+        else next.delete(s.id);
+      }
+    } else if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    setSelected(next);
+    setLastPicked(id);
+  };
+  const stopSelecting = () => {
+    setSelected(null);
+    setLastPicked(null);
+  };
 
   return (
     <>
@@ -134,6 +184,16 @@ export default function Library() {
             {filtered.length} of {data.length}
           </span>
         )}
+        {data && data.length > 0 && (
+          <button
+            className={`btn${selected ? " active" : ""}`}
+            aria-pressed={selected !== null}
+            title="Select series to edit, refresh, search or remove several at once"
+            onClick={() => (selected ? stopSelecting() : setSelected(new Set()))}
+          >
+            ☑ Select
+          </button>
+        )}
         <Link to="/add" className="btn primary">
           + Add Series
         </Link>
@@ -160,12 +220,33 @@ export default function Library() {
           />
         ) : (
           <div className="poster-grid">
-            {filtered.map((s) => (
-              <PosterCard key={s.id} series={s} />
-            ))}
+            {filtered.map((s) =>
+              selected ? (
+                <PosterCard
+                  key={s.id}
+                  series={s}
+                  selected={selected.has(s.id)}
+                  onPick={(shift) => pick(s.id, shift)}
+                />
+              ) : (
+                <PosterCard key={s.id} series={s} />
+              ),
+            )}
           </div>
         )}
       </div>
+      {selected && (
+        <LibraryEditorBar
+          selected={selectedVisible}
+          visibleCount={filtered?.length ?? 0}
+          onSelectAll={() => setSelected(new Set(filtered?.map((s) => s.id)))}
+          onClear={() => {
+            setSelected(new Set());
+            setLastPicked(null);
+          }}
+          onDone={stopSelecting}
+        />
+      )}
     </>
   );
 }

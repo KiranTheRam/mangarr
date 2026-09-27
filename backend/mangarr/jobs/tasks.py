@@ -644,7 +644,9 @@ async def try_acquire_series_lock(series_id: int) -> asyncio.Lock | None:
     return lock
 
 
-async def refresh_series_full(series_id: int, grab_missing: bool = False) -> None:
+async def refresh_series_full(
+    series_id: int, grab_missing: bool = False, only_monitored: bool = False
+) -> None:
     REFRESHING.add(series_id)
     lock = await acquire_series_lock(series_id)
     try:
@@ -670,7 +672,14 @@ async def refresh_series_full(series_id: int, grab_missing: bool = False) -> Non
                 except Exception as exc:
                     log.warning("library scan failed for series %d: %s", series_id, exc)
             await reconcile_downloaded_files(session, series)
-            if grab_missing:
+            if grab_missing and only_monitored:
+                # an on-demand monitor pass (the library editor's "search
+                # missing"): the series' monitoring mode still decides what is
+                # wanted, so chapters it leaves out stay unwanted
+                await grab_missing_chapters(
+                    session, series, values, chapter_cache=chapter_cache,
+                )
+            elif grab_missing:
                 # explicit one-time search (e.g. "search for missing" at add
                 # time): runs even for unmonitored series, whose chapters carry
                 # monitored=False — the user asked for the missing content now

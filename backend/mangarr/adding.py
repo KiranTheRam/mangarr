@@ -171,11 +171,13 @@ async def create_series(
     return series
 
 
-def start_refreshes(series_ids: list[int], grab_missing: bool = False) -> None:
-    """Link sources and fetch chapters for newly added series in the
-    background. One series refreshes right away (what the Add dialog wants);
-    a batch runs one at a time so importing a whole library doesn't fire
-    hundreds of concurrent searches at every source."""
+def start_refreshes(
+    series_ids: list[int], grab_missing: bool = False, only_monitored: bool = False
+) -> None:
+    """Link sources and fetch chapters for newly added (or bulk-refreshed)
+    series in the background. One series refreshes right away (what the Add
+    dialog wants); a batch runs one at a time so importing a whole library
+    doesn't fire hundreds of concurrent searches at every source."""
     from .jobs.tasks import REFRESHING, refresh_series_full
 
     if not series_ids:
@@ -186,6 +188,8 @@ def start_refreshes(series_ids: list[int], grab_missing: bool = False) -> None:
 
     async def run() -> None:
         for series_id in series_ids:
-            await refresh_series_full(series_id, grab_missing=grab_missing)
+            await refresh_series_full(
+                series_id, grab_missing=grab_missing, only_monitored=only_monitored
+            )
 
     asyncio.get_running_loop().create_task(run())

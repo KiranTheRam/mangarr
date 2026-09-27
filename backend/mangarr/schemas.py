@@ -182,6 +182,43 @@ class SeriesUpdateIn(BaseModel):
     merge_volumes: bool | None = None
 
 
+class SeriesEditorIn(BaseModel):
+    """One change applied to many series at once; None fields are left alone."""
+    series_ids: list[int]
+    monitored: bool | None = None
+    monitor_mode: MonitorMode | None = None
+    monitor_from: float | None = None
+    root_folder_id: int | None = None
+    # with a root folder change: move each series' folder into the new root
+    # (otherwise existing files stay where they are and only new ones land there)
+    move_files: bool = False
+
+
+class SeriesEditorProblemOut(BaseModel):
+    series_id: int
+    title: str
+    detail: str
+
+
+class SeriesEditorOut(BaseModel):
+    updated: int
+    moved: int = 0
+    problems: list[SeriesEditorProblemOut] = []
+
+
+class SeriesBulkIn(BaseModel):
+    series_ids: list[int]
+
+
+class SeriesBulkRefreshIn(SeriesBulkIn):
+    # also queue the missing chapters each series' monitoring wants
+    search_missing: bool = False
+
+
+class SeriesBulkOut(BaseModel):
+    count: int
+
+
 class SeriesGroupOut(BaseModel):
     """A scanlation group a linked source offers for the series."""
     source_name: str

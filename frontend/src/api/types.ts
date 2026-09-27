@@ -74,6 +74,14 @@ export interface Series {
 
 export type MonitorMode = "all" | "missing" | "future" | "from_chapter" | "latest_volume" | "none";
 
+/** Result of a library mass edit; series listed in `problems` kept their
+ * old root folder (the rest of the edit still applied to them). */
+export interface SeriesEditorResult {
+  updated: number;
+  moved: number;
+  problems: { series_id: number; title: string; detail: string }[];
+}
+
 export interface SeriesDetail extends Series {
   chapters: Chapter[];
   source_links: SourceLink[];

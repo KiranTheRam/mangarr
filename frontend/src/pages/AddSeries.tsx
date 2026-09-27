@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { NavLink } from "react-router-dom";
+import { NavLink, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { MetadataResult, RootFolder } from "../api/types";
 import { AddSeriesModal } from "../components/AddSeriesModal";
@@ -32,8 +32,18 @@ export function AddTabs() {
 }
 
 export default function AddSeries() {
-  const [query, setQuery] = useState("");
-  const [submitted, setSubmitted] = useState("");
+  // ?q= starts a search right away (the command palette's "search MangaUpdates")
+  const [params] = useSearchParams();
+  const linkedQuery = params.get("q") ?? "";
+  const [query, setQuery] = useState(linkedQuery);
+  const [submitted, setSubmitted] = useState(linkedQuery.trim());
+  // a new ?q= while already on this page (no remount) replaces the search
+  useEffect(() => {
+    if (linkedQuery) {
+      setQuery(linkedQuery);
+      setSubmitted(linkedQuery.trim());
+    }
+  }, [linkedQuery]);
   const [adding, setAdding] = useState<MetadataResult | null>(null);
 
   const { data: rootFolders, error: foldersError, refetch: retryFolders } = useQuery({

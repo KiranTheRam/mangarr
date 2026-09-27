@@ -1,4 +1,6 @@
+import { useState } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
+import CommandPalette from "./components/CommandPalette";
 import Sidebar from "./components/Sidebar";
 import Library from "./pages/Library";
 import AddSeries from "./pages/AddSeries";
@@ -11,9 +13,11 @@ import Wanted from "./pages/Wanted";
 import Settings from "./pages/Settings";
 
 export default function App() {
+  const [paletteOpen, setPaletteOpen] = useState(false);
   return (
     <div className="app">
-      <Sidebar />
+      <Sidebar onSearch={() => setPaletteOpen(true)} />
+      <CommandPalette open={paletteOpen} setOpen={setPaletteOpen} />
       <div className="main">
         <Routes>
           <Route path="/" element={<Library />} />

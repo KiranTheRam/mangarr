@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Iterable
+from pathlib import Path
 from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,11 +22,14 @@ from ..automation import RESOLVED_MODES, apply_monitor_mode, order_sources
 from ..db import get_session
 from ..jobs.tasks import (
     REFRESHING,
+    _notify_kavita,
     acquire_series_lock,
     merge_complete_volumes,
     refresh_series_full,
+    try_acquire_series_lock,
 )
-from ..models import Chapter, Series
+from ..library.move import MoveError, anchor_extra_folders, move_series_folder
+from ..models import Chapter, Download, DownloadStatus, RootFolder, Series
 from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
     AddSeriesIn,
@@ -34,7 +38,13 @@ from ..schemas import (
     ChapterOut,
     RelatedOut,
     RelatedTitleOut,
+    SeriesBulkIn,
+    SeriesBulkOut,
+    SeriesBulkRefreshIn,
     SeriesDetailOut,
+    SeriesEditorIn,
+    SeriesEditorOut,
+    SeriesEditorProblemOut,
     SeriesGroupOut,
     SeriesOut,
     SeriesUpdateIn,
@@ -94,6 +104,42 @@ def _check_source_names(names: list[str], field: str) -> None:
     unknown = [n for n in names if n not in settings_service.CONTENT_SOURCE_NAMES]
     if unknown:
         raise HTTPException(422, f"{field}: unknown source(s) {', '.join(unknown)}")
+
+
+def _apply_monitoring(
+    series: Series,
+    monitored: bool | None,
+    monitor_mode: str | None,
+    monitor_from: float | None,
+) -> None:
+    """Apply a monitored toggle and/or monitoring mode, re-deriving every
+    chapter's monitored flag when either changes. `series.chapters` must be
+    loaded."""
+    reapply_monitoring = False
+    if monitored is not None and monitored != series.monitored:
+        series.monitored = monitored
+        # monitoring a series means wanting what its mode covers, so the
+        # chapter flags follow the toggle (the next monitor pass grabs every
+        # chapter the mode wants, not just ones added while monitored);
+        # per-chapter toggles can then re-exclude individual chapters
+        reapply_monitoring = True
+    if monitor_mode is not None:
+        if monitor_mode == "from_chapter":
+            threshold = monitor_from if monitor_from is not None else series.monitor_from
+            if threshold is None:
+                raise HTTPException(422, "monitor_from is required for monitor_mode from_chapter")
+            series.monitor_from = threshold
+        elif monitor_mode not in RESOLVED_MODES:
+            series.monitor_from = None
+        # a derived threshold ("future", "latest volume") is re-resolved
+        # against today's chapter list by apply_monitor_mode below
+        series.monitor_mode = monitor_mode
+        reapply_monitoring = True
+    elif monitor_from is not None and series.monitor_mode == "from_chapter":
+        series.monitor_from = monitor_from
+        reapply_monitoring = True
+    if reapply_monitoring:
+        apply_monitor_mode(series, series.chapters)
 
 
 def _clean_lines(names: list[str]) -> str:
@@ -165,6 +211,114 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
     return await get_series(series.id, session)
 
 
+# ---------------------------------------------------------- library editor
+# (declared before the /{series_id} routes, which would otherwise claim
+# "editor" as a series id)
+
+async def _series_in_order(session: AsyncSession, series_ids: list[int], *options) -> list[Series]:
+    """The requested series that exist, in the order they were given."""
+    result = await session.execute(select(Series).options(*options).where(Series.id.in_(series_ids)))
+    by_id = {s.id: s for s in result.scalars().all()}
+    return [by_id[i] for i in dict.fromkeys(series_ids) if i in by_id]
+
+
+async def _change_root_folder(
+    session: AsyncSession, series: Series, new_root: RootFolder, move_files: bool
+) -> bool:
+    """Point the series at another root folder, optionally moving its folder
+    there first. Returns whether files moved; raises MoveError (with nothing
+    changed) when the move can't happen."""
+    if not move_files or series.root_folder is None:
+        if series.root_folder is not None:
+            anchor_extra_folders(series, Path(series.root_folder.path))
+        series.root_folder = new_root
+        return False
+    in_flight = await session.scalar(
+        select(Download.id).where(
+            Download.series_id == series.id,
+            Download.status.in_([
+                DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+            ]),
+        ).limit(1)
+    )
+    if in_flight is not None:
+        # an import would write into the old folder after it moved away
+        raise MoveError("downloads are in progress; move it once they finish")
+    lock = await try_acquire_series_lock(series.id)
+    if lock is None:
+        raise MoveError("the series is refreshing; try again once it finishes")
+    try:
+        old_root = Path(series.root_folder.path)
+        moved = await move_series_folder(series, new_root)
+        anchor_extra_folders(series, old_root)
+        series.root_folder = new_root
+        # commit while still holding the lock, so the next refresh already
+        # sees the files at their new paths
+        await session.commit()
+    finally:
+        lock.release()
+    return moved
+
+
+@router.put("/editor", response_model=SeriesEditorOut)
+async def edit_series_bulk(body: SeriesEditorIn, session: AsyncSession = Depends(get_session)):
+    """Change monitoring and/or the root folder of many series at once.
+    A series that can't be moved is reported and left in its old root folder;
+    the rest of the change still applies to it."""
+    if body.monitor_mode == "from_chapter" and body.monitor_from is None:
+        raise HTTPException(422, "monitor_from is required for monitor_mode from_chapter")
+    new_root = None
+    if body.root_folder_id is not None:
+        new_root = await session.get(RootFolder, body.root_folder_id)
+        if new_root is None:
+            raise HTTPException(404, "Root folder not found")
+    series_list = await _series_in_order(
+        session, body.series_ids,
+        selectinload(Series.chapters), selectinload(Series.extra_folders),
+        selectinload(Series.root_folder),
+    )
+    values = await settings_service.get_all(session) if new_root and body.move_files else {}
+    out = SeriesEditorOut(updated=0)
+    for series in series_list:
+        _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
+        if new_root is not None and series.root_folder_id != new_root.id:
+            try:
+                moved = await _change_root_folder(session, series, new_root, body.move_files)
+            except MoveError as exc:
+                out.problems.append(
+                    SeriesEditorProblemOut(series_id=series.id, title=series.title, detail=str(exc))
+                )
+                continue
+            if moved:
+                out.moved += 1
+                _notify_kavita(values, series)
+        out.updated += 1
+    await session.commit()
+    return out
+
+
+@router.post("/editor/refresh", response_model=SeriesBulkOut, status_code=202)
+async def refresh_series_bulk(
+    body: SeriesBulkRefreshIn, session: AsyncSession = Depends(get_session)
+):
+    """Refresh many series in the background, one at a time; with
+    search_missing, also queue the missing chapters their monitoring wants
+    (an on-demand monitor pass)."""
+    series_ids = [s.id for s in await _series_in_order(session, body.series_ids)]
+    start_refreshes(series_ids, grab_missing=body.search_missing, only_monitored=True)
+    return SeriesBulkOut(count=len(series_ids))
+
+
+@router.post("/editor/delete", response_model=SeriesBulkOut)
+async def delete_series_bulk(body: SeriesBulkIn, session: AsyncSession = Depends(get_session)):
+    """Remove many series from the library. Files on disk are kept."""
+    series_list = await _series_in_order(session, body.series_ids)
+    for series in series_list:
+        await session.delete(series)
+    await session.commit()
+    return SeriesBulkOut(count=len(series_list))
+
+
 @router.get("/{series_id}", response_model=SeriesDetailOut)
 async def get_series(series_id: int, session: AsyncSession = Depends(get_session)):
     result = await session.execute(
@@ -199,31 +353,7 @@ async def update_series(
     series = result.scalar_one_or_none()
     if series is None:
         raise HTTPException(404, "Series not found")
-    reapply_monitoring = False
-    if body.monitored is not None and body.monitored != series.monitored:
-        series.monitored = body.monitored
-        # monitoring a series means wanting what its mode covers, so the
-        # chapter flags follow the toggle (the next monitor pass grabs every
-        # chapter the mode wants, not just ones added while monitored);
-        # per-chapter toggles can then re-exclude individual chapters
-        reapply_monitoring = True
-    if body.monitor_mode is not None:
-        if body.monitor_mode == "from_chapter":
-            threshold = body.monitor_from if body.monitor_from is not None else series.monitor_from
-            if threshold is None:
-                raise HTTPException(422, "monitor_from is required for monitor_mode from_chapter")
-            series.monitor_from = threshold
-        elif body.monitor_mode not in RESOLVED_MODES:
-            series.monitor_from = None
-        # a derived threshold ("future", "latest volume") is re-resolved
-        # against today's chapter list by apply_monitor_mode below
-        series.monitor_mode = body.monitor_mode
-        reapply_monitoring = True
-    elif body.monitor_from is not None and series.monitor_mode == "from_chapter":
-        series.monitor_from = body.monitor_from
-        reapply_monitoring = True
-    if reapply_monitoring:
-        apply_monitor_mode(series, series.chapters)
+    _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
     if body.source_priority is not None:
         _check_source_names(body.source_priority, "source_priority")
         series.source_priority = ",".join(dict.fromkeys(body.source_priority))
