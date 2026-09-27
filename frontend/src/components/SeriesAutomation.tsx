@@ -129,8 +129,10 @@ export function AutomationModal({
       api.put(`/series/${series.id}`, {
         // re-sending the mode re-applies it to every chapter, which resets
         // per-chapter toggles — only do that when it actually changed
-        ...(modeChanged ? { monitor_mode: mode } : {}),
-        ...(mode === "from_chapter" ? { monitor_from: Number(from) } : {}),
+        ...(modeChanged ? {
+          monitor_mode: mode,
+          ...(mode === "from_chapter" ? { monitor_from: Number(from) } : {}),
+        } : {}),
         source_priority: sameOrder(order, globalOrder) ? [] : order,
         blocked_sources: order.filter((name) => blocked.has(name)),
         preferred_groups: linesOf(preferredGroups),

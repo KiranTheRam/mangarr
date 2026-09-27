@@ -182,6 +182,46 @@ async def test_update_series_applies_mode_and_requires_threshold(db_session):
     ]
 
 
+async def test_unchanged_monitor_from_does_not_reset_chapter_toggles(db_session):
+    chapters = [_chapter(1), _chapter(2), _chapter(3)]
+    chapters[0].monitored = False
+    chapters[2].monitored = False
+    series = await _series(
+        db_session,
+        chapters=chapters,
+        monitored=True,
+        monitor_mode="from_chapter",
+        monitor_from=2,
+    )
+    out = await update_series(
+        series.id,
+        SeriesUpdateIn(monitor_from=2, blocked_groups=["Bad Scans"]),
+        db_session,
+    )
+    assert [c.monitored for c in sorted(out.chapters, key=lambda c: c.number)] == [
+        False, True, False,
+    ]
+
+
+async def test_monitored_toggle_preserves_resolved_future_threshold(db_session):
+    chapters = [_chapter(1), _chapter(2), _chapter(3), _chapter(4)]
+    chapters[0].monitored = False
+    chapters[1].monitored = False
+    series = await _series(
+        db_session,
+        chapters=chapters,
+        monitored=True,
+        monitor_mode="future",
+        monitor_from=2,
+    )
+    await update_series(series.id, SeriesUpdateIn(monitored=False), db_session)
+    out = await update_series(series.id, SeriesUpdateIn(monitored=True), db_session)
+    assert out.monitor_from == 2
+    assert [c.monitored for c in sorted(out.chapters, key=lambda c: c.number)] == [
+        False, False, True, True,
+    ]
+
+
 async def test_from_chapter_mode_needs_a_threshold(db_session):
     series = await _series(db_session, chapters=[_chapter(1)])
     with pytest.raises(HTTPException) as err:
@@ -244,6 +284,28 @@ def test_group_selection_prefers_blocks_and_matches_joint_releases():
     picked = automation.select_group_variants(listing, preferred=["gamma"], blocked=["delta"])
     # joint release matches its member; the blocked group's only copy is dropped
     assert [c.external_id for c in picked] == ["1b", "2a"]
+
+
+def test_group_matching_handles_joint_entries_without_overmatching_solo_releases():
+    assert automation.group_is_blocked("Alpha & Beta", ["Alpha"])
+    assert automation.group_is_blocked("Alpha & Beta", ["Alpha & Beta"])
+    assert automation.group_is_blocked("Beta & Alpha", ["Alpha & Beta"])
+    assert not automation.group_is_blocked("Alpha", ["Alpha & Beta"])
+
+
+def test_group_matching_preserves_a_whole_name_containing_ampersand():
+    assert automation.group_is_blocked("Hachi & Co Scans", ["Hachi & Co Scans"])
+
+
+def test_group_preference_rank_uses_the_earliest_matching_joint_entry():
+    listing = [
+        SourceChapter("s", "alpha", 1.0, group="Alpha"),
+        SourceChapter("s", "joint", 1.0, group="Beta & Gamma"),
+    ]
+    picked = automation.select_group_variants(
+        listing, preferred=["Gamma & Beta", "Alpha", "Beta"]
+    )
+    assert [c.external_id for c in picked] == ["joint"]
 
 
 async def test_grab_uses_preferred_group_and_records_it(db_session, monkeypatch):

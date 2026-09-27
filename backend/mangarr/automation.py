@@ -90,12 +90,15 @@ def resolve_monitor_from(series: Series, chapters: Iterable[Chapter]) -> float |
     return series.monitor_from
 
 
-def apply_monitor_mode(series: Series, chapters: Iterable[Chapter]) -> int:
+def apply_monitor_mode(
+    series: Series, chapters: Iterable[Chapter], *, resolve: bool = True,
+) -> int:
     """Rewrite every chapter's monitored flag from the series' mode (explicit
     per-chapter toggles are replaced — applying a mode is a reset). Resolves
-    a derived threshold first. Returns the number of flags changed."""
+    a derived threshold when requested or still unresolved. Returns the number
+    of flags changed."""
     chapters = list(chapters)
-    if series.monitor_mode in RESOLVED_MODES:
+    if series.monitor_mode in RESOLVED_MODES and (resolve or series.monitor_from is None):
         series.monitor_from = resolve_monitor_from(series, chapters)
     changed = 0
     for chapter in chapters:
@@ -136,9 +139,26 @@ def _group_parts(group: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def _group_match_keys(group: str, *, include_parts: bool) -> set[str]:
+    """Comparable forms for a stored group name or a release's group list."""
+    whole = _group_key(group)
+    parts = _group_parts(group)
+    keys = {whole} if whole else set()
+    if parts:
+        keys.add(" & ".join(sorted(parts)))
+    if include_parts:
+        keys.update(parts)
+    return keys
+
+
 def group_is_blocked(group: str, blocked: Iterable[str]) -> bool:
-    blocked_keys = {_group_key(b) for b in blocked}
-    return any(part in blocked_keys for part in _group_parts(group))
+    release_keys = _group_match_keys(group, include_parts=True)
+    blocked_keys = {
+        key
+        for name in blocked
+        for key in _group_match_keys(name, include_parts=False)
+    }
+    return bool(release_keys & blocked_keys)
 
 
 def select_group_variants(
@@ -151,14 +171,21 @@ def select_group_variants(
     preference order, so without preferences the first variant wins (the
     pre-group behaviour). Preferred groups win in the order given; blocked
     groups are dropped even when that leaves a chapter unavailable."""
-    rank = {_group_key(name): i for i, name in enumerate(preferred)}
-    blocked_keys = {_group_key(name) for name in blocked}
+    rank: dict[str, int] = {}
+    for i, name in enumerate(preferred):
+        for key in _group_match_keys(name, include_parts=False):
+            rank.setdefault(key, i)
+    blocked_keys = {
+        key
+        for name in blocked
+        for key in _group_match_keys(name, include_parts=False)
+    }
     best: dict[float, tuple[tuple[int, int], SourceChapter]] = {}
     for index, sc in enumerate(chapters):
-        parts = _group_parts(sc.group)
-        if any(part in blocked_keys for part in parts):
+        release_keys = _group_match_keys(sc.group, include_parts=True)
+        if release_keys & blocked_keys:
             continue
-        group_rank = min((rank[p] for p in parts if p in rank), default=len(rank))
+        group_rank = min((rank[key] for key in release_keys if key in rank), default=len(rank))
         key = (group_rank, index)
         current = best.get(sc.number)
         if current is None or key < current[0]:

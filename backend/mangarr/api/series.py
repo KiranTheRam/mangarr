@@ -135,11 +135,15 @@ def _apply_monitoring(
         # against today's chapter list by apply_monitor_mode below
         series.monitor_mode = monitor_mode
         reapply_monitoring = True
-    elif monitor_from is not None and series.monitor_mode == "from_chapter":
+    elif (
+        monitor_from is not None
+        and series.monitor_mode == "from_chapter"
+        and monitor_from != series.monitor_from
+    ):
         series.monitor_from = monitor_from
         reapply_monitoring = True
     if reapply_monitoring:
-        apply_monitor_mode(series, series.chapters)
+        apply_monitor_mode(series, series.chapters, resolve=monitor_mode is not None)
 
 
 def _clean_lines(names: list[str]) -> str:

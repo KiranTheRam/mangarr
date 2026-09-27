@@ -211,8 +211,12 @@ input[type="checkbox"] {
 }
 
 .series-toolbar {
-  justify-content: flex-end;
+  justify-content: flex-start;
   overflow-x: auto;
+}
+
+.series-toolbar > :first-child {
+  margin-left: auto;
 }
 
 .toolbar-search {
@@ -1507,6 +1511,10 @@ h4.link-text:hover {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
+  }
+
+  .series-toolbar > :first-child {
+    margin-left: 0;
   }
 
   .series-toolbar::-webkit-scrollbar {
