@@ -593,6 +593,9 @@ class LibraryImportItemIn(BaseModel):
     folder_name: str
     provider: Literal["mangaupdates", "anilist"]
     provider_id: int
+    # the entry's titles, so a library series from another provider is
+    # recognised as the same manga
+    title: str = ""
     english_title: str = ""
     alt_titles: list[str] = Field(default_factory=list)
 

@@ -258,6 +258,7 @@ export default function LibraryImport() {
           folder_name: r.folder.name,
           provider: r.choice!.provider,
           provider_id: Number(r.choice!.provider_id),
+          title: r.choice!.title,
           english_title: r.choice!.english_title,
           alt_titles: r.choice!.alt_titles,
         })),

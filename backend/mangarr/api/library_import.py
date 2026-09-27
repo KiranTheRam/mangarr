@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..adding import AddOptions, SeriesExists, create_series, start_refreshes
+from ..adding import AddOptions, LibraryIndex, SeriesExists, create_series, start_refreshes
 from ..db import get_session
 from ..library.matcher import find_media_files
 from ..library.scanner import resolve_folders
@@ -50,13 +50,34 @@ async def _claimed_paths(session: AsyncSession) -> set[Path]:
     return claimed
 
 
+def _dir_identity(path: Path) -> tuple[int, int] | None:
+    """(device, inode) of a directory: one folder reached through a symlink
+    or a second mount point (a container mounting the same share at /manga
+    and /media/manga) is still one folder."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
 def _unclaimed_folders(root: Path, claimed: set[Path]) -> list[ImportFolderOut]:
+    # a folder that is, or holds, a series folder belongs to that series —
+    # so every existing ancestor of a claimed folder counts as taken too
+    taken_paths: set[Path] = set()
+    taken_ids: set[tuple[int, int]] = set()
+    for path in claimed:
+        for p in (path, *path.parents):
+            if p in taken_paths:
+                break
+            taken_paths.add(p)
+            if (identity := _dir_identity(p)) is not None:
+                taken_ids.add(identity)
     out: list[ImportFolderOut] = []
     for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         if not child.is_dir() or child.name.startswith("."):
             continue
-        # a folder that is, or holds, a series folder belongs to that series
-        if any(path == child or child in path.parents for path in claimed):
+        if child in taken_paths or _dir_identity(child) in taken_ids:
             continue
         out.append(ImportFolderOut(
             name=child.name,
@@ -100,6 +121,11 @@ def best_match(query: str, candidates) -> int | None:
     return None
 
 
+def _provider_ids(provider: str, provider_id: int) -> tuple[int | None, int | None]:
+    """(anilist_id, mangaupdates_id) for one provider's id."""
+    return (provider_id, None) if provider == "anilist" else (None, provider_id)
+
+
 @router.get("/match", response_model=ImportMatchOut)
 async def import_match(
     query: str = Query(min_length=1),
@@ -110,6 +136,16 @@ async def import_match(
         candidates = await metadata_results(session, provider, query, limit=8)
     except Exception as exc:
         raise HTTPException(502, f"{provider} search failed: {exc}") from exc
+    # metadata_results only compares this provider's ids; a series added
+    # from the other provider (or never linked to this one) is still the
+    # same manga, and importing its folder would add it twice
+    library = await LibraryIndex.load(session)
+    for cand in candidates:
+        if not cand.in_library and library.find(
+            *_provider_ids(cand.provider, int(cand.provider_id)),
+            titles=[cand.title, cand.english_title, *cand.alt_titles],
+        ) is not None:
+            cand.in_library = True
     return ImportMatchOut(candidates=candidates, best=best_match(query, candidates))
 
 
@@ -122,9 +158,19 @@ async def import_library(body: LibraryImportIn, session: AsyncSession = Depends(
         raise HTTPException(422, "monitor_from is required for monitor_mode from_chapter")
     # a failed row rolls the session back, which expires `root`
     root_id = root.id
+    library = await LibraryIndex.load(session)
     results: list[LibraryImportResultOut] = []
     added: list[int] = []
     for item in body.items:
+        anilist_id, mangaupdates_id = _provider_ids(item.provider, item.provider_id)
+        titles = [item.title, item.english_title, *item.alt_titles]
+        existing = library.find(anilist_id, mangaupdates_id, titles)
+        if existing is not None:
+            results.append(LibraryImportResultOut(
+                folder_name=item.folder_name, status="exists", series_id=existing,
+                detail="already in the library",
+            ))
+            continue
         opts = AddOptions(
             root_folder_id=root_id,
             monitored=body.monitored,
@@ -136,13 +182,10 @@ async def import_library(body: LibraryImportIn, session: AsyncSession = Depends(
             # the user matched this folder to this series on purpose
             folder_pinned=True,
         )
-        ids = (
-            {"anilist_id": item.provider_id}
-            if item.provider == "anilist"
-            else {"mangaupdates_id": item.provider_id}
-        )
         try:
-            series = await create_series(session, opts, **ids)
+            series = await create_series(
+                session, opts, anilist_id=anilist_id, mangaupdates_id=mangaupdates_id
+            )
         except SeriesExists as exc:
             results.append(LibraryImportResultOut(
                 folder_name=item.folder_name, status="exists", series_id=exc.series_id,
@@ -156,6 +199,8 @@ async def import_library(body: LibraryImportIn, session: AsyncSession = Depends(
             ))
             continue
         added.append(series.id)
+        # two folders of one batch matched to the same manga
+        library.add(series.id, anilist_id, mangaupdates_id, [series.title, *titles])
         results.append(LibraryImportResultOut(
             folder_name=item.folder_name, status="added", series_id=series.id,
         ))

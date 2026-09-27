@@ -67,11 +67,16 @@ class LibraryIndex:
     then by any shared normalized title — a series added from MangaUpdates
     has no AniList id, and an AniList-sourced list entry has no MangaUpdates
     id, so ids alone would add the same manga twice. Built once so matching
-    a long list costs one pass over the library, not one per entry."""
+    a long list costs one pass over the library, not one per entry.
+
+    A title match only counts when the ids can't tell the two apart: a
+    library series with a *different* id from the same provider is another
+    manga that happens to share the title."""
 
     def __init__(self) -> None:
         self._by_id: dict[tuple[str, int], int] = {}
-        self._by_title: dict[str, int] = {}
+        # title key → [(series id, anilist id, mangaupdates id)]
+        self._by_title: dict[str, list[tuple[int, int | None, int | None]]] = {}
 
     @classmethod
     async def load(cls, session: AsyncSession) -> "LibraryIndex":
@@ -91,17 +96,21 @@ class LibraryIndex:
         if mangaupdates_id is not None:
             self._by_id[("mangaupdates", mangaupdates_id)] = series_id
         for key in title_keys(titles):
-            self._by_title.setdefault(key, series_id)
+            self._by_title.setdefault(key, []).append((series_id, anilist_id, mangaupdates_id))
 
     def find(self, anilist_id: int | None = None, mangaupdates_id: int | None = None,
              titles: Iterable[str] = ()) -> int | None:
         for provider, pid in (("anilist", anilist_id), ("mangaupdates", mangaupdates_id)):
             if pid is not None and (found := self._by_id.get((provider, pid))) is not None:
                 return found
-        return next(
-            (self._by_title[k] for k in sorted(title_keys(titles)) if k in self._by_title),
-            None,
-        )
+        for key in sorted(title_keys(titles)):
+            for series_id, lib_anilist, lib_mu in self._by_title.get(key, ()):
+                if anilist_id is not None and lib_anilist is not None:
+                    continue  # both on AniList, different entries
+                if mangaupdates_id is not None and lib_mu is not None:
+                    continue  # both on MangaUpdates, different entries
+                return series_id
+        return None
 
 
 async def create_series(
