@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Container version="2">
+  <Name>Mangarr</Name>
+  <Repository>kirantheram/mangarr:latest</Repository>
+  <Registry>https://hub.docker.com/r/kirantheram/mangarr</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/KiranTheRam/mangarr/issues</Support>
+  <Project>https://github.com/KiranTheRam/mangarr</Project>
+  <ReadMe>https://raw.githubusercontent.com/KiranTheRam/mangarr/main/README.md</ReadMe>
+  <Overview>Monitor manga series, download missing chapters, and organize CBZ files for Komga or Kavita.</Overview>
+  <Description>Mangarr manages a manga library, monitors new chapters, downloads from supported direct sources or an optional qBittorrent client, and writes CBZ files with ComicInfo.xml metadata. Configure a root folder in Mangarr after installation. For torrent imports and hardlinks, mount the same host media directory at the same container path in Mangarr and qBittorrent.</Description>
+  <Category>MediaApp:Books Downloaders:</Category>
+  <WebUI>http://[IP]:[PORT:6996]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/KiranTheRam/mangarr/main/templates/mangarr.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/KiranTheRam/mangarr/main/frontend/public/mangarr-icon.png</Icon>
+  <License>GPLv3</License>
+  <Config Name="WebUI Port" Target="6996" Default="6996" Mode="tcp" Description="Mangarr web interface port." Type="Port" Display="always" Required="true" Mask="false"/>
+  <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/mangarr" Mode="rw" Description="Persistent database, API key, and settings." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Media" Target="/media" Default="/mnt/user/media" Mode="rw" Description="Shared media folder. Use /media/manga as a root folder and /media/torrents as the downloads folder." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Manga Library" Target="/manga" Default="/mnt/user/media/manga" Mode="rw" Description="Bind the image-declared /manga volume to the same manga library folder." Type="Path" Display="advanced" Required="true" Mask="false"/>
+</Container>
