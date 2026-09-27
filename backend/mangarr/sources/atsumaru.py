@@ -6,9 +6,9 @@ title search, ``/api/manga/info`` for the full chapter list, and
 
 A title usually carries several scanlation groups, each publishing its own
 copy of a chapter. The site ranks those groups by community score
-(``/api/manga/page``); for every chapter number we take the copy from the
-best-ranked group that actually has pages. Search also indexes web novels,
-whose chapters have no images, so only comics are returned.
+(``/api/manga/page``); every copy with pages is listed, best-ranked group
+first, and the series' group preferences pick one. Search also indexes web
+novels, whose chapters have no images, so only comics are returned.
 
 Pages are WebP for older uploads and AVIF for recent ones; both are kept as
 served (Kavita and Komga read them directly).
@@ -93,30 +93,35 @@ class AtsumaruSource(DirectSource):
             )
         return results
 
-    async def _group_rank(self, manga_id: str) -> dict[str, int]:
-        """scanlation group id → rank (0 = the community's preferred group)."""
+    async def _groups(self, manga_id: str) -> dict[str, tuple[int, str]]:
+        """scanlation group id → (rank, name); rank 0 is the community's
+        preferred group."""
         page = (await self._get("/api/manga/page", params={"id": manga_id})).get("mangaPage") or {}
         groups = [g for g in page.get("scanlators") or [] if isinstance(g, dict) and g.get("id")]
         # stable sort keeps the site's own order between equally scored groups
         groups.sort(key=lambda g: -(g.get("score") or 0))
-        return {g["id"]: rank for rank, g in enumerate(groups)}
+        return {
+            g["id"]: (rank, str(g.get("name") or "").strip())
+            for rank, g in enumerate(groups)
+        }
 
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:
-        rank = await self._group_rank(external_id)
+        groups = await self._groups(external_id)
         info = await self._get("/api/manga/info", params={"mangaId": external_id})
-        best: dict[float, tuple[int, dict]] = {}
-        for item in info.get("chapters") or []:
+        copies: list[tuple[float, int, int, dict]] = []
+        for index, item in enumerate(info.get("chapters") or []):
             if not isinstance(item, dict) or not item.get("id") or not item.get("pageCount"):
                 continue
             try:
                 number = float(item["number"])
             except (KeyError, TypeError, ValueError):
                 continue
-            group_rank = rank.get(item.get("scanId"), len(rank))
-            if number not in best or group_rank < best[number][0]:
-                best[number] = (group_rank, item)
+            group_rank = groups.get(item.get("scanId"), (len(groups), ""))[0]
+            copies.append((number, group_rank, index, item))
+        # every group's copy, best-ranked first within each chapter number
+        copies.sort(key=lambda copy: copy[:3])
         chapters = []
-        for number, (_, item) in best.items():
+        for number, _, _, item in copies:
             title = str(item.get("title") or "").strip()
             chapters.append(
                 SourceChapter(
@@ -126,9 +131,10 @@ class AtsumaruSource(DirectSource):
                     number=number,
                     title="" if _GENERIC_TITLE.match(title) else title,
                     url=f"{SITE_URL}/read/{external_id}/{item['id']}",
+                    group=groups.get(item.get("scanId"), (0, ""))[1],
                 )
             )
-        return sorted(chapters, key=lambda chapter: chapter.number)
+        return chapters
 
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         manga_id, _, chapter_id = chapter_external_id.partition("|")

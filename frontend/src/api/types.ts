@@ -37,6 +37,9 @@ export interface Chapter {
   downloaded: boolean;
   file_path: string;
   available_sources: string | null;
+  // where mangarr got the file ("" = adopted from disk) and its scanlation group
+  file_source: string;
+  file_group: string;
 }
 
 export interface Series {
@@ -65,12 +68,32 @@ export interface Series {
   // decimal chapters (60.5 …), tracked and searched but never blocking completion
   special_count: number;
   special_downloaded_count: number;
+  monitor_mode: MonitorMode;
+  monitor_from: number | null;
 }
+
+export type MonitorMode = "all" | "missing" | "future" | "from_chapter" | "latest_volume" | "none";
 
 export interface SeriesDetail extends Series {
   chapters: Chapter[];
   source_links: SourceLink[];
   refreshing: boolean;
+  source_priority: string[];
+  blocked_sources: string[];
+  preferred_groups: string[];
+  blocked_groups: string[];
+  upgrades_enabled: boolean;
+  upgrade_cutoff: string;
+  merge_volumes: boolean;
+  // enabled download sources: global order, and the order grabs use here
+  global_source_order: string[];
+  effective_source_order: string[];
+}
+
+export interface SeriesGroup {
+  source_name: string;
+  group: string;
+  chapters: number;
 }
 
 export interface MetadataResult {
@@ -104,6 +127,7 @@ export interface Release {
   chapter_id: number | null;
   chapter_number: number | null;
   external_id: string;
+  group: string;
   url: string;
   magnet: string;
   size_bytes: number;

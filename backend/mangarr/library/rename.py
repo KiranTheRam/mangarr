@@ -137,7 +137,10 @@ def apply_renames(items: list[RenameItem], chapter_by_id: dict[int, Chapter]) ->
         for cid in item.chapter_ids:
             ch = chapter_by_id.get(cid)
             if ch is not None:
+                # same file under a new name: its recorded origin still holds
+                source, group = ch.file_source, ch.file_group
                 ch.file_path = str(dst)
+                ch.file_source, ch.file_group = source, group
         log.info("Renamed %s -> %s", src.name, dst.name)
         outcomes.append(RenameOutcome(item, "renamed"))
     return outcomes

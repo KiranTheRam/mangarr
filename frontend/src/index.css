@@ -54,7 +54,8 @@ button {
 }
 
 input,
-select {
+select,
+textarea {
   font: inherit;
   background: var(--bg);
   color: var(--text);
@@ -65,7 +66,8 @@ select {
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: var(--accent);
 }
 
@@ -780,9 +782,65 @@ table.data-table {
 
 .form-row input[type="text"],
 .form-row input[type="password"],
-.form-row select {
+.form-row select,
+.form-row textarea {
   flex: 1;
   max-width: 380px;
+}
+
+.form-row.top {
+  align-items: flex-start;
+}
+
+.form-row.top label {
+  padding-top: 8px;
+}
+
+.form-row textarea {
+  resize: vertical;
+  min-height: 64px;
+}
+
+.form-hint {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  margin: -4px 0 12px;
+}
+
+.form-hint.warn {
+  color: var(--warning);
+}
+
+/* ---------- series automation dialog ---------- */
+
+.automation-section {
+  padding-bottom: 16px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.automation-section h4 {
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 10px;
+}
+
+.automation-section .form-hint {
+  margin-top: 0;
+}
+
+.automation-inline-btn {
+  margin-top: 10px;
+}
+
+.group-table {
+  margin-top: 10px;
+}
+
+.group-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
 }
 
 .toggle {
@@ -1296,7 +1354,8 @@ h4.link-text:hover {
 
   /* 16px inputs stop iOS Safari from zooming the page on focus */
   input,
-  select {
+  select,
+  textarea {
     font-size: 16px;
     min-height: 42px;
   }
@@ -1867,10 +1926,15 @@ h4.link-text:hover {
   }
 
   .form-row input:not([type="checkbox"]):not([type="radio"]),
-  .form-row select {
+  .form-row select,
+  .form-row textarea {
     flex: 1 1 auto;
     width: 100%;
     max-width: none;
+  }
+
+  .form-row.top label {
+    padding-top: 0;
   }
 
   .settings-section {

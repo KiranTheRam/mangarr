@@ -134,5 +134,8 @@ export const statusPill: Record<string, string> = {
   failed: "red",
   grabbed: "blue",
   imported: "green",
+  upgraded: "green",
+  merged: "green",
+  unmonitored: "gray",
   deleted: "red",
 };

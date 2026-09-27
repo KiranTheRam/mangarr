@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..automation import select_for_series
 from ..db import get_session
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
@@ -179,6 +180,10 @@ async def search_releases(
                 source_chapters = await src.list_chapters(external_id)
             except Exception:
                 continue
+            if selected is None:
+                # the open-ended search shows the release a grab would take;
+                # a scoped one lists every group's copy to choose from
+                source_chapters = select_for_series(source_chapters, series)
             added_for_source = 0
             for sc in source_chapters:
                 if (src.name, sc.external_id) in direct_seen:
@@ -199,10 +204,12 @@ async def search_releases(
                         kind="direct",
                         source_name=src.name,
                         title=f"{series.title} - Chapter {sc.number:g}"
-                              + (f" - {sc.title}" if sc.title else ""),
+                              + (f" - {sc.title}" if sc.title else "")
+                              + (f" [{sc.group}]" if sc.group else ""),
                         chapter_id=local_chapter.id,
                         chapter_number=sc.number,
                         external_id=sc.external_id,
+                        group=sc.group,
                         url=sc.url,
                     )
                 )
@@ -213,8 +220,12 @@ async def search_releases(
                     break
         return out
 
+    # the series' own source order first; sources it blocks from automatic
+    # grabs still answer a manual search, last
+    ordered = registry.series_direct_sources(values, series)
+    ordered += [src for src in registry.enabled_direct_sources(values) if src not in ordered]
     direct_parts = await _gather_limited(
-        registry.enabled_direct_sources(values),
+        ordered,
         DIRECT_SEARCH_CONCURRENCY,
         direct_releases_for_source,
     )

@@ -69,6 +69,16 @@ def enabled_direct_sources(values: dict[str, str]) -> list[DirectSource]:
     return sources
 
 
+def series_direct_sources(values: dict[str, str], series) -> list[DirectSource]:
+    """Enabled direct sources in the order grabs try them for one series: its
+    own priority override first, then the global order, minus the sources it
+    blocks."""
+    from ..automation import order_sources
+
+    by_name = {src.name: src for src in enabled_direct_sources(values)}
+    return [by_name[name] for name in order_sources(list(by_name), series)]
+
+
 def enabled_torrent_indexers(values: dict[str, str]) -> list[TorrentIndexer]:
     return [
         idx

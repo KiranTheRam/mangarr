@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
-import type { FolderPreview, MetadataResult, RootFolder } from "../api/types";
+import type { FolderPreview, MetadataResult, MonitorMode, RootFolder } from "../api/types";
 import { FolderBrowser } from "../components/FolderBrowser";
+import { MonitorModeFields } from "../components/SeriesAutomation";
 import { EmptyState, ErrorNotice, Modal, Spinner, Toggle, Toolbar, statusPill } from "../components/common";
 import { sanitizeDescription } from "../sanitize";
 
@@ -21,6 +22,8 @@ function AddSeriesModal({
 
   const [rootFolderId, setRootFolderId] = useState<number>(rootFolders[0].id);
   const [monitored, setMonitored] = useState(true);
+  const [monitorMode, setMonitorMode] = useState<MonitorMode>("all");
+  const [monitorFrom, setMonitorFrom] = useState("");
   const [searchNow, setSearchNow] = useState(false);
   const [folderName, setFolderName] = useState("");
   const [folderTouched, setFolderTouched] = useState(false);
@@ -49,6 +52,8 @@ function AddSeriesModal({
           Number(result.provider_id),
         root_folder_id: rootFolderId,
         monitored,
+        monitor_mode: monitorMode,
+        ...(monitorMode === "from_chapter" ? { monitor_from: Number(monitorFrom) } : {}),
         search_now: searchNow,
         english_title: result.english_title,
         alt_titles: result.alt_titles,
@@ -181,6 +186,14 @@ function AddSeriesModal({
           Grab new chapters automatically at each monitor interval
         </span>
       </div>
+      {monitored && (
+        <MonitorModeFields
+          mode={monitorMode}
+          from={monitorFrom}
+          onMode={setMonitorMode}
+          onFrom={setMonitorFrom}
+        />
+      )}
 
       <div className="form-row">
         <label>Search for missing content</label>
@@ -200,7 +213,11 @@ function AddSeriesModal({
         </button>
         <button
           className="btn primary"
-          disabled={addMutation.isPending}
+          disabled={
+            addMutation.isPending ||
+            (monitored && monitorMode === "from_chapter" &&
+              (monitorFrom.trim() === "" || !Number.isFinite(Number(monitorFrom))))
+          }
           onClick={() => addMutation.mutate()}
         >
           {addMutation.isPending ? "Adding…" : `Add ${result.english_title || result.title}`}

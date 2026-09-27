@@ -143,7 +143,7 @@ class MangaDexSource(DirectSource):
         return results
 
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:
-        chapters: dict[float, SourceChapter] = {}
+        chapters: list[SourceChapter] = []
         offset = 0
         while True:
             data = await self._get(
@@ -155,6 +155,7 @@ class MangaDexSource(DirectSource):
                     "order[chapter]": "asc",
                     "contentRating[]": ["safe", "suggestive", "erotica"],
                     "includeExternalUrl": 0,  # skip chapters hosted off-site (unfetchable)
+                    "includes[]": ["scanlation_group"],
                 },
             )
             for ch in data.get("data", []):
@@ -173,22 +174,24 @@ class MangaDexSource(DirectSource):
                     volume = int(float(vol_raw)) if vol_raw else None
                 except ValueError:
                     volume = None
-                # First scanlation group wins per chapter number (feed is ordered)
-                if number not in chapters:
-                    chapters[number] = SourceChapter(
-                        source_name=self.name,
-                        external_id=ch["id"],
-                        number=number,
-                        volume=volume,
-                        title=attrs.get("title") or "",
-                        language=self._language,
-                        url=f"https://mangadex.org/chapter/{ch['id']}",
-                    )
+                # every group's copy is kept, in feed order (the first one
+                # is the default pick when the series prefers no group)
+                chapters.append(SourceChapter(
+                    source_name=self.name,
+                    external_id=ch["id"],
+                    number=number,
+                    volume=volume,
+                    title=attrs.get("title") or "",
+                    language=self._language,
+                    url=f"https://mangadex.org/chapter/{ch['id']}",
+                    group=_group_names(ch),
+                ))
             total = data.get("total", 0)
             offset += 500
             if offset >= total:
                 break
-        return sorted(chapters.values(), key=lambda c: c.number)
+        # stable: copies of one chapter keep their feed order
+        return sorted(chapters, key=lambda c: c.number)
 
     async def get_volume_map(self, external_id: str) -> dict[float, int]:
         """Volume assignments from the aggregate endpoint, across all
@@ -225,6 +228,17 @@ class MangaDexSource(DirectSource):
         chapter = data["chapter"]
         chapter_hash = chapter["hash"]
         return [f"{base}/data/{chapter_hash}/{page}" for page in chapter["data"]]
+
+
+def _group_names(chapter: dict) -> str:
+    """Scanlation group names from a feed entry's expanded relationships;
+    a joint release lists each group."""
+    names = [
+        ((rel.get("attributes") or {}).get("name") or "").strip()
+        for rel in chapter.get("relationships") or []
+        if isinstance(rel, dict) and rel.get("type") == "scanlation_group"
+    ]
+    return " & ".join(name for name in names if name)
 
 
 source = MangaDexSource()

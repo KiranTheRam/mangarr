@@ -15,7 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
 
 def utcnow() -> datetime:
@@ -74,6 +74,28 @@ class Series(Base):
     # when provider metadata (status, totals, …) was last pulled; the monitor
     # re-refreshes stale series so finished/hiatus states don't rot
     metadata_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # which chapters monitoring covers — see mangarr.automation.MONITOR_MODES.
+    # monitor_from is the chapter-number threshold of the threshold modes;
+    # None for "future"/"latest_volume" means not resolved yet (no chapters)
+    monitor_mode: Mapped[str] = mapped_column(String, default="all")
+    monitor_from: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # per-series grab order: comma-separated source names tried first (the
+    # global order fills in the rest); blocked sources are never grabbed from
+    source_priority: Mapped[str] = mapped_column(Text, default="")
+    blocked_sources: Mapped[str] = mapped_column(Text, default="")
+    # scanlation groups, newline-separated (names may contain commas)
+    preferred_groups: Mapped[str] = mapped_column(Text, default="")
+    blocked_groups: Mapped[str] = mapped_column(Text, default="")
+    # replace mangarr-downloaded chapters when a higher-priority source has
+    # them, until the file comes from upgrade_cutoff (empty = the top source)
+    upgrades_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    upgrade_cutoff: Mapped[str] = mapped_column(String, default="")
+    # pack each complete volume's chapter files into one volume archive
+    merge_volumes: Mapped[bool] = mapped_column(Boolean, default=False)
+    # last scheduled monitor pass; finished, complete series are checked less
+    last_monitored_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -149,8 +171,26 @@ class Chapter(Base):
     available_sources: Mapped[str | None] = mapped_column(
         String, nullable=True, default=None
     )
+    # Provenance of the file at file_path: the direct source (or "nyaa") that
+    # mangarr fetched it from, and the scanlation group when known. Empty for
+    # files adopted from disk, which upgrades and volume merges never touch.
+    file_source: Mapped[str] = mapped_column(String, default="")
+    file_group: Mapped[str] = mapped_column(String, default="")
 
     series: Mapped[Series] = relationship(back_populates="chapters")
+
+    @validates("file_path")
+    def _forget_provenance_of_replaced_file(self, _key: str, value: str) -> str:
+        # provenance describes one file; pointing the chapter at another file
+        # (a scan adoption, a manual map, a cleanup repoint) must not let the
+        # new file inherit it. Writers that keep the same file (rename) or
+        # that know the new file's origin set the fields again afterwards.
+        # read the loaded value directly: attribute access on an expired
+        # instance would lazy-load, which an async session cannot do here
+        if value != self.__dict__.get("file_path"):
+            self.file_source = ""
+            self.file_group = ""
+        return value
 
 
 class DownloadKind(str, enum.Enum):
@@ -182,6 +222,8 @@ class Download(Base):
     title: Mapped[str] = mapped_column(String, default="")  # human-readable release title
     source_name: Mapped[str] = mapped_column(String, default="")
     payload: Mapped[str] = mapped_column(Text, default="")  # source-specific: chapter external id / magnet
+    # scanlation group of the grabbed release, when the source reports one
+    release_group: Mapped[str] = mapped_column(String, default="")
     torrent_hash: Mapped[str] = mapped_column(String, default="")
     progress: Mapped[float] = mapped_column(Float, default=0.0)  # 0..1
     error: Mapped[str] = mapped_column(Text, default="")

@@ -9,6 +9,7 @@ import type {
 } from "../api/types";
 import { FolderBrowser } from "../components/FolderBrowser";
 import { ErrorNotice, Spinner, Toggle, Toolbar } from "../components/common";
+import { SOURCE_LABELS } from "../sources";
 
 function RootFolders() {
   const queryClient = useQueryClient();
@@ -157,20 +158,6 @@ function ApiKeys() {
     </div>
   );
 }
-
-const SOURCE_LABELS: Record<string, string> = {
-  mangaplus: "MangaPlus",
-  webtoons: "WEBTOON",
-  tcbscans: "TCB Scans",
-  mangadex: "MangaDex",
-  mangafire: "MangaFire",
-  weebcentral: "WeebCentral",
-  atsumaru: "Atsumaru",
-  asura: "Asura Scans",
-  viz: "VIZ (official metadata)",
-  wikipedia: "Wikipedia (metadata)",
-  nyaa: "Nyaa (torrents)",
-};
 
 const SOURCE_HINTS: Record<string, string> = {
   mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
@@ -628,6 +615,23 @@ export default function Settings() {
             <label>Monitor interval (minutes)</label>
             {text("monitor_interval_minutes")}
           </div>
+          <div className="form-row">
+            <label>Finished series</label>
+            <select value={form.finished_series_mode ?? "slow"} onChange={set("finished_series_mode")}>
+              <option value="keep">Keep checking every pass</option>
+              <option value="slow">Check less often</option>
+              <option value="unmonitor">Unmonitor</option>
+            </select>
+          </div>
+          {(form.finished_series_mode ?? "slow") === "slow" && (
+            <div className="form-row">
+              <label>Check finished series every (days)</label>
+              {text("finished_series_check_days")}
+            </div>
+          )}
+          <p className="section-hint">
+            Applies once a series is finished or cancelled and every monitored chapter is on disk.
+          </p>
         </div>
 
         <div className="settings-section">

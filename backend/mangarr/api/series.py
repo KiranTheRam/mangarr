@@ -4,12 +4,18 @@ from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import Integer, case, cast, func, select
-from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from .. import settings_service
+from ..automation import RESOLVED_MODES, apply_monitor_mode, order_sources
 from ..db import get_session
-from ..jobs.tasks import REFRESHING, refresh_series_full
+from ..jobs.tasks import (
+    REFRESHING,
+    acquire_series_lock,
+    merge_complete_volumes,
+    refresh_series_full,
+)
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
 from ..models import Chapter, Series, SeriesFolder, SeriesStatus
@@ -19,9 +25,12 @@ from ..schemas import (
     ChapterMonitorIn,
     ChapterOut,
     SeriesDetailOut,
+    SeriesGroupOut,
     SeriesOut,
     SeriesUpdateIn,
+    VolumeMergeOut,
 )
+from ..sources import registry
 from ..titles import english_title, split_alt_titles, unique_titles
 from ..util import is_special_chapter, sanitize_filename
 
@@ -60,6 +69,31 @@ def _series_out(series: Series, counts: _Counts) -> SeriesOut:
     out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
     _apply_counts(out, counts)
     return out
+
+
+def _content_source_names(values: dict[str, str]) -> list[str]:
+    """Enabled sources that can serve chapters, in global priority order
+    (metadata-only sources such as VIZ are never grabbed from)."""
+    return [
+        src.name for src in registry.enabled_direct_sources(values)
+        if src.name in settings_service.CONTENT_SOURCE_NAMES
+    ]
+
+
+def _check_source_names(names: list[str], field: str) -> None:
+    unknown = [n for n in names if n not in settings_service.CONTENT_SOURCE_NAMES]
+    if unknown:
+        raise HTTPException(422, f"{field}: unknown source(s) {', '.join(unknown)}")
+
+
+def _clean_lines(names: list[str]) -> str:
+    """Join group names one per line, dropping blanks and repeats."""
+    out: list[str] = []
+    for name in names:
+        name = " ".join(name.split())
+        if name and name not in out:
+            out.append(name)
+    return "\n".join(out)
 
 
 async def _normalize_folder_name(session: AsyncSession, series: Series, folder_name: str) -> str:
@@ -111,6 +145,8 @@ async def list_series(session: AsyncSession = Depends(get_session)):
 async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_session)):
     if (body.mangaupdates_id is None) == (body.anilist_id is None):
         raise HTTPException(422, "Provide exactly one of mangaupdates_id or anilist_id")
+    if body.monitor_mode == "from_chapter" and body.monitor_from is None:
+        raise HTTPException(422, "monitor_from is required for monitor_mode from_chapter")
     if body.mangaupdates_id is not None:
         id_filter = Series.mangaupdates_id == body.mangaupdates_id
         provider, provider_id = mangaupdates, body.mangaupdates_id
@@ -139,6 +175,8 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
         total_chapters=meta.total_chapters,
         total_volumes=meta.total_volumes,
         monitored=body.monitored,
+        monitor_mode=body.monitor_mode,
+        monitor_from=body.monitor_from if body.monitor_mode == "from_chapter" else None,
         root_folder_id=body.root_folder_id,
         folder_name=sanitize_filename(meta.title),
         folder_pinned=body.folder_pinned,
@@ -178,6 +216,8 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
     _apply_counts(out, _count_chapters(series.chapters))
     out.refreshing = series_id in REFRESHING
+    out.global_source_order = _content_source_names(await settings_service.get_all(session))
+    out.effective_source_order = order_sources(out.global_source_order, series)
     return out
 
 
@@ -185,20 +225,55 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
 async def update_series(
     series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
 ):
-    series = await session.get(Series, series_id)
+    result = await session.execute(
+        select(Series).options(selectinload(Series.chapters)).where(Series.id == series_id)
+    )
+    series = result.scalar_one_or_none()
     if series is None:
         raise HTTPException(404, "Series not found")
+    reapply_monitoring = False
     if body.monitored is not None and body.monitored != series.monitored:
         series.monitored = body.monitored
-        # monitoring a series means wanting all of its missing content, so the
+        # monitoring a series means wanting what its mode covers, so the
         # chapter flags follow the toggle (the next monitor pass grabs every
-        # missing chapter, not just ones added while monitored); per-chapter
-        # toggles can then re-exclude individual chapters
-        await session.execute(
-            sa_update(Chapter)
-            .where(Chapter.series_id == series_id)
-            .values(monitored=body.monitored)
-        )
+        # chapter the mode wants, not just ones added while monitored);
+        # per-chapter toggles can then re-exclude individual chapters
+        reapply_monitoring = True
+    if body.monitor_mode is not None:
+        if body.monitor_mode == "from_chapter":
+            threshold = body.monitor_from if body.monitor_from is not None else series.monitor_from
+            if threshold is None:
+                raise HTTPException(422, "monitor_from is required for monitor_mode from_chapter")
+            series.monitor_from = threshold
+        elif body.monitor_mode not in RESOLVED_MODES:
+            series.monitor_from = None
+        # a derived threshold ("future", "latest volume") is re-resolved
+        # against today's chapter list by apply_monitor_mode below
+        series.monitor_mode = body.monitor_mode
+        reapply_monitoring = True
+    elif body.monitor_from is not None and series.monitor_mode == "from_chapter":
+        series.monitor_from = body.monitor_from
+        reapply_monitoring = True
+    if reapply_monitoring:
+        apply_monitor_mode(series, series.chapters)
+    if body.source_priority is not None:
+        _check_source_names(body.source_priority, "source_priority")
+        series.source_priority = ",".join(dict.fromkeys(body.source_priority))
+    if body.blocked_sources is not None:
+        _check_source_names(body.blocked_sources, "blocked_sources")
+        series.blocked_sources = ",".join(dict.fromkeys(body.blocked_sources))
+    if body.preferred_groups is not None:
+        series.preferred_groups = _clean_lines(body.preferred_groups)
+    if body.blocked_groups is not None:
+        series.blocked_groups = _clean_lines(body.blocked_groups)
+    if body.upgrades_enabled is not None:
+        series.upgrades_enabled = body.upgrades_enabled
+    if body.upgrade_cutoff is not None:
+        if body.upgrade_cutoff:
+            _check_source_names([body.upgrade_cutoff], "upgrade_cutoff")
+        series.upgrade_cutoff = body.upgrade_cutoff
+    if body.merge_volumes is not None:
+        series.merge_volumes = body.merge_volumes
     if body.root_folder_id is not None:
         series.root_folder_id = body.root_folder_id
     if body.folder_name is not None:
@@ -277,3 +352,55 @@ async def update_chapter_metadata(
     await session.commit()
     await session.refresh(chapter)
     return chapter
+
+
+@router.get("/{series_id}/groups", response_model=list[SeriesGroupOut])
+async def list_series_groups(series_id: int, session: AsyncSession = Depends(get_session)):
+    """Scanlation groups the series' linked sources offer, with how many
+    chapters each covers — the choices for preferred/blocked groups. Asks
+    the sources live, so it is only fetched on demand."""
+    result = await session.execute(
+        select(Series).options(selectinload(Series.source_links)).where(Series.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if series is None:
+        raise HTTPException(404, "Series not found")
+    values = await registry.apply_settings(session)
+    links = {sl.source_name: sl for sl in series.source_links}
+    sources = [src for src in registry.enabled_direct_sources(values) if src.name in links]
+
+    async def groups_of(src) -> list[SeriesGroupOut]:
+        chapters = await src.list_chapters(links[src.name].external_id)
+        numbers: dict[str, set[float]] = {}
+        for sc in chapters:
+            if sc.group:
+                numbers.setdefault(sc.group, set()).add(sc.number)
+        return [
+            SeriesGroupOut(source_name=src.name, group=group, chapters=len(covered))
+            for group, covered in sorted(numbers.items(), key=lambda kv: -len(kv[1]))
+        ]
+
+    listings = await asyncio.gather(*(groups_of(src) for src in sources), return_exceptions=True)
+    out: list[SeriesGroupOut] = []
+    for listing in listings:
+        if not isinstance(listing, BaseException):
+            out.extend(listing)
+    return out
+
+
+@router.post("/{series_id}/volumes/merge", response_model=VolumeMergeOut)
+async def merge_volumes_now(series_id: int, session: AsyncSession = Depends(get_session)):
+    """Pack every closed, fully downloaded volume into one archive now,
+    whether or not the series merges automatically."""
+    from ..jobs.tasks import _load_series
+
+    lock = await acquire_series_lock(series_id)
+    try:
+        series = await _load_series(session, series_id)
+        if series is None:
+            raise HTTPException(404, "Series not found")
+        values = await settings_service.get_all(session)
+        merged = await merge_complete_volumes(session, series, values, force=True)
+    finally:
+        lock.release()
+    return VolumeMergeOut(merged=merged)

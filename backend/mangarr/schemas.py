@@ -1,6 +1,26 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+MonitorMode = Literal["all", "missing", "future", "from_chapter", "latest_volume", "none"]
+
+
+def _names(value):
+    """Stored comma/newline-joined name lists are served as lists."""
+    if isinstance(value, str):
+        from .automation import split_names
+
+        return split_names(value)
+    return value or []
+
+
+def _lines(value):
+    if isinstance(value, str):
+        from .automation import split_lines
+
+        return split_lines(value)
+    return value or []
 
 
 class RootFolderOut(BaseModel):
@@ -37,6 +57,8 @@ class ChapterOut(BaseModel):
     downloaded: bool
     file_path: str
     available_sources: str | None
+    file_source: str = ""
+    file_group: str = ""
 
 
 class SeriesOut(BaseModel):
@@ -67,12 +89,35 @@ class SeriesOut(BaseModel):
     # from the counts above so a missing special never blocks completion
     special_count: int = 0
     special_downloaded_count: int = 0
+    monitor_mode: str = "all"
+    monitor_from: float | None = None
 
 
 class SeriesDetailOut(SeriesOut):
     chapters: list[ChapterOut] = []
     source_links: list[SourceLinkOut] = []
     refreshing: bool = False  # a full refresh is running in the background
+    source_priority: list[str] = []
+    blocked_sources: list[str] = []
+    preferred_groups: list[str] = []
+    blocked_groups: list[str] = []
+    upgrades_enabled: bool = False
+    upgrade_cutoff: str = ""
+    merge_volumes: bool = False
+    # enabled download sources in global priority order, and in the order
+    # grabs try them for this series (override applied, blocked removed)
+    global_source_order: list[str] = []
+    effective_source_order: list[str] = []
+
+    @field_validator("source_priority", "blocked_sources", mode="before")
+    @classmethod
+    def _split_sources(cls, value):
+        return _names(value)
+
+    @field_validator("preferred_groups", "blocked_groups", mode="before")
+    @classmethod
+    def _split_groups(cls, value):
+        return _lines(value)
 
 
 class AddSeriesIn(BaseModel):
@@ -81,6 +126,9 @@ class AddSeriesIn(BaseModel):
     anilist_id: int | None = None
     root_folder_id: int
     monitored: bool = True
+    monitor_mode: MonitorMode = "all"
+    # first monitored chapter for monitor_mode="from_chapter"
+    monitor_from: float | None = None
     search_now: bool = False
     english_title: str = ""
     alt_titles: list[str] = Field(default_factory=list)
@@ -116,6 +164,28 @@ class SeriesUpdateIn(BaseModel):
     # None + a folder_name update pins implicitly (an explicit folder edit is
     # an explicit choice); pass False to re-enable folder adoption
     folder_pinned: bool | None = None
+    # setting a mode re-applies it to every chapter
+    monitor_mode: MonitorMode | None = None
+    monitor_from: float | None = None
+    # [] restores the global order / unblocks everything
+    source_priority: list[str] | None = None
+    blocked_sources: list[str] | None = None
+    preferred_groups: list[str] | None = None
+    blocked_groups: list[str] | None = None
+    upgrades_enabled: bool | None = None
+    upgrade_cutoff: str | None = None
+    merge_volumes: bool | None = None
+
+
+class SeriesGroupOut(BaseModel):
+    """A scanlation group a linked source offers for the series."""
+    source_name: str
+    group: str
+    chapters: int
+
+
+class VolumeMergeOut(BaseModel):
+    merged: list[int]
 
 
 class ChapterMonitorIn(BaseModel):
@@ -156,6 +226,7 @@ class ReleaseOut(BaseModel):
     chapter_id: int | None = None
     chapter_number: float | None = None
     external_id: str = ""  # direct: source chapter id
+    group: str = ""  # direct: scanlation group, when the source says
     url: str = ""
     magnet: str = ""
     size_bytes: int = 0
@@ -168,6 +239,7 @@ class GrabIn(BaseModel):
     chapter_id: int | None = None
     source_name: str | None = None
     external_id: str | None = None
+    group: str = ""
     # torrent grab
     series_id: int | None = None
     magnet: str | None = None
