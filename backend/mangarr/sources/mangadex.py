@@ -118,6 +118,27 @@ class MangaDexSource(DirectSource):
                     alts.append(value)
         return title, alts
 
+    async def library_manga(self, statuses: list[str]) -> list[dict]:
+        """Manga records in the account's library with one of `statuses`
+        (reading, plan_to_read, completed, on_hold, dropped, re_reading).
+        Needs the account credentials — the library is private."""
+        if not self.has_credentials:
+            raise RuntimeError("MangaDex account credentials are not configured")
+        data = await self._get("/manga/status")
+        wanted = set(statuses)
+        ids = [mid for mid, status in (data.get("statuses") or {}).items() if status in wanted]
+        records: list[dict] = []
+        for start in range(0, len(ids), 100):
+            batch = ids[start:start + 100]
+            # the default content filter would silently drop mature titles
+            # the user explicitly put in their library
+            page = await self._get("/manga", params={
+                "ids[]": batch, "limit": len(batch),
+                "contentRating[]": ["safe", "suggestive", "erotica", "pornographic"],
+            })
+            records.extend(page.get("data") or [])
+        return records
+
     async def search_series(self, query: str) -> list[SourceSeries]:
         data = await self._get(
             "/manga",

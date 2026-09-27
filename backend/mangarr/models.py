@@ -270,3 +270,51 @@ class ApiKey(Base):
     key: Mapped[str] = mapped_column(String, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ImportList(Base):
+    """An external reading list (AniList, MyAnimeList, MangaDex, MangaUpdates)
+    whose new entries are added to the library on each sync."""
+
+    __tablename__ = "import_lists"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    kind: Mapped[str] = mapped_column(String)  # see mangarr.import_lists.PROVIDERS
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # provider settings as JSON: username, password, client_id, statuses
+    config: Mapped[str] = mapped_column(Text, default="{}")
+    # how entries are added
+    root_folder_id: Mapped[int | None] = mapped_column(ForeignKey("root_folders.id"), nullable=True)
+    monitored: Mapped[bool] = mapped_column(Boolean, default=True)
+    monitor_mode: Mapped[str] = mapped_column(String, default="all")
+    search_now: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+
+    entries: Mapped[list[ImportListEntry]] = relationship(
+        back_populates="import_list", cascade="all, delete-orphan"
+    )
+
+
+class ImportListEntry(Base):
+    """Every entry a list has produced, so each is acted on once: deleting a
+    series a list added must not have the next sync add it back."""
+
+    __tablename__ = "import_list_entries"
+    __table_args__ = (UniqueConstraint("list_id", "key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    list_id: Mapped[int] = mapped_column(ForeignKey("import_lists.id"))
+    key: Mapped[str] = mapped_column(String)  # "<provider>:<id>" on the list's own site
+    title: Mapped[str] = mapped_column(String, default="")
+    anilist_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mangaupdates_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # added | existing (was already in the library) | failed (retried next
+    # sync) | skipped (the user dismissed it)
+    status: Mapped[str] = mapped_column(String, default="added")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    series_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    import_list: Mapped[ImportList] = relationship(back_populates="entries")

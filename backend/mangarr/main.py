@@ -7,7 +7,18 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .api import apikeys, library, queue, search, series, settings, system
+from .api import (
+    apikeys,
+    calendar,
+    import_lists,
+    library,
+    library_import,
+    queue,
+    search,
+    series,
+    settings,
+    system,
+)
 from .api.deps import get_api_key, require_api_key
 from .config import config
 from .db import init_db
@@ -33,7 +44,10 @@ app = FastAPI(title="Mangarr", version=__version__, lifespan=lifespan)
 
 api = FastAPI(dependencies=[Depends(require_api_key)])
 api.include_router(series.router)
+api.include_router(library_import.router)
 api.include_router(library.router)
+api.include_router(calendar.router)
+api.include_router(import_lists.router)
 api.include_router(search.router)
 api.include_router(queue.router)
 api.include_router(settings.router)

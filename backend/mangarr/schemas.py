@@ -108,6 +108,11 @@ class SeriesDetailOut(SeriesOut):
     # grabs try them for this series (override applied, blocked removed)
     global_source_order: list[str] = []
     effective_source_order: list[str] = []
+    # release rhythm from MangaUpdates release dates (see release_schedule)
+    cadence_days: float | None = None
+    cadence_label: str = ""
+    last_released_at: datetime | None = None
+    next_expected_at: datetime | None = None
 
     @field_validator("source_priority", "blocked_sources", mode="before")
     @classmethod
@@ -514,3 +519,152 @@ class FilesystemListOut(BaseModel):
     path: str
     parent: str | None
     entries: list[FilesystemEntryOut]
+
+
+# ---------------------------------------------------------------- calendar
+
+class CalendarReleaseOut(BaseModel):
+    series_id: int
+    series_title: str
+    cover_url: str
+    chapter_id: int
+    number: float
+    volume: int | None
+    title: str
+    released_at: datetime
+    downloaded: bool
+    monitored: bool
+
+
+class CalendarExpectedOut(BaseModel):
+    series_id: int
+    series_title: str
+    cover_url: str
+    expected_at: datetime
+    cadence_days: float
+    cadence_label: str
+    last_released_at: datetime
+    last_number: float | None
+    overdue: bool  # the expected day has passed without a new release
+    monitored: bool
+
+
+class CalendarOut(BaseModel):
+    released: list[CalendarReleaseOut]
+    expected: list[CalendarExpectedOut]
+
+
+# ---------------------------------------------------- related / recommended
+
+class RelatedTitleOut(BaseModel):
+    provider: str  # anilist | mangaupdates — which id adding it would use
+    provider_id: str
+    title: str
+    english_title: str = ""
+    alt_titles: list[str] = []
+    cover_url: str = ""
+    year: int | None = None
+    status: str = "unknown"
+    format: str = ""  # MANGA, ONE_SHOT, NOVEL … when the provider says
+    relation: str  # "Sequel", "Side story", "Recommended" …
+    in_library_series_id: int | None = None
+
+
+class RelatedOut(BaseModel):
+    relations: list[RelatedTitleOut]
+    recommendations: list[RelatedTitleOut]
+
+
+# ------------------------------------------------------------ bulk import
+
+class ImportFolderOut(BaseModel):
+    name: str
+    path: str
+    file_count: int
+    query: str  # the folder name cleaned into a search query
+
+
+class ImportMatchOut(BaseModel):
+    candidates: list[MetadataResult]
+    best: int | None  # index of the confident match, None = needs a human
+
+
+class LibraryImportItemIn(BaseModel):
+    folder_name: str
+    provider: Literal["mangaupdates", "anilist"]
+    provider_id: int
+    english_title: str = ""
+    alt_titles: list[str] = Field(default_factory=list)
+
+
+class LibraryImportIn(BaseModel):
+    root_folder_id: int
+    items: list[LibraryImportItemIn]
+    monitored: bool = True
+    monitor_mode: MonitorMode = "all"
+    monitor_from: float | None = None
+    search_now: bool = False
+
+
+class LibraryImportResultOut(BaseModel):
+    folder_name: str
+    status: Literal["added", "exists", "failed"]
+    series_id: int | None = None
+    detail: str = ""
+
+
+# ------------------------------------------------------------ import lists
+
+ImportListKind = Literal["anilist", "myanimelist", "mangadex", "mangaupdates"]
+
+
+class ImportListIn(BaseModel):
+    name: str
+    kind: ImportListKind
+    enabled: bool = True
+    username: str = ""  # AniList / MyAnimeList / MangaUpdates account
+    password: str = ""  # MangaUpdates only (its lists need a login)
+    client_id: str = ""  # MyAnimeList API client id
+    statuses: list[str] = Field(default_factory=list)  # empty = the provider default
+    root_folder_id: int
+    monitored: bool = True
+    monitor_mode: MonitorMode = "all"
+    search_now: bool = False
+
+
+class ImportListOut(ImportListIn):
+    id: int
+    last_synced_at: datetime | None = None
+    last_error: str = ""
+    entry_counts: dict[str, int] = {}
+
+
+class ImportListEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    key: str
+    title: str
+    anilist_id: int | None
+    mangaupdates_id: int | None
+    status: str  # added | existing | failed | skipped
+    detail: str
+    series_id: int | None
+    first_seen_at: datetime
+
+
+class ImportListPreviewItemOut(BaseModel):
+    key: str
+    title: str
+    cover_url: str = ""
+    year: int | None = None
+    # add = a sync would add it; in_library = already there; seen = handled
+    # by an earlier sync (added, skipped, or deleted since)
+    action: Literal["add", "in_library", "seen"]
+    series_id: int | None = None
+
+
+class ImportListSyncOut(BaseModel):
+    fetched: int
+    added: int
+    existing: int
+    failed: int

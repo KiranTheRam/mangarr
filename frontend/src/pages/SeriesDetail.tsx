@@ -28,6 +28,7 @@ import {
   SourcesModal,
 } from "../components/LibraryTools";
 import { AutomationModal, monitorModeLabel } from "../components/SeriesAutomation";
+import { RelatedTitles } from "../components/RelatedTitles";
 import { sanitizeDescription } from "../sanitize";
 import { sourceLabel } from "../sources";
 
@@ -1145,6 +1146,17 @@ export default function SeriesDetail() {
                   </span>
                 )}
                 {series.total_volumes && <span>{series.total_volumes} volumes</span>}
+                {series.cadence_label && (
+                  <span title="Release rhythm from MangaUpdates release dates">
+                    {series.cadence_label}
+                    {series.next_expected_at &&
+                      ` · next ~${new Date(series.next_expected_at).toLocaleDateString(undefined, {
+                        month: "short",
+                        day: "numeric",
+                        timeZone: "UTC",
+                      })}`}
+                  </span>
+                )}
                 {series.monitored && series.monitor_mode !== "all" && (
                   <span className="pill blue" title="Which chapters monitoring covers">
                     {monitorModeLabel(series.monitor_mode, series.monitor_from)}
@@ -1182,6 +1194,8 @@ export default function SeriesDetail() {
             <FoldersPanel seriesId={seriesId} onChanged={invalidate} />
           </div>
         </div>
+
+        <RelatedTitles seriesId={seriesId} />
 
         {series.chapters.length > 0 && (
           <div className="chapter-selection">

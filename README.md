@@ -51,6 +51,11 @@ design; it is the automation half of your manga stack.
     default — the torrent keeps seeding and the library copy costs no extra
     space (downloads and library must share a filesystem; falls back to copy
     automatically, and a copy mode setting is available).
+- **Discovery** — import lists follow AniList, MyAnimeList, MangaDex or
+  MangaUpdates reading lists and add new entries automatically; a calendar
+  shows recent releases and when each ongoing series' next chapter is due
+  (from its usual release rhythm); series pages list sequels, side stories
+  and recommendations from AniList and MangaUpdates, one click from adding.
 - **Automation** — a monitor loop checks linked sources for new chapters of
   monitored series and grabs them by configurable source priority. Manual
   per-chapter interactive search included.
@@ -135,9 +140,13 @@ it won't re-download what's on disk.
 1. **Mount your library** into the mangarr container and add it as a root
    folder. In `docker-compose.yml`, add a volume (e.g.
    `- /mnt/nas/manga:/library`), then Settings → Root Folders → add `/library`.
-2. **Add each series** as usual. On add (and on every refresh) mangarr finds the
-   matching folder in the root, scans it, and marks chapters/volumes you already
-   have as owned. The Wanted list then shows only what's genuinely missing.
+2. **Import the folders**: Add New → **Library import** lists every folder in
+   the root that no series uses yet, matches each to a MangaUpdates entry by
+   name, and adds the ones you confirm in one go (each keeps its folder). You
+   can also add series one at a time: on add (and on every refresh) mangarr
+   finds the matching folder in the root. Either way it scans the folder and
+   marks chapters/volumes you already have as owned, so the Wanted list shows
+   only what's genuinely missing.
 3. **Per-series tools** (on the series page):
    - **Scan Disk** — re-scan the folder and adopt any new files.
    - **Files** — see everything found, with unmatched files you can map to a

@@ -88,6 +88,11 @@ export interface SeriesDetail extends Series {
   // enabled download sources: global order, and the order grabs use here
   global_source_order: string[];
   effective_source_order: string[];
+  // release rhythm from MangaUpdates release dates
+  cadence_days: number | null;
+  cadence_label: string;
+  last_released_at: string | null;
+  next_expected_at: string | null;
 }
 
 export interface SeriesGroup {
@@ -300,4 +305,134 @@ export interface FilesystemList {
   path: string;
   parent: string | null;
   entries: FilesystemEntry[];
+}
+
+export interface CalendarRelease {
+  series_id: number;
+  series_title: string;
+  cover_url: string;
+  chapter_id: number;
+  number: number;
+  volume: number | null;
+  title: string;
+  released_at: string;
+  downloaded: boolean;
+  monitored: boolean;
+}
+
+export interface CalendarExpected {
+  series_id: number;
+  series_title: string;
+  cover_url: string;
+  expected_at: string;
+  cadence_days: number;
+  cadence_label: string;
+  last_released_at: string;
+  last_number: number | null;
+  overdue: boolean;
+  monitored: boolean;
+}
+
+export interface CalendarData {
+  released: CalendarRelease[];
+  expected: CalendarExpected[];
+}
+
+export interface RelatedTitle {
+  provider: "anilist" | "mangaupdates";
+  provider_id: string;
+  title: string;
+  english_title: string;
+  alt_titles: string[];
+  cover_url: string;
+  year: number | null;
+  status: string;
+  format: string;
+  relation: string;
+  in_library_series_id: number | null;
+}
+
+export interface RelatedData {
+  relations: RelatedTitle[];
+  recommendations: RelatedTitle[];
+}
+
+export interface ImportFolder {
+  name: string;
+  path: string;
+  file_count: number;
+  query: string;
+}
+
+export interface ImportMatch {
+  candidates: MetadataResult[];
+  best: number | null;
+}
+
+export interface LibraryImportResult {
+  folder_name: string;
+  status: "added" | "exists" | "failed";
+  series_id: number | null;
+  detail: string;
+}
+
+export type ImportListKind = "anilist" | "myanimelist" | "mangadex" | "mangaupdates";
+
+export interface ImportListProvider {
+  kind: ImportListKind;
+  label: string;
+  statuses: Record<string, string>;
+  default_statuses: string[];
+  needs_username: boolean;
+  needs_password: boolean;
+  needs_client_id: boolean;
+}
+
+export interface ImportListConfig {
+  name: string;
+  kind: ImportListKind;
+  enabled: boolean;
+  username: string;
+  password: string;
+  client_id: string;
+  statuses: string[];
+  root_folder_id: number;
+  monitored: boolean;
+  monitor_mode: MonitorMode;
+  search_now: boolean;
+}
+
+export interface ImportList extends ImportListConfig {
+  id: number;
+  last_synced_at: string | null;
+  last_error: string;
+  entry_counts: Record<string, number>;
+}
+
+export interface ImportListEntry {
+  id: number;
+  key: string;
+  title: string;
+  anilist_id: number | null;
+  mangaupdates_id: number | null;
+  status: "added" | "existing" | "failed" | "skipped";
+  detail: string;
+  series_id: number | null;
+  first_seen_at: string;
+}
+
+export interface ImportListPreviewItem {
+  key: string;
+  title: string;
+  cover_url: string;
+  year: number | null;
+  action: "add" | "in_library" | "seen";
+  series_id: number | null;
+}
+
+export interface ImportListSyncResult {
+  fetched: number;
+  added: number;
+  existing: number;
+  failed: number;
 }

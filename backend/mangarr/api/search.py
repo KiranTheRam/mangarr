@@ -40,13 +40,13 @@ async def _gather_limited(
     return list(await asyncio.gather(*(run(item) for item in items)))
 
 
-@router.get("/metadata", response_model=list[MetadataResult])
-async def search_metadata(
-    q: str, provider: str = "mangaupdates", session: AsyncSession = Depends(get_session)
-):
+async def metadata_results(
+    session: AsyncSession, provider: str, query: str, limit: int = 20
+) -> list[MetadataResult]:
+    """Search a metadata provider, marking results already in the library."""
     meta_provider = anilist if provider == "anilist" else mangaupdates
     id_column = Series.anilist_id if provider == "anilist" else Series.mangaupdates_id
-    results = await meta_provider.search(q)
+    results = await meta_provider.search(query, limit=limit)
     in_library = {
         row[0]
         for row in (await session.execute(select(id_column))).all()
@@ -57,7 +57,7 @@ async def search_metadata(
             provider=r.provider,
             provider_id=r.provider_id,
             title=r.title,
-            english_title=english_title(r.title, r.alt_titles, q),
+            english_title=english_title(r.title, r.alt_titles, query),
             alt_titles=r.alt_titles,
             description=r.description,
             status=r.status,
@@ -70,6 +70,13 @@ async def search_metadata(
         )
         for r in results
     ]
+
+
+@router.get("/metadata", response_model=list[MetadataResult])
+async def search_metadata(
+    q: str, provider: str = "mangaupdates", session: AsyncSession = Depends(get_session)
+):
+    return await metadata_results(session, provider, q)
 
 
 def _candidate_matches_series(candidate_titles: list[str], wanted: set[str]) -> bool:

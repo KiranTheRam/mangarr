@@ -77,6 +77,8 @@ DEFAULTS: dict[str, str] = {
     # or "unmonitor" them
     "finished_series_mode": "slow",
     "finished_series_check_days": "7",
+    # how often enabled import lists are synced
+    "import_list_sync_hours": "6",
     # Library
     "library_scan_on_add": "true",  # adopt existing on-disk files on add/refresh
     # Outbound webhook fired when chapters are imported (e.g. NextPanel's
@@ -134,6 +136,7 @@ def validate(values: dict[str, str]) -> None:
         ("torrent_auto_max_size_gib", 1),
         ("torrent_auto_min_seeders", 0),
         ("finished_series_check_days", 1),
+        ("import_list_sync_hours", 1),
     ):
         if key not in values:
             continue

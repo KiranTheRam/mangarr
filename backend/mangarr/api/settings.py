@@ -43,6 +43,10 @@ async def update_settings(
         from ..jobs.scheduler import reschedule_monitor
 
         reschedule_monitor(int(to_save["monitor_interval_minutes"]))
+    if "import_list_sync_hours" in to_save:
+        from ..jobs.scheduler import reschedule_import_lists
+
+        reschedule_import_lists(int(to_save["import_list_sync_hours"]))
     return await get_settings(session)
 
 

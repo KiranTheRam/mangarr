@@ -8,6 +8,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .. import settings_service
+from ..adding import (
+    AddOptions,
+    LibraryIndex,
+    MetadataNotFound,
+    SeriesExists,
+    create_series,
+    normalize_folder_name,
+    start_refreshes,
+)
 from ..automation import RESOLVED_MODES, apply_monitor_mode, order_sources
 from ..db import get_session
 from ..jobs.tasks import (
@@ -16,14 +25,15 @@ from ..jobs.tasks import (
     merge_complete_volumes,
     refresh_series_full,
 )
-from ..metadata.anilist import provider as anilist
-from ..metadata.mangaupdates import provider as mangaupdates
-from ..models import Chapter, Series, SeriesFolder, SeriesStatus
+from ..models import Chapter, Series
+from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
     AddSeriesIn,
     ChapterMetadataIn,
     ChapterMonitorIn,
     ChapterOut,
+    RelatedOut,
+    RelatedTitleOut,
     SeriesDetailOut,
     SeriesGroupOut,
     SeriesOut,
@@ -31,8 +41,8 @@ from ..schemas import (
     VolumeMergeOut,
 )
 from ..sources import registry
-from ..titles import english_title, split_alt_titles, unique_titles
-from ..util import is_special_chapter, sanitize_filename
+from ..titles import english_title, split_alt_titles
+from ..util import is_special_chapter
 
 router = APIRouter(prefix="/series", tags=["series"])
 
@@ -96,24 +106,6 @@ def _clean_lines(names: list[str]) -> str:
     return "\n".join(out)
 
 
-async def _normalize_folder_name(session: AsyncSession, series: Series, folder_name: str) -> str:
-    """Store the folder relative to the series' root folder when the given path
-    is under it (so it survives a root-folder move); otherwise keep as given."""
-    from pathlib import Path
-
-    from ..models import RootFolder
-
-    folder_name = folder_name.strip()
-    if series.root_folder_id is not None and folder_name.startswith("/"):
-        root = await session.get(RootFolder, series.root_folder_id)
-        if root is not None:
-            try:
-                return str(Path(folder_name).relative_to(root.path))
-            except ValueError:
-                pass  # outside the root — keep absolute
-    return folder_name.strip("/") if not folder_name.startswith("/") else folder_name
-
-
 @router.get("", response_model=list[SeriesOut])
 async def list_series(session: AsyncSession = Depends(get_session)):
     # the SQL mirror of util.is_special_chapter: a cast to INTEGER truncates the
@@ -147,58 +139,29 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
         raise HTTPException(422, "Provide exactly one of mangaupdates_id or anilist_id")
     if body.monitor_mode == "from_chapter" and body.monitor_from is None:
         raise HTTPException(422, "monitor_from is required for monitor_mode from_chapter")
-    if body.mangaupdates_id is not None:
-        id_filter = Series.mangaupdates_id == body.mangaupdates_id
-        provider, provider_id = mangaupdates, body.mangaupdates_id
-    else:
-        id_filter = Series.anilist_id == body.anilist_id
-        provider, provider_id = anilist, body.anilist_id
-    existing = await session.execute(select(Series).where(id_filter))
-    if existing.scalar_one_or_none() is not None:
-        raise HTTPException(409, "Series already in library")
-    meta = await provider.get_series(str(provider_id))
-    if meta is None:
-        raise HTTPException(404, f"{provider.name} series not found")
-    alt_titles = unique_titles([*meta.alt_titles, body.english_title, *body.alt_titles])
-    series = Series(
-        anilist_id=body.anilist_id,
-        mangaupdates_id=body.mangaupdates_id,
-        title=meta.title,
-        sort_title=meta.title.lower(),
-        alt_titles="\n".join(alt_titles),
-        description=meta.description,
-        status=SeriesStatus(meta.status),
-        year=meta.year,
-        cover_url=meta.cover_url,
-        banner_url=meta.banner_url,
-        genres=",".join(meta.genres),
-        total_chapters=meta.total_chapters,
-        total_volumes=meta.total_volumes,
+    opts = AddOptions(
+        root_folder_id=body.root_folder_id,
         monitored=body.monitored,
         monitor_mode=body.monitor_mode,
-        monitor_from=body.monitor_from if body.monitor_mode == "from_chapter" else None,
-        root_folder_id=body.root_folder_id,
-        folder_name=sanitize_filename(meta.title),
+        monitor_from=body.monitor_from,
+        english_title=body.english_title,
+        alt_titles=body.alt_titles,
+        folder_name=body.folder_name,
         folder_pinned=body.folder_pinned,
+        extra_folders=body.extra_folders,
     )
-    if body.folder_name.strip():
-        series.folder_name = await _normalize_folder_name(session, series, body.folder_name)
-    session.add(series)
-    for extra in body.extra_folders:
-        path = await _normalize_folder_name(session, series, extra)
-        if path and path != series.folder_name:
-            series.extra_folders.append(SeriesFolder(path=path))
-    await session.commit()
-    await session.refresh(series)
+    try:
+        series = await create_series(
+            session, opts, anilist_id=body.anilist_id, mangaupdates_id=body.mangaupdates_id
+        )
+    except SeriesExists:
+        raise HTTPException(409, "Series already in library") from None
+    except MetadataNotFound as exc:
+        raise HTTPException(404, str(exc)) from None
     # link sources + fetch chapters in the background; "search now" adds queue
     # available missing chapters as soon as the library scan and metadata
     # refresh have run, instead of waiting for the next monitor interval.
-    # Pre-mark so the series page the UI jumps to shows the work in progress
-    # even before the task's first tick.
-    REFRESHING.add(series.id)
-    asyncio.get_running_loop().create_task(
-        refresh_series_full(series.id, grab_missing=body.search_now)
-    )
+    start_refreshes([series.id], grab_missing=body.search_now)
     return await get_series(series.id, session)
 
 
@@ -218,6 +181,11 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     out.refreshing = series_id in REFRESHING
     out.global_source_order = _content_source_names(await settings_service.get_all(session))
     out.effective_source_order = order_sources(out.global_source_order, series)
+    schedule = release_schedule(series.chapters, series.status)
+    out.cadence_days = schedule.cadence_days
+    out.cadence_label = cadence_label(schedule.cadence_days)
+    out.last_released_at = schedule.last_released_at
+    out.next_expected_at = schedule.next_expected_at
     return out
 
 
@@ -277,7 +245,7 @@ async def update_series(
     if body.root_folder_id is not None:
         series.root_folder_id = body.root_folder_id
     if body.folder_name is not None:
-        series.folder_name = await _normalize_folder_name(session, series, body.folder_name)
+        series.folder_name = await normalize_folder_name(session, series, body.folder_name)
         # an explicit folder edit is an explicit choice — pin it so the next
         # scan can't re-adopt a title-matching folder over it
         if body.folder_pinned is None:
@@ -404,3 +372,44 @@ async def merge_volumes_now(series_id: int, session: AsyncSession = Depends(get_
     finally:
         lock.release()
     return VolumeMergeOut(merged=merged)
+
+
+@router.get("/{series_id}/related", response_model=RelatedOut)
+async def series_related(series_id: int, session: AsyncSession = Depends(get_session)):
+    """Sequels, side stories and similar manga, each marked with the library
+    series it already is (by provider id or any shared title)."""
+    from ..related import related_titles
+
+    series = await session.get(Series, series_id)
+    if series is None:
+        raise HTTPException(404, "Series not found")
+    try:
+        related = await related_titles(series)
+    except Exception as exc:
+        raise HTTPException(502, f"Metadata providers unavailable: {exc}") from exc
+
+    library = await LibraryIndex.load(session)
+
+    def out(item) -> RelatedTitleOut:
+        pid = int(item.provider_id)
+        return RelatedTitleOut(
+            provider=item.provider,
+            provider_id=item.provider_id,
+            title=item.title,
+            alt_titles=item.alt_titles,
+            cover_url=item.cover_url,
+            year=item.year,
+            status=item.status,
+            format=item.format,
+            relation=item.relation,
+            in_library_series_id=library.find(
+                pid if item.provider == "anilist" else None,
+                pid if item.provider == "mangaupdates" else None,
+                [item.title, *item.alt_titles],
+            ),
+        )
+
+    return RelatedOut(
+        relations=[out(r) for r in related.relations],
+        recommendations=[out(r) for r in related.recommendations],
+    )

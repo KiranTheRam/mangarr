@@ -2,6 +2,9 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import Library from "./pages/Library";
 import AddSeries from "./pages/AddSeries";
+import Calendar from "./pages/Calendar";
+import ImportLists from "./pages/ImportLists";
+import LibraryImport from "./pages/LibraryImport";
 import SeriesDetail from "./pages/SeriesDetail";
 import Activity from "./pages/Activity";
 import Wanted from "./pages/Wanted";
@@ -15,6 +18,9 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Library />} />
           <Route path="/add" element={<AddSeries />} />
+          <Route path="/add/import" element={<LibraryImport />} />
+          <Route path="/add/lists" element={<ImportLists />} />
+          <Route path="/calendar" element={<Calendar />} />
           <Route path="/series/:id" element={<SeriesDetail />} />
           <Route path="/activity" element={<Activity />} />
           <Route path="/wanted" element={<Wanted />} />
