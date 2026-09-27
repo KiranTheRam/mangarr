@@ -107,3 +107,40 @@ async def test_retry_failed_torrent_resubmits_stored_magnet(db_session, monkeypa
     assert out.status == DownloadStatus.DOWNLOADING
     assert dl.torrent_hash == "a" * 40
     assert dl.error == ""
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_cancellation_failure_preserves_visible_work(db_session, monkeypatch, enabled):
+    from unittest.mock import AsyncMock, MagicMock
+    from mangarr import settings_service
+    dl = Download(kind=DownloadKind.TORRENT, status=DownloadStatus.DOWNLOADING,
+                  torrent_hash="a" * 40, title="Test torrent")
+    db_session.add(dl)
+    await db_session.commit()
+    values = dict(settings_service.DEFAULTS, qbittorrent_enabled=str(enabled).lower())
+    monkeypatch.setattr(queue.registry, "apply_settings", AsyncMock(return_value=values))
+    client = MagicMock()
+    client.delete_torrents = AsyncMock(side_effect=RuntimeError("offline"))
+    client.close = AsyncMock()
+    monkeypatch.setattr(queue, "QbtClient", lambda *args: client)
+    with pytest.raises(HTTPException) as exc:
+        await queue._remove_downloads(db_session, [dl.id])
+    assert exc.value.status_code == (502 if enabled else 409)
+    assert dl.status == DownloadStatus.DOWNLOADING
+    assert [item.id for item in await queue.get_queue(db_session)] == [dl.id]
+
+
+async def test_successful_cancellation_removes_work(db_session, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+    from mangarr import settings_service
+    dl = Download(kind=DownloadKind.TORRENT, status=DownloadStatus.DOWNLOADING,
+                  torrent_hash="a" * 40)
+    db_session.add(dl)
+    await db_session.commit()
+    values = dict(settings_service.DEFAULTS, qbittorrent_enabled="true")
+    monkeypatch.setattr(queue.registry, "apply_settings", AsyncMock(return_value=values))
+    client = MagicMock(delete_torrents=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(queue, "QbtClient", lambda *args: client)
+    assert await queue._remove_downloads(db_session, [dl.id]) == 1
+    client.delete_torrents.assert_awaited_once_with(["a" * 40])
+    assert await queue.get_queue(db_session) == []

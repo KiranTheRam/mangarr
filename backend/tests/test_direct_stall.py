@@ -37,7 +37,9 @@ class FakeSource(DirectSource):
 
 
 @pytest.fixture
-async def db_session():
+async def db_session(monkeypatch):
+    from mangarr import settings_service
+    monkeypatch.setitem(settings_service.DEFAULTS, "source_fake_enabled", "true")
     engine = create_async_engine("sqlite+aiosqlite://")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -147,3 +149,17 @@ async def test_failed_downloads_stay_visible_in_queue(db_session, tmp_path):
     await db_session.refresh(dl)
     assert dl.error == REMOVED_BY_USER
     assert await get_queue(db_session) == []
+
+
+async def test_disabled_source_is_rejected_before_network(db_session, tmp_path, monkeypatch):
+    from mangarr import settings_service
+    from unittest.mock import AsyncMock
+    dl = await _make_download(db_session, tmp_path)
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    await settings_service.set_many(db_session, {"source_fake_enabled": "false"})
+    download = AsyncMock()
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", download)
+    await tasks._run_direct_download(db_session, dl)
+    download.assert_not_awaited()
+    assert dl.status == DownloadStatus.FAILED
+    assert "disabled" in dl.error

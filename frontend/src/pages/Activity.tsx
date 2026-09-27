@@ -2,12 +2,12 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { HistoryItem, QueueItem } from "../api/types";
-import { EmptyState, Spinner, statusPill, Toolbar } from "../components/common";
+import { EmptyState, ErrorNotice, Spinner, statusPill, Toolbar } from "../components/common";
 
 function Queue() {
   const queryClient = useQueryClient();
   const [selected, setSelected] = useState<Set<number>>(() => new Set());
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["queue"],
     queryFn: () => api.get<QueueItem[]>("/queue"),
     refetchInterval: 2000,
@@ -32,8 +32,9 @@ function Queue() {
   });
 
   if (isLoading) return <Spinner />;
+  if (error && !data) return <ErrorNotice error={error} retry={() => void refetch()} />;
   if (!data || data.length === 0)
-    return <EmptyState icon="⇅" title="Queue is empty" hint="Grabbed releases will appear here." />;
+    return <><ErrorNotice error={error} retry={() => void refetch()} /><EmptyState icon="⇅" title="Queue is empty" hint="Grabbed releases will appear here." /></>;
 
   // only ids still in the queue count (items can finish between refetches)
   const selectedVisible = data.filter((item) => selected.has(item.id)).map((item) => item.id);
@@ -50,6 +51,8 @@ function Queue() {
 
   return (
     <>
+      <ErrorNotice error={error} retry={() => void refetch()} />
+      <ErrorNotice error={remove.error || retry.error || removeSelected.error} />
       <div className="table-actions" style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <button
           className="btn"
@@ -150,16 +153,19 @@ function Queue() {
 }
 
 function History() {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["history"],
     queryFn: () => api.get<HistoryItem[]>("/history"),
     refetchInterval: 5000,
   });
 
   if (isLoading) return <Spinner />;
-  if (!data || data.length === 0) return <EmptyState icon="🕘" title="No history yet" />;
+  if (error && !data) return <ErrorNotice error={error} retry={() => void refetch()} />;
+  if (!data || data.length === 0) return <><ErrorNotice error={error} retry={() => void refetch()} /><EmptyState icon="🕘" title="No history yet" /></>;
 
   return (
+    <>
+    <ErrorNotice error={error} retry={() => void refetch()} />
     <table className="data-table card-table history-table">
       <thead>
         <tr>
@@ -186,6 +192,7 @@ function History() {
         ))}
       </tbody>
     </table>
+    </>
   );
 }
 

@@ -150,7 +150,7 @@ async def test_runtime_settings_select_only_content_sources(monkeypatch):
     assert registry.DIRECT_SOURCES["viz"].content_proxy_enabled is False
 
 
-async def test_runtime_settings_ignore_proxy_flag_for_disabled_source(monkeypatch):
+async def test_disabled_source_retains_its_routing_requirement(monkeypatch):
     values = dict(settings_service.DEFAULTS)
     values["download_proxy_url"] = "http://192.168.1.28:8888"
     values["source_mangafire_enabled"] = "false"
@@ -164,5 +164,37 @@ async def test_runtime_settings_ignore_proxy_flag_for_disabled_source(monkeypatc
     await registry.apply_settings(None)
 
     source = registry.DIRECT_SOURCES["mangafire"]
-    assert source.content_proxy_enabled is False
-    assert source.content_proxy_url == ""
+    assert source.content_proxy_enabled is True
+    assert source.content_proxy_url == values["download_proxy_url"]
+
+
+async def test_routing_is_snapshotted_before_manifest_request(tmp_path):
+    source = FakeSource()
+    source.content_proxy_enabled = True
+    source.content_proxy_url = "http://vpn.example:8118"
+
+    async def manifest(_id):
+        source.content_proxy_enabled = False
+        source.content_proxy_url = ""
+        return ["https://cdn.example/page.jpg"]
+
+    source.get_pages = manifest
+    series, chapter = media_objects()
+    await direct.download_chapter_to_cbz(source, "c1", series, chapter, tmp_path / "chapter.cbz")
+    assert CapturingClient.created[0].kwargs["proxy"] == "http://vpn.example:8118"
+
+
+@pytest.mark.parametrize("content", [b"", b"<html>Access denied</html>", b'{"error":"blocked"}'])
+async def test_non_images_never_become_completed_archives(tmp_path, monkeypatch, content):
+    source = FakeSource()
+    async def bad_page(client, url):
+        return content
+    async def no_wait(seconds):
+        pass
+    source.download_page = bad_page
+    monkeypatch.setattr(direct.asyncio, "sleep", no_wait)
+    series, chapter = media_objects()
+    dest = tmp_path / "chapter.cbz"
+    with pytest.raises(RuntimeError, match="not a supported image"):
+        await direct.download_chapter_to_cbz(source, "c1", series, chapter, dest)
+    assert not dest.exists()

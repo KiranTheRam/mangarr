@@ -52,7 +52,9 @@ class FakeSource(DirectSource):
 
 
 @pytest.fixture
-async def db_session():
+async def db_session(monkeypatch):
+    from mangarr import settings_service
+    monkeypatch.setitem(settings_service.DEFAULTS, "source_fake_enabled", "true")
     engine = create_async_engine("sqlite+aiosqlite://")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

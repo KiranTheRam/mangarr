@@ -931,6 +931,11 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         dl.error = "series/chapter/source no longer exists or chapter is excluded"
         await session.commit()
         return
+    if values.get(f"source_{source_name}_enabled") != "true":
+        dl.status = DownloadStatus.FAILED
+        dl.error = "source is disabled; enable it before retrying"
+        await session.commit()
+        return
     series_id = series.id
     chapter_id = chapter.id
 
