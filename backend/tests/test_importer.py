@@ -171,3 +171,52 @@ class TestImportModes:
         dest = imported[0][0]
         assert dest.exists()
         assert dest.stat().st_ino != src.stat().st_ino
+
+
+@pytest.mark.parametrize("mode", ["copy", "hardlink"])
+def test_failed_copy_never_publishes_partial_file(tmp_path, series, chapters, monkeypatch, mode):
+    from mangarr.library import importer
+    src = tmp_path / "Ashita no Joe - c002.cbz"
+    make_cbz(src)
+    original_copy = importer.shutil.copy2
+    def broken_copy(src, dest):
+        dest.write_bytes(b"partial")
+        raise OSError("disk full")
+    def cross_device(src, dest):
+        raise OSError(18, "cross device")
+    monkeypatch.setattr(importer.shutil, "copy2", broken_copy)
+    if mode == "hardlink":
+        monkeypatch.setattr(importer.os, "link", cross_device)
+    args = (src, series, chapters, tmp_path / "lib", DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME)
+    with pytest.raises(OSError, match="disk full"):
+        import_torrent_payload(*args, import_mode=mode)
+    assert not list((tmp_path / "lib").rglob("*.cbz"))
+    assert not list((tmp_path / "lib").rglob("*.partial"))
+    monkeypatch.setattr(importer.shutil, "copy2", original_copy)
+    imported = import_torrent_payload(*args, import_mode=mode)
+    assert imported[0][0].read_bytes() == src.read_bytes()
+
+
+def test_preexisting_damaged_archive_is_not_reported_imported(tmp_path, series, chapters):
+    src = tmp_path / "Ashita no Joe - c002.cbz"
+    make_cbz(src)
+    dest = run_import(src, series, chapters, tmp_path / "lib")[0][0]
+    dest.unlink()  # keep source intact when the original import used a hardlink
+    dest.write_bytes(b"partial")
+    with pytest.raises(ValueError, match="damaged"):
+        run_import(src, series, chapters, tmp_path / "lib")
+
+
+def test_failed_image_pack_is_atomic(tmp_path, monkeypatch):
+    from mangarr.library.importer import _pack_images
+    folder = tmp_path / "images"
+    folder.mkdir()
+    (folder / "1.png").write_bytes(PNG)
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+    monkeypatch.setattr(zipfile.ZipFile, "write", fail_write)
+    dest = tmp_path / "chapter.cbz"
+    with pytest.raises(OSError):
+        _pack_images(folder, dest)
+    assert not dest.exists()
+    assert not list(tmp_path.glob("*.partial"))

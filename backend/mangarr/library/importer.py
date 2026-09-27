@@ -8,6 +8,8 @@ import logging
 import os
 import shutil
 import zipfile
+from contextlib import contextmanager
+from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from ..models import Chapter, Series
@@ -27,6 +29,30 @@ def _dest_ext(media: MediaFile) -> str:
     )
 
 
+@contextmanager
+def _atomic_destination(dest: Path):
+    """Never expose a partial copy/archive under its library filename."""
+    with NamedTemporaryFile(dir=dest.parent, prefix=".mangarr-", suffix=".partial", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        yield temporary
+        temporary.replace(dest)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_existing(dest: Path) -> None:
+    if dest.stat().st_size == 0:
+        raise ValueError(f"Existing library file is empty: {dest}")
+    if dest.suffix.lower() in {".cbz", ".zip"}:
+        try:
+            with zipfile.ZipFile(dest) as archive:
+                if not archive.namelist() or archive.testzip() is not None:
+                    raise ValueError("empty or damaged archive")
+        except (zipfile.BadZipFile, ValueError) as exc:
+            raise ValueError(f"Existing library archive is damaged; repair or remove it before retrying: {dest}") from exc
+
+
 def place_file(src: Path, dest: Path, mode: str) -> None:
     """Put a payload file into the library. Hardlink mode keeps the torrent
     seeding without doubling disk use; it needs src and dest on one
@@ -39,7 +65,10 @@ def place_file(src: Path, dest: Path, mode: str) -> None:
         except OSError as exc:
             log.warning("hardlink %s -> %s failed (%s); copying instead",
                         src.name, dest, exc)
-    shutil.copy2(src, dest)
+    with _atomic_destination(dest) as temporary:
+        shutil.copy2(src, temporary)
+        if temporary.stat().st_size != src.stat().st_size:
+            raise OSError("Incomplete library copy")
     log.info("Imported %s -> %s", src.name, dest)
 
 
@@ -72,7 +101,9 @@ def import_torrent_payload(
         else:
             dest_name = f"{series_folder(series.title)} - {media.path.stem}{ext}"
         dest = folder / dest_name
-        if not dest.exists():
+        if dest.exists():
+            _validate_existing(dest)
+        else:
             if media.is_dir:
                 _pack_images(media.path, dest)
             else:
@@ -90,7 +121,8 @@ def _pack_images(img_dir: Path, dest: Path) -> None:
     images = sorted(
         p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS
     )
-    with zipfile.ZipFile(dest, "w", zipfile.ZIP_STORED) as zf:
-        for img in images:
-            zf.write(img, img.name)
+    with _atomic_destination(dest) as temporary:
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as zf:
+            for img in images:
+                zf.write(img, img.name)
     log.info("Packed %s (%d images) -> %s", img_dir, len(images), dest)

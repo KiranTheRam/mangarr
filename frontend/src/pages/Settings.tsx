@@ -8,7 +8,7 @@ import type {
   Settings as SettingsType,
 } from "../api/types";
 import { FolderBrowser } from "../components/FolderBrowser";
-import { Spinner, Toggle, Toolbar } from "../components/common";
+import { ErrorNotice, Spinner, Toggle, Toolbar } from "../components/common";
 
 function RootFolders() {
   const queryClient = useQueryClient();
@@ -258,7 +258,7 @@ function SourcePriority({
               <span className="priority-toggle priority-proxy-toggle" title="Proxy chapter page/image downloads">
                 <span>Proxy</span>
                 <Toggle
-                  on={enabled && form[`source_${name}_proxy_enabled`] === "true"}
+                  on={form[`source_${name}_proxy_enabled`] === "true"}
                   disabled={!enabled}
                   label={`Use proxy for ${SOURCE_LABELS[name] ?? name} content downloads`}
                   onChange={(proxyEnabled) =>
@@ -280,9 +280,6 @@ function SourcePriority({
                     ...form,
                     [`source_${name}_enabled`]: v ? "true" : "false",
                   };
-                  if (!v && CONTENT_SOURCES.has(name)) {
-                    next[`source_${name}_proxy_enabled`] = "false";
-                  }
                   setForm(next);
                 }}
               />
@@ -446,7 +443,7 @@ function KavitaSettings({
       </p>
       <div className="form-row">
         <label>Enabled</label>
-        <Toggle on={form.kavita_enabled === "true"} onChange={setBool("kavita_enabled")} />
+        <Toggle label="Enable Kavita" on={form.kavita_enabled === "true"} onChange={setBool("kavita_enabled")} />
       </div>
       <div className="form-row">
         <label>URL</label>
@@ -528,7 +525,7 @@ function KavitaSettings({
 
 export default function Settings() {
   const queryClient = useQueryClient();
-  const { data: saved, isLoading } = useQuery({
+  const { data: saved, isLoading, error: loadError, refetch: retryLoad } = useQuery({
     queryKey: ["settings"],
     queryFn: () => api.get<SettingsType>("/settings"),
   });
@@ -545,6 +542,14 @@ export default function Settings() {
       setForm(data);
     },
   });
+
+  const dirty = !!saved && JSON.stringify(form) !== JSON.stringify(saved);
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
 
   const [qbtTest, setQbtTest] = useState<string | null>(null);
   const testQbt = useMutation({
@@ -571,6 +576,8 @@ export default function Settings() {
 
   const [browsing, setBrowsing] = useState(false);
 
+  if (loadError && !saved) return <><Toolbar title="Settings" /><ErrorNotice error={loadError} retry={() => void retryLoad()} /></>;
+
   if (isLoading || !saved) {
     return (
       <>
@@ -591,12 +598,15 @@ export default function Settings() {
   return (
     <>
       <Toolbar title="Settings">
-        {save.isSuccess && <span style={{ color: "var(--success)", fontSize: 13 }}>Saved</span>}
-        <button className="btn primary" onClick={() => save.mutate()} disabled={save.isPending}>
-          Save Changes
+        {dirty && <span role="status">Unsaved changes</span>}
+        {save.isSuccess && !dirty && <span style={{ color: "var(--success)", fontSize: 13 }}>Saved</span>}
+        <button className="btn primary" onClick={() => save.mutate()} disabled={save.isPending || !dirty}>
+          {save.isPending ? "Saving…" : "Save Changes"}
         </button>
       </Toolbar>
       <div className="content">
+        <ErrorNotice error={loadError} retry={() => void retryLoad()} />
+        <ErrorNotice error={save.error} />
         <RootFolders />
         <ApiKeys />
 
@@ -686,7 +696,7 @@ export default function Settings() {
           </p>
           <div className="form-row">
             <label>Enabled</label>
-            <Toggle on={form.qbittorrent_enabled === "true"} onChange={setBool("qbittorrent_enabled")} />
+            <Toggle label="Enable qBittorrent" on={form.qbittorrent_enabled === "true"} onChange={setBool("qbittorrent_enabled")} />
           </div>
           <div className="form-row">
             <label>URL</label>
@@ -766,7 +776,7 @@ export default function Settings() {
           </p>
           <div className="form-row">
             <label>Enabled</label>
-            <Toggle on={form.webhook_enabled === "true"} onChange={setBool("webhook_enabled")} />
+            <Toggle label="Enable webhook" on={form.webhook_enabled === "true"} onChange={setBool("webhook_enabled")} />
           </div>
           <div className="form-row">
             <label>Webhook URL</label>

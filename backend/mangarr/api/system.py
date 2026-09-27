@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,7 +46,7 @@ async def system_status(session: AsyncSession = Depends(get_session)):
 
 
 @router.get("/wanted", response_model=list[WantedItemOut])
-async def wanted(limit: int = 100, session: AsyncSession = Depends(get_session)):
+async def wanted(limit: int = 100, session: AsyncSession = Depends(get_session), offset: int = 0):
     result = await session.execute(
         select(Chapter, Series.title, Series.cover_url)
         .join(Series, Chapter.series_id == Series.id)
@@ -56,7 +56,8 @@ async def wanted(limit: int = 100, session: AsyncSession = Depends(get_session))
             Chapter.excluded == False,  # noqa: E712
             Series.monitored == True,  # noqa: E712
         )
-        .order_by(Series.title, Chapter.number)
+        .order_by(Series.title, Series.id, Chapter.number, Chapter.id)
+        .offset(offset)
         .limit(limit)
     )
     return [
@@ -71,6 +72,21 @@ async def wanted(limit: int = 100, session: AsyncSession = Depends(get_session))
         )
         for ch, title, cover in result.all()
     ]
+
+
+@router.get("/wanted/page")
+async def wanted_page(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+):
+    total = await session.scalar(
+        select(func.count(Chapter.id)).join(Series).where(
+            Chapter.monitored == True, Chapter.downloaded == False,
+            Chapter.excluded == False, Series.monitored == True,
+        )
+    )
+    return {"items": await wanted(limit, session, offset), "total": total}
 
 
 @router.get("/rootfolders", response_model=list[RootFolderOut])

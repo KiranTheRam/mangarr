@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import type { Series } from "../api/types";
-import { EmptyState, Spinner, Toolbar } from "../components/common";
+import { EmptyState, ErrorNotice, Spinner, Toolbar } from "../components/common";
 
 /** Case-insensitive match against every name we know for the series —
  * canonical (often romaji/Japanese), English, and all alt titles (including
@@ -87,7 +87,7 @@ function PosterCard({ series }: { series: Series }) {
 export default function Library() {
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<Filters>(loadFilters);
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["series"],
     queryFn: () => api.get<Series[]>("/series"),
   });
@@ -139,9 +139,10 @@ export default function Library() {
         </Link>
       </Toolbar>
       <div className="content">
+        <ErrorNotice error={error} retry={() => void refetch()} />
         {isLoading ? (
           <Spinner />
-        ) : !data || data.length === 0 ? (
+        ) : !data && error ? null : !data || data.length === 0 ? (
           <EmptyState
             icon="📚"
             title="Your library is empty"

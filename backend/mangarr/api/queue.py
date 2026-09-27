@@ -85,24 +85,25 @@ async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
         dl.torrent_hash for dl in downloads
         if dl.kind == DownloadKind.TORRENT and dl.torrent_hash
     ]
+    # Do not hide work until the download client confirms cancellation.
+    if hashes:
+        values = await registry.apply_settings(session)
+        if values["qbittorrent_enabled"] != "true":
+            raise HTTPException(409, "Enable qBittorrent to stop these torrents before removing them")
+        client = QbtClient(
+            values["qbittorrent_url"], values["qbittorrent_username"],
+            values["qbittorrent_password"],
+        )
+        try:
+            await client.delete_torrents(hashes)
+        except Exception as exc:
+            raise HTTPException(502, "Could not stop torrents in qBittorrent; items remain visible. Retry removal.") from exc
+        finally:
+            await client.close()
     for dl in downloads:
         dl.status = DownloadStatus.FAILED
         dl.error = REMOVED_BY_USER
     await session.commit()
-    if hashes:
-        values = await registry.apply_settings(session)
-        if values["qbittorrent_enabled"] == "true":
-            client = QbtClient(
-                values["qbittorrent_url"], values["qbittorrent_username"],
-                values["qbittorrent_password"],
-            )
-            try:
-                await client.delete_torrents(hashes)
-            except Exception as exc:
-                log.warning("failed to delete %d torrent(s) from qBittorrent: %s",
-                            len(hashes), exc)
-            finally:
-                await client.close()
     return len(downloads)
 
 

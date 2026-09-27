@@ -4,7 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import type { FolderPreview, MetadataResult, RootFolder } from "../api/types";
 import { FolderBrowser } from "../components/FolderBrowser";
-import { EmptyState, Modal, Spinner, Toggle, Toolbar, statusPill } from "../components/common";
+import { EmptyState, ErrorNotice, Modal, Spinner, Toggle, Toolbar, statusPill } from "../components/common";
 import { sanitizeDescription } from "../sanitize";
 
 function AddSeriesModal({
@@ -176,7 +176,7 @@ function AddSeriesModal({
 
       <div className="form-row">
         <label>Monitor</label>
-        <Toggle on={monitored} onChange={setMonitored} />
+        <Toggle label="Monitor series" on={monitored} onChange={setMonitored} />
         <span style={{ color: "var(--text-faint)", fontSize: 13 }}>
           Grab new chapters automatically at each monitor interval
         </span>
@@ -184,7 +184,7 @@ function AddSeriesModal({
 
       <div className="form-row">
         <label>Search for missing content</label>
-        <Toggle on={searchNow} onChange={setSearchNow} />
+        <Toggle label="Search for missing content" on={searchNow} onChange={setSearchNow} />
         <span style={{ color: "var(--text-faint)", fontSize: 13 }}>
           Start fetching missing chapters right after the library scan and metadata refresh
         </span>
@@ -230,12 +230,12 @@ export default function AddSeries() {
   const [submitted, setSubmitted] = useState("");
   const [adding, setAdding] = useState<MetadataResult | null>(null);
 
-  const { data: rootFolders } = useQuery({
+  const { data: rootFolders, error: foldersError, refetch: retryFolders } = useQuery({
     queryKey: ["rootfolders"],
     queryFn: () => api.get<RootFolder[]>("/rootfolders"),
   });
 
-  const { data: results, isFetching } = useQuery({
+  const { data: results, isFetching, error: searchError, refetch: retrySearch } = useQuery({
     queryKey: ["metadata-search", submitted],
     queryFn: () => api.get<MetadataResult[]>(`/search/metadata?q=${encodeURIComponent(submitted)}`),
     enabled: submitted.length > 1,
@@ -247,6 +247,8 @@ export default function AddSeries() {
     <>
       <Toolbar title="Add New Series" />
       <div className="content">
+        <ErrorNotice error={foldersError} retry={() => void retryFolders()} />
+        <ErrorNotice error={searchError} retry={() => void retrySearch()} />
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -286,6 +288,12 @@ export default function AddSeries() {
                 style={clickable ? { cursor: "pointer" } : undefined}
                 title={clickable ? "Add this series" : undefined}
                 onClick={clickable ? () => setAdding(r) : undefined}
+                role={clickable ? "button" : undefined}
+                tabIndex={clickable ? 0 : undefined}
+                aria-label={clickable ? `Add ${r.english_title || r.title}` : undefined}
+                onKeyDown={clickable ? (event) => {
+                  if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setAdding(r); }
+                } : undefined}
               >
                 {r.cover_url && <img src={r.cover_url} alt="" />}
                 <div style={{ flex: 1 }}>

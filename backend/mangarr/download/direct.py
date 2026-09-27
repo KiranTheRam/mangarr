@@ -10,7 +10,7 @@ import httpx
 from .. import USER_AGENT
 from ..models import Chapter, Series
 from ..sources.base import DirectSource
-from .cbz import build_comicinfo, write_cbz
+from .cbz import build_comicinfo, guess_extension, write_cbz
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +32,10 @@ async def download_chapter_to_cbz(
 ) -> None:
     """Fetches all pages of a chapter and writes the CBZ to dest_path.
     progress_cb(done, total) is called as pages finish."""
-    if source.content_proxy_enabled and not source.content_proxy_url:
+    # Snapshot routing before the manifest request yields to other jobs.
+    proxy_enabled = source.content_proxy_enabled
+    proxy_url = source.content_proxy_url
+    if proxy_enabled and not proxy_url:
         # Never turn a proxy configuration error into a direct request. This
         # can only happen if the database was edited outside the settings API.
         raise RuntimeError(f"{source.name} content proxy is enabled but has no URL")
@@ -61,8 +64,8 @@ async def download_chapter_to_cbz(
         # Unchecked means direct even if the container inherits HTTP_PROXY.
         "trust_env": False,
     }
-    if source.content_proxy_enabled:
-        client_options["proxy"] = source.content_proxy_url
+    if proxy_enabled:
+        client_options["proxy"] = proxy_url
 
     async with httpx.AsyncClient(**client_options) as client:
 
@@ -75,7 +78,10 @@ async def download_chapter_to_cbz(
                 # second chance as a network blip
                 for attempt in range(3):
                     try:
-                        pages[i] = await source.download_page(client, url)
+                        content = await source.download_page(client, url)
+                        if not guess_extension(content, fallback=""):
+                            raise ValueError("response is not a supported image")
+                        pages[i] = content
                         break
                     except Exception as exc:
                         if attempt == 2:

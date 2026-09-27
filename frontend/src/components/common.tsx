@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 
 export function Toolbar({
   title,
@@ -20,7 +20,7 @@ export function Toolbar({
 export function Spinner() {
   return (
     <div className="center">
-      <div className="spinner" />
+      <div className="spinner" role="status" aria-label="Loading" />
     </div>
   );
 }
@@ -44,19 +44,40 @@ export function Modal({
   onClose: () => void;
   children: ReactNode;
 }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
+  useEffect(() => {
+    const dialog = dialogRef.current!;
+    const previousFocus = document.activeElement;
+    dialog.showModal();
+    return () => {
+      dialog.close();
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
+    };
+  }, []);
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <dialog ref={dialogRef} className="modal-backdrop" aria-labelledby={titleId}
+      onCancel={(event) => { event.preventDefault(); event.stopPropagation(); onClose(); }}
+      onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          {title}
-          <button onClick={onClose} style={{ fontSize: 18, color: "var(--text-dim)" }}>
+          <span id={titleId}>{title}</span>
+          <button type="button" aria-label="Close dialog" onClick={onClose} style={{ fontSize: 18, color: "var(--text-dim)" }}>
             ✕
           </button>
         </div>
         <div className="modal-body">{children}</div>
       </div>
-    </div>
+    </dialog>
   );
+}
+
+export function ErrorNotice({ error, retry }: { error: unknown; retry?: () => void }) {
+  if (!error) return null;
+  return <div className="error-banner" role="alert">
+    {error instanceof Error ? error.message : "Request failed. Please try again."}
+    {retry && <button className="btn" style={{ marginLeft: 12 }} onClick={retry}>Retry</button>}
+  </div>;
 }
 
 export function Toggle({
