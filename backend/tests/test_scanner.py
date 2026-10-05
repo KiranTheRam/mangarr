@@ -147,3 +147,28 @@ class TestFindExistingFolder:
         (tmp_path / "One Piece Manga").mkdir()
         s = Series(id=1, title="One Piece", alt_titles="")
         assert find_existing_folder(tmp_path, s) == "One Piece Manga"
+
+
+def test_scan_repairs_omnibus_mappings_and_clears_false_ownership(tmp_path):
+    first = tmp_path / 'Series - Vol. 01.cbz'
+    second = tmp_path / 'Series - Vol. 02.cbz'
+    with zipfile.ZipFile(first, 'w') as z:
+        z.writestr('Series - c016x6 (v02) - p470.png', PNG)
+    with zipfile.ZipFile(second, 'w') as z:
+        z.writestr('Series - c017 (v03) - p001.jpg', PNG)
+        z.writestr('Series - c028x5 (v04) - p441.png', PNG)
+    chapters = chs((16.6, 2), (17, 3), (28.5, 4), (5.5, 1))
+    # The old scanner assigned original-edition volume 2 to English book 2.
+    chapters[0].downloaded = True
+    chapters[0].file_path = str(second)
+    chapters[3].downloaded = True
+    chapters[3].file_path = str(first)
+    series = Series(id=1, title='Series', folder_name='Series', alt_titles='')
+    result = scan_series(series, chapters, [tmp_path])
+    assert result.cleared == 2
+    assert chapters[0].file_path == str(first)
+    assert chapters[1].file_path == str(second) and chapters[2].file_path == str(second)
+    assert not chapters[3].downloaded and chapters[3].file_path == ''
+    # A second scan neither changes ownership nor loses the corrected pointers.
+    again = scan_series(series, chapters, [tmp_path])
+    assert again.cleared == 0 and again.matched_chapters == 0

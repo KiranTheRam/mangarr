@@ -135,3 +135,48 @@ async def test_import_retries_when_qbittorrent_moves_content(tmp_path, monkeypat
     finally:
         tasks._import_path_missing_counts.clear()
         await engine.dispose()
+
+
+async def test_torrent_import_maps_english_book_to_actual_chapters(tmp_path, monkeypatch):
+    import zipfile
+    from mangarr.models import Chapter
+    from mangarr.library.naming import DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME
+
+    engine = create_async_engine('sqlite+aiosqlite://')
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with maker() as session:
+            series = Series(title='Vinland Saga', sort_title='vinland saga',
+                            root_folder=RootFolder(path=str(tmp_path / 'library')),
+                            folder_name='Vinland Saga')
+            series.chapters = [Chapter(number=n, volume=v, downloaded=False)
+                               for n, v in ((16., 2), (17., 3), (28.5, 4))]
+            session.add(series)
+            await session.commit()
+            download = Download(series_id=series.id, kind=DownloadKind.TORRENT,
+                                status=DownloadStatus.IMPORTING, title='English book 2')
+            session.add(download)
+            await session.commit()
+            source = tmp_path / 'Vinland Saga v02.cbz'
+            with zipfile.ZipFile(source, 'w') as archive:
+                archive.writestr('Vinland Saga c017 (v03) - p001.jpg', b'page')
+                archive.writestr('Vinland Saga c028x5 (v04) - p441.png', b'page')
+            monkeypatch.setattr(tasks.notifications, 'notify_import', lambda *a: None)
+            monkeypatch.setattr(tasks, '_notify_kavita', lambda *a: None)
+            await tasks._import_torrent(session, download, source, {
+                'naming_template': DEFAULT_TEMPLATE,
+                'naming_template_no_volume': DEFAULT_TEMPLATE_NO_VOLUME,
+                'import_mode': 'copy',
+            })
+            await session.refresh(download)
+            assert download.status == DownloadStatus.DONE
+            await session.refresh(series, ['chapters'])
+            by_number = {c.number: c for c in series.chapters}
+            assert not by_number[16.].downloaded
+            for n in (17., 28.5):
+                assert by_number[n].downloaded
+                assert by_number[n].file_path.endswith('Vinland Saga - Vol. 02.cbz')
+    finally:
+        await engine.dispose()

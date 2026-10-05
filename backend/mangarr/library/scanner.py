@@ -117,6 +117,22 @@ def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) ->
         media.extend(find_media_files(folder))
     match = match_files(media, chapters)
 
+    # Explicit page labels can disprove an old original-edition assignment
+    # to an omnibus even though the recorded file still exists.
+    known_content = {
+        str(m.media.path.resolve()): m.content_chapters
+        for m in match.matched if m.content_chapters is not None
+    }
+    for chapter in chapters:
+        if not chapter.file_path:
+            continue
+        content = known_content.get(str(Path(chapter.file_path).resolve()))
+        if content is not None and chapter.number not in content:
+            if chapter.downloaded:
+                result.cleared += 1
+            chapter.downloaded = False
+            chapter.file_path = ""
+
     owned_now: set[int] = set()
 
     # exact chapter files first — they take precedence over volume coverage
@@ -158,7 +174,7 @@ def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) ->
             owned_now.add(chapter.id)
 
     result.unmatched = match.unmatched
-    result.cleared = _reconcile(chapters, keep=owned_now)
+    result.cleared += _reconcile(chapters, keep=owned_now)
     log.info("Scanned %r across %d folder(s): +%d chapters, %d volume files, "
              "%d unmatched, -%d cleared", series.title, len(existing),
              result.matched_chapters, result.volume_files, result.unmatched_count,

@@ -455,6 +455,7 @@ class CleanupGroupOut(BaseModel):
 class CleanupPlanOut(BaseModel):
     groups: list[CleanupGroupOut] = []
     orphans: list[CleanupFileOut] = []
+    overlaps: list[CleanupFileOut] = []
 
 
 class CleanupApplyIn(BaseModel):

@@ -177,7 +177,7 @@ def sanitize_filename(name: str) -> str:
 # "c002", "ch 21", "Ch. 21", "Chapter 3", "_Chapter_1" — the lookbehind (no
 # preceding letter) lets it match after an underscore/bracket/digit too, since
 # \b treats "_" as a word char and would miss "[0001]_Chapter_1"
-CHAPTER_PREFIX_PATTERN = re.compile(r"(?<![a-z])c(?:h(?:apter)?)?[ ._]{0,2}(\d+(?:\.\d+)?)", re.I)
+CHAPTER_PREFIX_PATTERN = re.compile(r"(?<![a-z])c(?:h(?:apter)?)?[ ._]{0,2}(\d+(?:[.x]\d+)?)", re.I)
 TRAILING_NUMBER_PATTERN = re.compile(r"\b(\d+(?:\.\d+)?)\s*$")
 BRACKET_GROUPS = re.compile(r"\([^)]*\)|\[[^\]]*\]")
 VOLUME_PATTERN = re.compile(r"(?<![a-z])v(?:ol(?:ume)?)?[ ._]{0,2}(\d+)", re.I)
@@ -192,7 +192,7 @@ def has_chapter_marker(text: str) -> bool:
 def parse_chapter_number(text: str) -> float | None:
     m = CHAPTER_PREFIX_PATTERN.search(text)
     if m:
-        return float(m.group(1))
+        return float(m.group(1).lower().replace("x", "."))
     # scene-style names bury the chapter before tag groups:
     # "Kagurabachi 057 (2024) (Digital) (1r0n)" → strip (…)/[…], then the
     # chapter is the trailing number

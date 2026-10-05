@@ -258,6 +258,7 @@ async def cleanup_plan(series_id: int, session: AsyncSession = Depends(get_sessi
         groups=[CleanupGroupOut(label=g.label, files=[out(f) for f in g.files])
                 for g in plan.groups],
         orphans=[out(f) for f in plan.orphans],
+        overlaps=[out(f) for f in plan.overlaps],
     )
 
 
@@ -267,13 +268,19 @@ async def cleanup_apply(
 ):
     from ..library.cleanup import apply_cleanup
 
-    series = await _load(session, series_id)
-    result = apply_cleanup(series, _active_chapters(series), _folders_of(series), body.delete)
-    await session.commit()
-    return CleanupResultOut(
-        deleted=result.deleted, repointed=result.repointed,
-        skipped=result.skipped, freed_bytes=result.freed_bytes,
-    )
+    from ..jobs.tasks import acquire_series_lock
+
+    lock = await acquire_series_lock(series_id)
+    try:
+        series = await _load(session, series_id)
+        result = apply_cleanup(series, _active_chapters(series), _folders_of(series), body.delete)
+        await session.commit()
+        return CleanupResultOut(
+            deleted=result.deleted, repointed=result.repointed,
+            skipped=result.skipped, freed_bytes=result.freed_bytes,
+        )
+    finally:
+        lock.release()
 
 
 @router.post("/series/{series_id}/files/map-range", response_model=FileMapRangeOut)

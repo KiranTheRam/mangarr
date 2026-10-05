@@ -39,7 +39,7 @@ from ..db import session_scope
 from ..download.direct import download_chapter_to_cbz
 from ..download.qbittorrent import QbtClient
 from ..library.importer import import_torrent_payload
-from ..library.matcher import find_media_files
+from ..library.matcher import archive_chapter_numbers, find_media_files
 from ..library.naming import chapter_path, series_folder, volume_filename
 from ..library.volume_merge import merge_chapter_archives
 from ..metadata.anilist import provider as anilist
@@ -1298,9 +1298,10 @@ async def _import_torrent(
                 chapter.file_source = "nyaa"
             chapter.downloaded = True
         elif volume is not None:
-            # a volume archive covers every chapter assigned to that volume
+            content = archive_chapter_numbers(dest)
             for ch in series.chapters:
-                if not ch.excluded and ch.volume == volume and not ch.downloaded:
+                covered = ch.number in content if content is not None else ch.volume == volume
+                if not ch.excluded and covered and not ch.downloaded:
                     ch.downloaded = True
                     ch.file_path = str(dest)
     dl.status = DownloadStatus.DONE

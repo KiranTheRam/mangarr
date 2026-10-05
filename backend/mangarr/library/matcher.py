@@ -1,13 +1,13 @@
 """Shared, read-only matching of on-disk files to tracked chapters.
 
-Used both by the importer (copying completed downloads into the library) and
-the scanner (adopting an existing library in place). Matching is filename-based
-and never opens files; comicinfo_title() reads a CBZ's ComicInfo.xml on demand
-(cached per file version) for callers that already matched the file to a
-chapter. Files are never written."""
+Used by the importer, scanner and cleanup. Volume CBZ/ZIP archives with explicit
+chapter labels on every page use those labels instead of assuming the release's
+volume number matches the metadata edition. Archive directories and ComicInfo
+titles are cached per file version; page images are never read or written."""
 
 import zipfile
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -36,6 +36,7 @@ class MatchedFile:
     chapter: Chapter | None  # the single chapter this file is, if any
     volume: int | None  # set when the file is a whole-volume archive
     covered_chapters: list[Chapter] = field(default_factory=list)
+    content_chapters: frozenset[float] | None = None  # authoritative archive labels
 
 
 @dataclass
@@ -126,6 +127,43 @@ def _read_comicinfo_title(path: Path) -> str:
         return ""
 
 
+def archive_chapter_numbers(path: Path) -> frozenset[float] | None:
+    """Explicit chapter labels from every image member of a CBZ/ZIP.
+
+    A book number can refer to a different edition (e.g. a two-in-one English
+    volume). Only complete labeling overrides metadata coverage; generic page
+    numbers, partly labeled archives and unsupported formats use the existing
+    filename/metadata fallback. Read the ZIP directory, never page payloads.
+    """
+    if path.suffix.lower() not in {".cbz", ".zip"}:
+        return None
+    try:
+        stat = path.stat()
+        return _archive_chapter_numbers(str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=256)
+def _archive_chapter_numbers(path: str, mtime_ns: int, size: int) -> frozenset[float] | None:
+    numbers: set[float] = set()
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.infolist():
+                name = Path(member.filename)
+                if member.is_dir() or name.suffix.lower() not in IMAGE_EXTS:
+                    continue
+                if not has_chapter_marker(name.stem):
+                    return None
+                number = parse_chapter_number(name.stem)
+                if number is None:
+                    return None
+                numbers.add(number)
+    except (OSError, zipfile.BadZipFile):
+        return None
+    return frozenset(numbers) if numbers else None
+
+
 def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
     """Match each media file to a chapter (by number) or, for whole-volume
     archives, to every chapter assigned to that volume."""
@@ -142,15 +180,14 @@ def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
         if chapter is not None:
             matched.append(MatchedFile(media=mf, chapter=chapter, volume=None,
                                        covered_chapters=[chapter]))
-        elif mf.volume_number is not None and mf.volume_number in chapters_in_volume:
-            covered = chapters_in_volume[mf.volume_number]
-            matched.append(MatchedFile(media=mf, chapter=None, volume=mf.volume_number,
-                                       covered_chapters=list(covered)))
         elif mf.volume_number is not None:
-            # a volume archive for a volume we don't have chapter rows for yet;
-            # keep the volume tag so callers can still name it, but no coverage
+            content = None if mf.is_dir else archive_chapter_numbers(mf.path)
+            if content is not None:
+                covered = [c for c in chapters if c.number in content]
+            else:
+                covered = chapters_in_volume.get(mf.volume_number, [])
             matched.append(MatchedFile(media=mf, chapter=None, volume=mf.volume_number,
-                                       covered_chapters=[]))
+                                       covered_chapters=list(covered), content_chapters=content))
         else:
             unmatched.append(mf)
     return MatchResult(matched=matched, unmatched=unmatched)

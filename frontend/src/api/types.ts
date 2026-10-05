@@ -286,6 +286,7 @@ export interface CleanupGroup {
 export interface CleanupPlan {
   groups: CleanupGroup[];
   orphans: CleanupFile[];
+  overlaps: CleanupFile[];
 }
 
 export interface SourceCandidate {
