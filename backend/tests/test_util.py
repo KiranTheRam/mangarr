@@ -96,3 +96,9 @@ class TestNormalizeTitle:
 
     def test_multiplication_sign_matches_x(self):
         assert normalize_title("Spy × Family") == normalize_title("Spy x Family")
+
+
+def test_scene_extra_chapter_labels_do_not_collapse_to_regular_chapters():
+    assert parse_chapter_number('Vinland Saga - c016x6 (v02) - p470') == 16.6
+    assert parse_chapter_number('Series C028X5 - p001') == 28.5
+    assert parse_chapter_number('Series c028.5 - p001') == 28.5

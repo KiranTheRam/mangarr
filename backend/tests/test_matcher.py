@@ -96,3 +96,43 @@ class TestMatchFiles:
         res = match_files(find_media_files(tmp_path), chs)
         m = res.matched[0]
         assert m.volume == 9 and m.covered_chapters == [] and not res.unmatched
+
+
+class TestArchiveCoverage:
+    def test_english_omnibus_uses_explicit_page_chapters(self, tmp_path):
+        path = tmp_path / 'Vinland Saga - Vol. 02.cbz'
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('Vinland Saga - c017 (v03) - p000 [Cover].jpg', PNG)
+            archive.writestr('Vinland Saga - c028x5 (v04) - p441.png', PNG)
+        chs = chapters((16, 2), (17, 3), (28.5, 4))
+        matched = match_files(find_media_files(tmp_path), chs).matched[0]
+        assert matched.volume == 2  # release/book numbering stays intact
+        assert [c.number for c in matched.covered_chapters] == [17., 28.5]
+        assert matched.content_chapters == {17., 28.5}
+
+    def test_partial_page_labels_keep_metadata_fallback(self, tmp_path):
+        path = tmp_path / 'Series v01.cbz'
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('Series c001 - p001.jpg', PNG)
+            archive.writestr('002.jpg', PNG)
+        matched = match_files(find_media_files(tmp_path), chapters((1, 1), (2, 1))).matched[0]
+        assert matched.content_chapters is None
+        assert [c.number for c in matched.covered_chapters] == [1., 2.]
+
+    def test_content_cache_invalidates_after_archive_changes(self, tmp_path):
+        from mangarr.library.matcher import archive_chapter_numbers
+        path = tmp_path / 'Series v01.cbz'
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('Series c001 - p001.jpg', PNG)
+        assert archive_chapter_numbers(path) == {1.}
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('Series c002 - p001.jpg', PNG)
+            archive.writestr('Series c003 - p001.jpg', PNG)
+        assert archive_chapter_numbers(path) == {2., 3.}
+
+    def test_untracked_book_number_can_still_match_chapter_labels(self, tmp_path):
+        path = tmp_path / 'Series v99.cbz'
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('Series c001 - p001.jpg', PNG)
+        matched = match_files(find_media_files(tmp_path), chapters((1, 1))).matched[0]
+        assert [c.number for c in matched.covered_chapters] == [1.]

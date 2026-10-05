@@ -245,7 +245,7 @@ export function CleanupModal({
       k[i] = (g.files.find((f) => f.keep) ?? g.files[0]).path;
     });
     setKeepers(k);
-    setOrphanDel(Object.fromEntries(data.orphans.map((o) => [o.path, !o.keep])));
+    setOrphanDel(Object.fromEntries([...data.orphans, ...data.overlaps].map((o) => [o.path, !o.keep])));
   }, [data]);
 
   const deletePaths = () => {
@@ -255,7 +255,7 @@ export function CleanupModal({
         if (f.path !== keepers[i]) del.push(f.path);
       });
     });
-    data?.orphans.forEach((o) => {
+    [...(data?.orphans ?? []), ...(data?.overlaps ?? [])].forEach((o) => {
       if (orphanDel[o.path]) del.push(o.path);
     });
     return del;
@@ -288,10 +288,35 @@ export function CleanupModal({
             <button className="btn primary" onClick={onClose}>Done</button>
           </div>
         </>
-      ) : !data || (data.groups.length === 0 && data.orphans.length === 0) ? (
+      ) : !data || (data.groups.length === 0 && data.orphans.length === 0 && data.overlaps.length === 0) ? (
         <p style={{ color: "var(--text-dim)" }}>No duplicates or stray files — nothing to clean up.</p>
       ) : (
         <>
+          {data.overlaps.length > 0 && (
+            <>
+              <h4 className="files-heading">Overlapping files</h4>
+              <p className="section-hint">
+                These files cover chapters also available in files recommended to keep.
+                Cleanup will move chapter references to surviving files and skip deletions
+                that would remove the last copy of a tracked chapter.
+              </p>
+              {data.overlaps.map((o) => (
+                <label key={o.path} className="cleanup-row">
+                  <input
+                    type="checkbox"
+                    checked={!!orphanDel[o.path]}
+                    onChange={(e) => setOrphanDel({ ...orphanDel, [o.path]: e.target.checked })}
+                  />
+                  <span className={orphanDel[o.path] ? "del" : ""}>{o.name}</span>
+                  <span className="cleanup-meta">
+                    {formatBytes(o.size)}
+                    <span className="tag">in use</span>
+                    {orphanDel[o.path] && <span className="tag danger-tag">delete</span>}
+                  </span>
+                </label>
+              ))}
+            </>
+          )}
           {data.groups.length > 0 && (
             <>
               <h4 className="files-heading">Duplicates — choose the copy to keep</h4>
