@@ -108,6 +108,20 @@ def test_cleanup_still_groups_plain_copies_of_numbered_titles(
     assert default_deletions(p) == [duplicate]
 
 
+@pytest.mark.parametrize("keeper,duplicate,number", [
+    ("S - Vol. 03 Ch. 0021.cbz", "S v03 c021 (Digital).cbz", 21),
+    ("S - Ch. 0042.cbz", "S - v05c42.cbz", 42),
+])
+def test_chapter_files_that_also_name_their_volume_still_group(tmp_path, keeper, duplicate, number):
+    make(tmp_path / keeper)
+    make(tmp_path / duplicate)
+    chs = chapters((number,))
+    own(chs, number, tmp_path / keeper)
+    p = plan(chs, tmp_path)
+    assert [g.label for g in p.groups] == [f"Chapter {number}"]
+    assert default_deletions(p) == [duplicate]
+
+
 def test_duplicate_volume_archives_still_group(tmp_path):
     make(tmp_path / "S v01.cbz")
     make(tmp_path / "S - Vol. 01.cbz")

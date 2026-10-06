@@ -92,9 +92,11 @@ def _provable(mf: MediaFile) -> bool:
         return False
     if mf.chapter_number is None:
         return True  # volume archives and unknown files keep their rules
-    if VOLUME_PATTERN.search(stem):
-        return False
     markers = _chapter_markers(untagged)
+    # "Vol. 03 Ch. 0021" / "v05c42" name both; "v01 (c1fi7)" / "v03 012" only
+    # have a volume, so the chapter number came from a tag or a bare number
+    if VOLUME_PATTERN.search(untagged) and not markers:
+        return False
     if len(_chapter_markers(stem)) > 1 or _chapter_markers(stem) != markers:
         return False
     trailing = TRAILING_NUMBER_PATTERN.search(untagged)
