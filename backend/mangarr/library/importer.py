@@ -13,7 +13,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from ..models import Chapter, Series
-from .matcher import IMAGE_EXTS, MediaFile, find_media_files, match_files
+from .matcher import ARCHIVE_EXTS, IMAGE_EXTS, MediaFile, find_media_files, match_files
 from .naming import chapter_filename, series_folder, volume_filename
 
 log = logging.getLogger(__name__)
@@ -94,9 +94,10 @@ def import_torrent_payload(
         if not only:
             raise ValueError("qBittorrent listed no files to import for this torrent")
         # content_path existing proves nothing when it is the shared folder; a
-        # listed file that is gone was moved mid-import, so let the caller retry
+        # listed archive or page that is gone was moved mid-import, so let the
+        # caller retry. Sidecars (.nfo, .txt …) a user deleted don't matter.
         for path in sorted(only):
-            if not path.exists():
+            if path.suffix.lower() in ARCHIVE_EXTS | IMAGE_EXTS and not path.exists():
                 raise FileNotFoundError(f"torrent file missing: {path}")
     folder = library_root / (series.folder_name or series_folder(series.title))
     folder.mkdir(parents=True, exist_ok=True)

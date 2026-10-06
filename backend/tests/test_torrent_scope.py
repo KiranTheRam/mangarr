@@ -171,6 +171,17 @@ async def test_listed_file_gone_retries_instead_of_finishing_empty(env, category
     assert downloaded == set()
 
 
+async def test_deleted_sidecar_file_does_not_block_the_import(env, category):
+    session, series, dl, library = env
+    make_cbz(category / "Kagurabachi - c003.cbz")
+    # qBittorrent still lists the .nfo the user deleted; only media must exist
+    downloaded = await sync(session, series, dl, content_path=category, save_path=category,
+                            files=[("Kagurabachi - c003.cbz", 1), ("release.nfo", 1)])
+
+    assert dl.status == DownloadStatus.DONE
+    assert downloaded == {3.0}
+
+
 async def test_no_listed_files_fails_visibly(env, category):
     session, series, dl, library = env
     downloaded = await sync(session, series, dl, content_path=category, save_path=category,
