@@ -80,14 +80,28 @@ def import_torrent_payload(
     template: str,
     template_no_volume: str,
     import_mode: str = "hardlink",
+    files: list[Path] | None = None,
 ) -> list[tuple[Path, Chapter | None, int | None]]:
     """Copies/renames payload files into the library. Returns (dest, matched
     chapter, volume) triples; chapter is None for volume archives that span
-    chapters — those carry the parsed volume number instead."""
+    chapters — those carry the parsed volume number instead.
+
+    `files` (the torrent's own files) limits the import to those instead of
+    everything under content_path, which may be a folder shared with other
+    torrents."""
+    only = set(files) if files is not None else None
+    if only is not None:
+        if not only:
+            raise ValueError("qBittorrent listed no files to import for this torrent")
+        # content_path existing proves nothing when it is the shared folder; a
+        # listed file that is gone was moved mid-import, so let the caller retry
+        for path in sorted(only):
+            if not path.exists():
+                raise FileNotFoundError(f"torrent file missing: {path}")
     folder = library_root / (series.folder_name or series_folder(series.title))
     folder.mkdir(parents=True, exist_ok=True)
     imported: list[tuple[Path, Chapter | None, int | None]] = []
-    result = match_files(find_media_files(content_path), chapters)
+    result = match_files(find_media_files(content_path, only), chapters)
 
     def place(media: MediaFile, chapter: Chapter | None, volume: int | None) -> None:
         ext = _dest_ext(media)
@@ -105,7 +119,7 @@ def import_torrent_payload(
             _validate_existing(dest)
         else:
             if media.is_dir:
-                _pack_images(media.path, dest)
+                _pack_images(media.path, dest, only)
             else:
                 place_file(media.path, dest, import_mode)
         imported.append((dest, chapter, volume if chapter is None else None))
@@ -117,9 +131,10 @@ def import_torrent_payload(
     return imported
 
 
-def _pack_images(img_dir: Path, dest: Path) -> None:
+def _pack_images(img_dir: Path, dest: Path, only: set[Path] | None = None) -> None:
     images = sorted(
-        p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+        p for p in img_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS and (only is None or p in only)
     )
     with _atomic_destination(dest) as temporary:
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as zf:

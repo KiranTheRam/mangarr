@@ -1222,9 +1222,15 @@ async def sync_qbittorrent() -> None:
                 _torrent_missing_counts.pop(dl.id, None)
                 dl.progress = torrent.progress
                 if torrent.is_complete and torrent.content_path:
+                    # import only the torrent's own files: under qBittorrent's
+                    # "Don't create subfolder" layout content_path is the shared
+                    # category folder, holding every other torrent's payload too
+                    files = [Path(torrent.save_path) / name
+                             for name in await client.torrent_files(torrent.hash)]
                     dl.status = DownloadStatus.IMPORTING
                     await session.commit()
-                    await _import_torrent(session, dl, Path(torrent.content_path), values)
+                    await _import_torrent(session, dl, Path(torrent.content_path), values,
+                                          files=files)
                 else:
                     await session.commit()
         finally:
@@ -1232,7 +1238,8 @@ async def sync_qbittorrent() -> None:
 
 
 async def _import_torrent(
-    session: AsyncSession, dl: Download, content_path: Path, values: dict[str, str]
+    session: AsyncSession, dl: Download, content_path: Path, values: dict[str, str],
+    files: list[Path] | None = None,
 ) -> None:
     series = await _load_series(session, dl.series_id) if dl.series_id else None
     if series is None or not series.root_folder:
@@ -1260,7 +1267,7 @@ async def _import_torrent(
             [chapter for chapter in series.chapters if not chapter.excluded],
             Path(series.root_folder.path),
             values["naming_template"], values["naming_template_no_volume"],
-            import_mode=values.get("import_mode", "hardlink"),
+            import_mode=values.get("import_mode", "hardlink"), files=files,
         )
     except FileNotFoundError as exc:
         # qBittorrent may finish downloading and then atomically move the

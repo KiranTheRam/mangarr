@@ -19,6 +19,8 @@ class QbtTorrent:
     state: str
     content_path: str
     category: str
+    # torrents/files names are relative to this, not to content_path
+    save_path: str = ""
 
     @property
     def is_complete(self) -> bool:
@@ -120,6 +122,7 @@ class QbtClient:
                 state=t.get("state", ""),
                 content_path=t.get("content_path", ""),
                 category=t.get("category", ""),
+                save_path=t.get("save_path", ""),
             )
             for t in resp.json()
         ]
@@ -147,7 +150,16 @@ class QbtClient:
             state=t.get("state", ""),
             content_path=t.get("content_path", ""),
             category=t.get("category", ""),
+            save_path=t.get("save_path", ""),
         )
+
+    async def torrent_files(self, torrent_hash: str) -> list[str]:
+        """The torrent's wanted files, relative to its save_path. Unlike
+        content_path these never reach outside the torrent: without a root
+        folder, a multi-file torrent's content_path IS the save path."""
+        resp = await self._request("GET", "/torrents/files", params={"hash": torrent_hash})
+        # priority 0 is "do not download": absent (or partial) on disk
+        return [f["name"] for f in resp.json() if f.get("name") and f.get("priority") != 0]
 
 
 async def test_connection(base_url: str, username: str, password: str) -> str:
