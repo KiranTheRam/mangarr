@@ -229,3 +229,17 @@ def normalize_title(title: str) -> str:
     t = t.replace("×", "x")
     t = re.sub(r"[^a-z0-9]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()
+
+
+_DIGIT_RUNS = re.compile(r"(\d+)")
+
+
+def natural_key(text: str) -> tuple:
+    """Sort key that orders embedded numbers by value, so unpadded page names
+    sort in reading order: 1.jpg, 2.jpg, 10.jpg (a plain sort gives 1, 10, 2).
+    Ties fall back to the original text so the order is total."""
+    parts = tuple(
+        (0, int(part), "") if part.isdigit() else (1, 0, part.casefold())
+        for part in _DIGIT_RUNS.split(text) if part
+    )
+    return parts, text
