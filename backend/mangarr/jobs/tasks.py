@@ -1067,6 +1067,20 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             series.title, series.folder_name,
             chapter.number, chapter.volume, chapter.title,
         )
+        # a template that drops precision can still map two chapters to one
+        # file; writing would silently replace the other chapter's archive
+        owner = await session.scalar(
+            select(Chapter.number).where(
+                Chapter.series_id == series.id,
+                Chapter.id != chapter.id,
+                Chapter.file_path == str(dest),
+            )
+        )
+        if owner is not None:
+            raise RuntimeError(
+                f"{dest.name} already holds chapter {owner:g}; "
+                "use a naming template that keeps chapter numbers distinct"
+            )
         dest_preexisted = dest.exists()
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,

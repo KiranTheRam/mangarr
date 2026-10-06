@@ -17,13 +17,16 @@ _CHAPTER_FMT = re.compile(r"\{chapter:0(\d+)\.1f\}")
 
 def _format_chapter(template: str, chapter: float) -> str:
     """Renders {chapter:04.1f} as zero-padded but without a trailing .0 for
-    whole numbers: 21 → 0021, 21.5 → 0021.5"""
+    whole numbers: 21 → 0021, 21.5 → 0021.5. Every decimal the source gave is
+    kept (12.25 → 0012.25), because rounding to one place gives distinct
+    chapters such as 12.21 and 12.24 the same filename."""
 
     def repl(m: re.Match) -> str:
         width = int(m.group(1))
         if float(chapter).is_integer():
             return f"{int(chapter):0{width}d}"
-        return f"{chapter:0{width + 2}.1f}"
+        whole, _, fraction = repr(float(chapter)).partition(".")
+        return f"{int(whole):0{width}d}.{fraction}"
 
     return _CHAPTER_FMT.sub(repl, template)
 
