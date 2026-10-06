@@ -18,6 +18,12 @@ def test_natural_key_orders_numbers_by_value():
     ]
 
 
+def test_natural_key_accepts_non_decimal_digit_characters():
+    from mangarr.util import natural_key
+    # "①" is a digit to str.isdigit() but not \d: it must sort as text, not crash
+    assert sorted(["1①2.jpg", "1.jpg", "10.jpg"], key=natural_key) == ["1.jpg", "1①2.jpg", "10.jpg"]
+
+
 def test_natural_key_keeps_zero_padded_order():
     from mangarr.util import natural_key
     padded = [f"{n:03d}.jpg" for n in (1, 2, 9, 10, 100)]

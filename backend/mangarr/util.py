@@ -239,7 +239,9 @@ def natural_key(text: str) -> tuple:
     sort in reading order: 1.jpg, 2.jpg, 10.jpg (a plain sort gives 1, 10, 2).
     Ties fall back to the original text so the order is total."""
     parts = tuple(
-        (0, int(part), "") if part.isdigit() else (1, 0, part.casefold())
+        # isdecimal, not isdigit: "①" or "²" are digits to isdigit() but not
+        # matched by \d, and int() rejects them
+        (0, int(part), "") if part.isdecimal() else (1, 0, part.casefold())
         for part in _DIGIT_RUNS.split(text) if part
     )
     return parts, text
