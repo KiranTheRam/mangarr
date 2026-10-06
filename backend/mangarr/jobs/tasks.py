@@ -103,7 +103,11 @@ async def _raise_if_download_removed(session: AsyncSession, download_id: int) ->
             select(Download.status, Download.error).where(Download.id == download_id)
         )
     ).one_or_none()
-    if row and row[0] == DownloadStatus.FAILED and row[1] == REMOVED_BY_USER:
+    # a vanished row was deleted out from under the worker; carrying on would
+    # commit against rows that no longer exist and orphan the finished file
+    if row is None:
+        raise DownloadCancelled("download record was deleted")
+    if row[0] == DownloadStatus.FAILED and row[1] == REMOVED_BY_USER:
         raise DownloadCancelled(REMOVED_BY_USER)
 
 
