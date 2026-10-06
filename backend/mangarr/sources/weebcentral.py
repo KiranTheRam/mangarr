@@ -16,6 +16,10 @@ from .base import DirectSource, SourceChapter, SourceSeries
 BASE_URL = "https://weebcentral.com"
 SERIES_URL_RE = re.compile(r"/series/([A-Z0-9]+)")
 CHAPTER_URL_RE = re.compile(r"/chapters/([A-Z0-9]+)")
+SEASON_CHAPTER_RE = re.compile(
+    r"\b(?:season|s)\s*(\d+)\s*[-:–—]?\s*(?:chapter|ch)\.?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 
 _limiter = RateLimiter(rate=1, per_seconds=1)
 _image_limiter = RateLimiter(rate=5, per_seconds=1)
@@ -92,21 +96,41 @@ class WeebCentralSource(DirectSource):
 
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:
         soup = await self._get_html(f"{BASE_URL}/series/{external_id}/full-chapter-list")
-        chapters: dict[float, SourceChapter] = {}
+        rows: list[tuple[str, str, float, tuple[int, float] | None]] = []
+        season_numbers: dict[int, set[float]] = {}
         for link in soup.find_all("a", href=CHAPTER_URL_RE):
-            m = CHAPTER_URL_RE.search(link.get("href", ""))
-            if not m:
+            match = CHAPTER_URL_RE.search(link.get("href", ""))
+            if not match:
                 continue
             text = self._chapter_label(link)
             number = parse_chapter_number(text)
             if number is None:
                 continue
+            season_match = SEASON_CHAPTER_RE.search(text)
+            season = None
+            if season_match:
+                season = (int(season_match.group(1)), float(season_match.group(2)))
+                season_numbers.setdefault(season[0], set()).add(season[1])
+            rows.append((match.group(1), text, number, season))
+
+        offsets: dict[int, float] = {}
+        if len(season_numbers) > 1:
+            next_overall = 1.0
+            for season, numbers in sorted(season_numbers.items()):
+                first = min(numbers)
+                offsets[season] = next_overall - first
+                next_overall = max(numbers) + offsets[season] + 1
+
+        chapters: dict[float, SourceChapter] = {}
+        for chapter_id, text, number, season in rows:
+            if season is not None and offsets:
+                number = season[1] + offsets[season[0]]
             if number not in chapters:
                 chapters[number] = SourceChapter(
                     source_name=self.name,
-                    external_id=m.group(1),
+                    external_id=chapter_id,
                     number=number,
-                    url=f"{BASE_URL}/chapters/{m.group(1)}",
+                    url=f"{BASE_URL}/chapters/{chapter_id}",
                 )
         return sorted(chapters.values(), key=lambda c: c.number)
 

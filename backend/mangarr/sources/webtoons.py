@@ -86,13 +86,14 @@ def assign_numbers(titles: list[str]) -> list[float]:
     """Chapter numbers for episodes given in release order (see module doc)."""
     parsed = [episode_number(title) for title in titles]
     known = [number for number in parsed if number is not None]
-    if not known or _restarts(titles, parsed):
-        # numbering restarts (or is absent): count in release order, anchored
-        # so a series that opens with "Episode 0" keeps starting at 0
-        first = next((i for i, number in enumerate(parsed) if number is not None), None)
-        start = parsed[first] - first if first is not None else 1.0
-        start = max(start, 0.0)
-        return [start + i for i in range(len(titles))]
+    if not known:
+        return [float(i) for i in range(1, len(titles) + 1)]
+    if _restarts(titles, parsed):
+        # A multi-season run is one overall series in Mangarr. Count it from
+        # chapter 1 even when each season calls its opener "Episode 0"; this
+        # agrees with one-based batch releases and prevents S2 Ep.0 from being
+        # offered again as chapter 0.
+        return [float(i) for i in range(1, len(titles) + 1)]
 
     numbers: list[float] = []
     used: set[float] = set()
@@ -175,16 +176,24 @@ class WebtoonsSource(DirectSource):
         ]
         episodes.sort(key=lambda episode: episode.get("episodeNo") or 0)
         titles = [str(episode.get("episodeTitle") or "").strip() for episode in episodes]
+        parsed = [episode_number(title) for title in titles]
+        season_reset = _restarts(titles, parsed)
         chapters = []
         for episode, title, number in zip(episodes, titles, assign_numbers(titles)):
             link = str(episode["viewerLink"])
+            display_title = _TITLE_PREFIX.sub("", title).strip()
+            if season_reset and not display_title:
+                # Once local episode numbers are translated into overall
+                # chapter numbers, retain the season/episode label so a stale
+                # pre-translation title can be corrected on refresh.
+                display_title = title
             chapters.append(
                 SourceChapter(
                     source_name=self.name,
                     # the viewer path is all get_pages needs
                     external_id=link,
                     number=number,
-                    title=_TITLE_PREFIX.sub("", title).strip(),
+                    title=display_title,
                     url=urljoin(SITE_URL, link),
                 )
             )
