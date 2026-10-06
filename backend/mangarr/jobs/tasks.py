@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1365,10 +1366,24 @@ async def _import_torrent(
             dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
+    # copy mode, a cross-device hardlink fallback and image packing rewrite
+    # every byte (and the duplicate preflight reads every archive); for a
+    # multi-GB payload that would freeze the API, the queue and this sync, so
+    # it runs off the loop. ORM objects aren't thread-safe: the importer gets
+    # plain snapshots, and the chapters it matched are mapped back to this
+    # session's objects for the updates below.
+    candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
     try:
-        imported = import_torrent_payload(
-            content_path, series,
-            [chapter for chapter in series.chapters if not chapter.excluded],
+        placed = await asyncio.to_thread(
+            import_torrent_payload,
+            content_path,
+            SimpleNamespace(title=series.title, folder_name=series.folder_name),
+            [
+                SimpleNamespace(id=chapter.id, number=chapter.number,
+                                volume=chapter.volume, title=chapter.title,
+                                downloaded=chapter.downloaded, file_path=chapter.file_path)
+                for chapter in candidates.values()
+            ],
             Path(series.root_folder.path),
             values["naming_template"], values["naming_template_no_volume"],
             import_mode=values.get("import_mode", "hardlink"), files=files,
@@ -1400,6 +1415,10 @@ async def _import_torrent(
         await session.commit()
         return
     _import_path_missing_counts.pop(dl.id, None)
+    imported = [
+        (dest, candidates[match.id] if match is not None else None, volume)
+        for dest, match, volume in placed
+    ]
     for dest, chapter, volume in imported:
         if chapter is not None:
             # a destination that already was this chapter's file keeps its
