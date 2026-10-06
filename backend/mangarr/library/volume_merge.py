@@ -47,7 +47,6 @@ def merge_chapter_archives(
     ) as handle:
         temporary = Path(handle.name)
     try:
-        temporary.chmod(NEW_FILE_MODE)  # not the temp file's 0600
         pages = 0
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as out:
             for index, (_number, path) in enumerate(ordered, start=1):
@@ -64,6 +63,9 @@ def merge_chapter_archives(
             out.writestr("ComicInfo.xml", build_comicinfo(
                 series=series_title, volume=volume, summary=summary, page_count=pages,
             ))
+        # not the temp file's 0600 — set once written, in case the umask
+        # leaves no owner write
+        temporary.chmod(NEW_FILE_MODE)
         temporary.replace(dest)
     finally:
         temporary.unlink(missing_ok=True)
