@@ -2,16 +2,20 @@
 
 Compare chapter coverage as well as file identity: a volume can overlap
 several chapter files even when every file is referenced. Defaults preserve
-at least one copy of each covered chapter. Apply rechecks the entire deletion
-batch against files still on disk and repoints chapters only after deletion.
+at least one copy of each covered chapter. A file whose name can't prove what
+it holds is never offered and never stands in as another file's copy. Apply
+rechecks the entire deletion batch against files still on disk and repoints
+chapters only after deletion.
 """
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..models import Chapter, Series
+from ..util import BRACKET_GROUPS, CHAPTER_PREFIX_PATTERN, TRAILING_NUMBER_PATTERN, VOLUME_PATTERN
 from .matcher import MediaFile, find_media_files, match_files
 from .naming import chapter_filename, series_folder, volume_filename
 
@@ -56,6 +60,45 @@ def _identity(mf: MediaFile, tracked_ch: set[float], tracked_vol: set[int]):
     if mf.volume_number is not None and mf.volume_number in tracked_vol:
         return ("vol", mf.volume_number)
     return ("unknown", str(mf.path))
+
+
+# "Ch. 12-15", "c001 - c010", "v01-03": a marked span of chapters/volumes
+_MARKED_SPAN = re.compile(
+    r"(?<![a-z])(?:c(?:h(?:apter)?)?|v(?:ol(?:ume)?)?)[ ._-]{0,2}\d+(?:\.\d+)?\s*[-–—]\s*"
+    r"(?:(?:c(?:h(?:apter)?)?|v(?:ol(?:ume)?)?)[ ._-]{0,2})?\d",
+    re.IGNORECASE,
+)
+# "Kagurabachi 001-010": a bare span at the end of the untagged name
+_BARE_SPAN = re.compile(r"\b\d+(?:\.\d+)?\s*[-–—]\s*\d+(?:\.\d+)?\s*$")
+
+
+def _chapter_markers(text: str) -> set[float]:
+    return {float(n.lower().replace("x", ".")) for n in CHAPTER_PREFIX_PATTERN.findall(text)}
+
+
+def _provable(mf: MediaFile) -> bool:
+    """Whether a file's name pins down what it holds well enough to offer it
+    (or a file it seems to duplicate) for deletion. The filename parser takes
+    the first number it finds, so it can't be trusted when the name:
+      - spans chapters or volumes ("Ch. 12-15", "v01-03", "001-010");
+      - is read as a chapter but also has a volume marker ("v01 (c1fi7)");
+      - has chapter numbers that disagree, including one only inside a tag
+        ("(c1fi7)") or a title number ("C3 - Cube x Cursed x Curious 012").
+    Such files are kept by default and never prove another file redundant;
+    the user can still select them."""
+    stem = mf.path.name if mf.is_dir else mf.path.stem
+    untagged = BRACKET_GROUPS.sub(" ", stem).strip()
+    if _MARKED_SPAN.search(stem) or _BARE_SPAN.search(untagged):
+        return False
+    if mf.chapter_number is None:
+        return True  # volume archives and unknown files keep their rules
+    if VOLUME_PATTERN.search(stem):
+        return False
+    markers = _chapter_markers(untagged)
+    if len(_chapter_markers(stem)) > 1 or _chapter_markers(stem) != markers:
+        return False
+    trailing = TRAILING_NUMBER_PATTERN.search(untagged)
+    return not (markers and trailing and float(trailing.group(1)) not in markers)
 
 
 def _all_media(folders: list[Path]) -> list[MediaFile]:
@@ -131,14 +174,16 @@ def analyze(
     ch_by_num = {c.number: c for c in chapters}
     coverage = _coverage(media, chapters)
     required = _requirements(coverage, chapters)
-    retained = set(coverage)
+    unprovable = {_canonical(mf.path) for mf in media if not _provable(mf)}
+    retained = set(coverage) - unprovable
 
     by_identity: dict[tuple, list[MediaFile]] = {}
     for mf in media:
         # Radio groups are interchangeable copies, not partial overlaps. A
         # manual mapping may give similarly named files different coverage.
-        # Loose-image directories remain keep-only.
-        if not mf.is_dir and required[_canonical(mf.path)] == coverage[_canonical(mf.path)]:
+        # Loose-image directories and unprovable names remain keep-only.
+        canon = _canonical(mf.path)
+        if not mf.is_dir and canon not in unprovable and required[canon] == coverage[canon]:
             identity = _identity(mf, tracked_ch, tracked_vol)
             key = (*identity, frozenset(coverage[_canonical(mf.path)]))
             by_identity.setdefault(key, []).append(mf)
@@ -167,7 +212,8 @@ def analyze(
         path = str(mf.path)
         key = _canonical(path)
         in_use = key in referenced
-        redundant = not mf.is_dir and _covered_elsewhere(key, coverage, retained, required[key])
+        redundant = (not mf.is_dir and key not in unprovable
+                     and _covered_elsewhere(key, coverage, retained, required[key]))
         if redundant:
             retained.remove(key)
         file = CleanupFile(path, _size(path), in_use, keep=not redundant)
@@ -249,10 +295,11 @@ def apply_cleanup(
             continue
         survivors = {
             other for other, item in media_by_path.items()
-            if other not in delete_set and item.path.exists()
+            if other not in delete_set and item.path.exists() and _provable(item)
         }
         # Protect all known coverage, even if this file is unreferenced or the
-        # database's downloaded flag is stale. Missing files prove nothing.
+        # database's downloaded flag is stale. Missing files prove nothing, and
+        # neither do names _provable rejects.
         if required[key] and not _covered_elsewhere(key, coverage, survivors, required[key]):
             result.skipped += 1
             continue
