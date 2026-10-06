@@ -29,6 +29,8 @@ class ScanResult:
     volume_files: int = 0  # whole-volume archives found
     cleared: int = 0  # chapters whose recorded file vanished
     unmatched: list[MediaFile] = field(default_factory=list)
+    # why the library root couldn't be trusted; nothing was changed when set
+    root_unavailable: str = ""
 
     @property
     def unmatched_count(self) -> int:
@@ -37,6 +39,25 @@ class ScanResult:
 
 def series_dir(root: Path, series: Series) -> Path:
     return root / (series.folder_name or series_folder(series.title))
+
+
+def root_unavailable(root: Path, expect_content: bool = True) -> str:
+    """Why `root` can't be trusted as the library right now ("" when it can).
+
+    A root that is missing — or empty while chapters say files live in it —
+    is far more often an unmounted share, an array that hasn't started, or a
+    container that came up before its mount than a library that really holds
+    nothing. Read as an empty library it would clear every chapter, and the
+    monitor would then download the whole library again."""
+    root = Path(root)
+    try:
+        if not root.is_dir():
+            return f"library root folder {root} is missing — is it mounted?"
+        if expect_content and next(root.iterdir(), None) is None:
+            return f"library root folder {root} is empty — is it mounted?"
+    except OSError as exc:
+        return f"library root folder {root} can't be read: {exc}"
+    return ""
 
 
 def resolve_folders(root: Path, series: Series, extra_paths: list[str]) -> list[Path]:
@@ -103,10 +124,22 @@ def find_existing_folder(root: Path, series: Series) -> str | None:
     return best
 
 
-def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) -> ScanResult:
-    """Mark chapters present across `folders` as downloaded (in place)."""
+def scan_series(
+    series: Series, chapters: list[Chapter], folders: list[Path],
+    root: Path | None = None,
+) -> ScanResult:
+    """Mark chapters present across `folders` as downloaded (in place).
+
+    With `root` given, an unavailable library root (see root_unavailable)
+    leaves every chapter untouched and is reported in the result instead."""
     folders = [Path(f) for f in folders]
     result = ScanResult()
+    if root is not None:
+        reason = root_unavailable(root, expect_content=any(c.downloaded for c in chapters))
+        if reason:
+            log.warning("Not scanning %r: %s", series.title, reason)
+            result.root_unavailable = reason
+            return result
     existing = [f for f in folders if f.exists()]
     if not existing:
         result.cleared = _reconcile(chapters, keep=set())

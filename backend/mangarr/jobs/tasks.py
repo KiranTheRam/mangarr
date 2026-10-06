@@ -540,6 +540,19 @@ def _series_folders(series: Series) -> list[Path]:
     return folders
 
 
+def _library_root_unavailable(series: Series) -> str:
+    """Why the series' library root can't be trusted right now ("" when it
+    can, or when there is no root to protect) — see scanner.root_unavailable."""
+    from ..library.scanner import root_unavailable
+
+    if series.root_folder is None:
+        return ""
+    return root_unavailable(
+        Path(series.root_folder.path),
+        expect_content=any(c.downloaded and not c.excluded for c in series.chapters),
+    )
+
+
 def disk_volume_numbers(series: Series) -> set[int]:
     """Volume numbers of whole-volume archives present in the series' folders."""
     volumes: set[int] = set()
@@ -586,6 +599,10 @@ def refine_volume_map_with_disk(
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
     """Clear downloaded state for chapters whose recorded media file is gone."""
+    reason = _library_root_unavailable(series)
+    if reason:
+        log.warning("Not checking files of %r: %s", series.title, reason)
+        return 0
     missing = 0
     for chapter in series.chapters:
         if chapter.excluded:
@@ -610,7 +627,8 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     folders = _series_folders(series)
     if not folders:
         return
-    scan_series(series, [chapter for chapter in series.chapters if not chapter.excluded], folders)
+    scan_series(series, [chapter for chapter in series.chapters if not chapter.excluded], folders,
+                root=Path(series.root_folder.path))
     await session.commit()
 
 
@@ -1001,6 +1019,13 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         dl.error = "series has no root folder configured"
         await session.commit()
         return
+    unavailable = _library_root_unavailable(series)
+    if unavailable:
+        # writing now would recreate the series folder on the bare mount point
+        dl.status = DownloadStatus.FAILED
+        dl.error = unavailable[:500]
+        await session.commit()
+        return
 
     # page fetches run concurrently and call back into ensure_not_cancelled /
     # on_progress; the shared AsyncSession is not task-safe, so every session
@@ -1240,6 +1265,14 @@ async def _import_torrent(
         dl.error = "torrent has no linked series/root folder; import manually"
         await session.commit()
         return
+    unavailable = _library_root_unavailable(series)
+    if unavailable:
+        # an unmounted library is transient: keep the finished torrent and
+        # retry the import on a later sync instead of writing beside the mount
+        dl.status = DownloadStatus.DOWNLOADING
+        dl.error = f"waiting for the library: {unavailable}"[:500]
+        await session.commit()
+        return
     if not content_path.exists():
         # path as seen by qBittorrent may not be mounted here yet — retry a
         # while, then fail visibly (a path mapping problem never resolves)
@@ -1332,6 +1365,12 @@ async def grab_missing_chapters(
     source links and chapter list have been created. `only_monitored=False`
     (explicit user-requested search) also grabs unmonitored missing chapters.
     """
+    # with the library unmounted every chapter would look missing, and new
+    # files would land on the bare mount point
+    reason = _library_root_unavailable(series)
+    if reason:
+        log.warning("Not grabbing for %r: %s", series.title, reason)
+        return 0
     result = await session.execute(
         select(Download.id, Download.chapter_id).where(
             Download.series_id == series.id,

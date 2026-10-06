@@ -135,7 +135,9 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
             if found:
                 series.folder_name = found
                 folders = _folders_of(series)
-        result = scan_series(series, _active_chapters(series), folders)
+        result = scan_series(series, _active_chapters(series), folders, root=root)
+        if result.root_unavailable:
+            raise HTTPException(409, result.root_unavailable)
         await session.commit()
         return ScanResultOut(
             folder=", ".join(str(f) for f in folders),
@@ -553,7 +555,8 @@ def _run_resync(
                 and file_volume != ch.volume:
             ch.downloaded = False
             ch.file_path = ""
-    scan_series(series, [ch for ch in chapters if not ch.excluded], _folders_of(series))
+    scan_series(series, [ch for ch in chapters if not ch.excluded], _folders_of(series),
+                root=_root_of(series))
 
     repointed = sum(
         1 for ch in chapters
@@ -678,7 +681,8 @@ async def resync_volumes(
 
 async def _scan_now(session: AsyncSession, series: Series) -> int:
     from ..library.scanner import scan_series
-    result = scan_series(series, _active_chapters(series), _folders_of(series))
+    result = scan_series(series, _active_chapters(series), _folders_of(series),
+                         root=_root_of(series))
     await session.commit()
     return result.matched_chapters
 
