@@ -89,6 +89,16 @@ def _active_chapters(series: Series) -> list[Chapter]:
     return [chapter for chapter in series.chapters if not chapter.excluded]
 
 
+async def _require_root_available(session: AsyncSession, series: Series) -> None:
+    """409 while the library root looks unmounted, before anything that would
+    read the missing files as gone (see tasks.library_root_unavailable)."""
+    from ..jobs.tasks import library_root_unavailable
+
+    reason = await library_root_unavailable(session, series)
+    if reason:
+        raise HTTPException(409, reason)
+
+
 def _canonical_path(path: str | Path) -> str:
     """Stable path key for comparing API input against discovered media files."""
     try:
@@ -127,6 +137,7 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
     try:
         series = await _load(session, series_id)
         root = _root_of(series)
+        await _require_root_available(session, series)
         folders = _folders_of(series)
         # adopt a matching folder if the primary one doesn't exist yet — unless
         # the user picked the folder deliberately
@@ -450,6 +461,8 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     try:
         active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
         series = await _load(session, series_id)
+        # the rebuild relies on a rescan to restore downloaded state
+        await _require_root_available(session, series)
         preserved_metadata = {
             ch.number: (
                 ch.title, ch.volume, ch.title_source, ch.volume_source,
@@ -595,6 +608,7 @@ async def resync_volumes_preview(series_id: int, session: AsyncSession = Depends
     from ..volumes import rank_labeled_volume_maps, select_ranked_volume_maps
 
     series = await _load(session, series_id)
+    await _require_root_available(session, series)
     values = await registry.apply_settings(session)
     labeled = await collect_volume_maps(series, values)
     ranked = rank_labeled_volume_maps(labeled)
@@ -651,6 +665,8 @@ async def resync_volumes(
     lock = await acquire_series_lock(series_id)
     try:
         series = await _load(session, series_id)
+        # re-pointing clears volume files and relies on a rescan to re-adopt
+        await _require_root_available(session, series)
         values = await registry.apply_settings(session)
         labeled = await collect_volume_maps(series, values)
         if body is not None and body.source and body.source != "auto":

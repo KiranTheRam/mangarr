@@ -126,16 +126,21 @@ def find_existing_folder(root: Path, series: Series) -> str | None:
 
 def scan_series(
     series: Series, chapters: list[Chapter], folders: list[Path],
-    root: Path | None = None,
+    root: Path | None = None, expect_content: bool | None = None,
 ) -> ScanResult:
     """Mark chapters present across `folders` as downloaded (in place).
 
     With `root` given, an unavailable library root (see root_unavailable)
-    leaves every chapter untouched and is reported in the result instead."""
+    leaves every chapter untouched and is reported in the result instead.
+    `expect_content` says whether the root should hold files; left None only
+    `chapters` decide, so callers with a database pass the root-wide answer
+    (tasks.root_expects_content)."""
     folders = [Path(f) for f in folders]
     result = ScanResult()
     if root is not None:
-        reason = root_unavailable(root, expect_content=any(c.downloaded for c in chapters))
+        if expect_content is None:
+            expect_content = any(c.downloaded for c in chapters)
+        reason = root_unavailable(root, expect_content=expect_content)
         if reason:
             log.warning("Not scanning %r: %s", series.title, reason)
             result.root_unavailable = reason

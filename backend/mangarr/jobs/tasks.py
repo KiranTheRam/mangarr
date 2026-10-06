@@ -540,7 +540,26 @@ def _series_folders(series: Series) -> list[Path]:
     return folders
 
 
-def _library_root_unavailable(series: Series) -> str:
+async def root_expects_content(session: AsyncSession, series: Series) -> bool:
+    """Whether the series' library root should hold files: any series in it —
+    not just this one — has a downloaded chapter. A new series has none of its
+    own, yet the root it shares can't be empty while its neighbours own files."""
+    if any(c.downloaded and not c.excluded for c in series.chapters):
+        return True
+    owned = await session.execute(
+        select(Chapter.id)
+        .join(Series, Chapter.series_id == Series.id)
+        .where(
+            Series.root_folder_id == series.root_folder.id,
+            Chapter.downloaded == True,  # noqa: E712
+            Chapter.excluded == False,  # noqa: E712
+        )
+        .limit(1)
+    )
+    return owned.first() is not None
+
+
+async def library_root_unavailable(session: AsyncSession, series: Series) -> str:
     """Why the series' library root can't be trusted right now ("" when it
     can, or when there is no root to protect) — see scanner.root_unavailable."""
     from ..library.scanner import root_unavailable
@@ -549,7 +568,7 @@ def _library_root_unavailable(series: Series) -> str:
         return ""
     return root_unavailable(
         Path(series.root_folder.path),
-        expect_content=any(c.downloaded and not c.excluded for c in series.chapters),
+        expect_content=await root_expects_content(session, series),
     )
 
 
@@ -599,7 +618,7 @@ def refine_volume_map_with_disk(
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
     """Clear downloaded state for chapters whose recorded media file is gone."""
-    reason = _library_root_unavailable(series)
+    reason = await library_root_unavailable(session, series)
     if reason:
         log.warning("Not checking files of %r: %s", series.title, reason)
         return 0
@@ -628,7 +647,8 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     if not folders:
         return
     scan_series(series, [chapter for chapter in series.chapters if not chapter.excluded], folders,
-                root=Path(series.root_folder.path))
+                root=Path(series.root_folder.path),
+                expect_content=await root_expects_content(session, series))
     await session.commit()
 
 
@@ -1019,7 +1039,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         dl.error = "series has no root folder configured"
         await session.commit()
         return
-    unavailable = _library_root_unavailable(series)
+    unavailable = await library_root_unavailable(session, series)
     if unavailable:
         # writing now would recreate the series folder on the bare mount point
         dl.status = DownloadStatus.FAILED
@@ -1265,7 +1285,7 @@ async def _import_torrent(
         dl.error = "torrent has no linked series/root folder; import manually"
         await session.commit()
         return
-    unavailable = _library_root_unavailable(series)
+    unavailable = await library_root_unavailable(session, series)
     if unavailable:
         # an unmounted library is transient: keep the finished torrent and
         # retry the import on a later sync instead of writing beside the mount
@@ -1367,7 +1387,7 @@ async def grab_missing_chapters(
     """
     # with the library unmounted every chapter would look missing, and new
     # files would land on the bare mount point
-    reason = _library_root_unavailable(series)
+    reason = await library_root_unavailable(session, series)
     if reason:
         log.warning("Not grabbing for %r: %s", series.title, reason)
         return 0
