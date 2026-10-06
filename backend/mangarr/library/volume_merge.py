@@ -12,6 +12,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from ..download.cbz import build_comicinfo
+from ..util import NEW_FILE_MODE
 from .matcher import IMAGE_EXTS
 
 log = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ def merge_chapter_archives(
     ) as handle:
         temporary = Path(handle.name)
     try:
+        temporary.chmod(NEW_FILE_MODE)  # not the temp file's 0600
         pages = 0
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as out:
             for index, (_number, path) in enumerate(ordered, start=1):

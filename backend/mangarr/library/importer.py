@@ -13,6 +13,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from ..models import Chapter, Series
+from ..util import NEW_FILE_MODE
 from .matcher import IMAGE_EXTS, MediaFile, find_media_files, match_files
 from .naming import chapter_filename, series_folder, volume_filename
 
@@ -35,6 +36,9 @@ def _atomic_destination(dest: Path):
     with NamedTemporaryFile(dir=dest.parent, prefix=".mangarr-", suffix=".partial", delete=False) as handle:
         temporary = Path(handle.name)
     try:
+        # a plain new file's mode, not the temp file's 0600; copy2 still
+        # carries the source file's mode over in copy mode
+        temporary.chmod(NEW_FILE_MODE)
         yield temporary
         temporary.replace(dest)
     finally:
