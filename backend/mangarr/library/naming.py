@@ -2,7 +2,9 @@
   {root}/{Series Title}/{Series Title} - Vol. 03 Ch. 0021.5.cbz
 Templates use Python format-spec style with {series}, {volume}, {chapter}, {title}."""
 
+import math
 import re
+from decimal import Decimal
 from pathlib import Path
 
 from ..util import sanitize_filename
@@ -23,12 +25,17 @@ def _format_chapter(template: str, chapter: float) -> str:
 
     def repl(m: re.Match) -> str:
         width = int(m.group(1))
+        if not math.isfinite(chapter):
+            return f"{chapter:0{width + 2}.1f}"
         if float(chapter).is_integer():
             return f"{int(chapter):0{width}d}"
-        # sign handled apart: int("-0") is 0, which would name -0.5 like 0.5
+        # repr keeps every decimal the source gave; Decimal spells it out
+        # positionally (repr writes 0.00001 as 1e-05). The sign is handled
+        # apart: int("-0") is 0, which would name -0.5 like 0.5.
+        digits = format(Decimal(repr(abs(float(chapter)))), "f")
+        whole, _, fraction = digits.partition(".")
         sign = "-" if chapter < 0 else ""
-        whole, _, fraction = repr(abs(float(chapter))).partition(".")
-        return f"{sign}{int(whole):0{width - len(sign)}d}.{fraction}"
+        return f"{sign}{int(whole):0{max(width - len(sign), 0)}d}.{fraction}"
 
     return _CHAPTER_FMT.sub(repl, template)
 

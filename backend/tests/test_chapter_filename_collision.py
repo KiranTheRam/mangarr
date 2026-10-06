@@ -40,9 +40,22 @@ def name(chapter: float) -> str:
     (-0.5, "Series - Ch. -000.5.cbz"),
     (-1.5, "Series - Ch. -001.5.cbz"),
     (-1, "Series - Ch. -001.cbz"),
+    # tiny decimals are spelled out, never scientific notation (repr: 1e-05)
+    (0.00001, "Series - Ch. 0000.00001.cbz"),
+    (12.00005, "Series - Ch. 0012.00005.cbz"),
 ])
 def test_default_name_keeps_every_decimal(number, expected):
     assert name(number) == expected
+
+
+@pytest.mark.parametrize("number, expected", [
+    (-0.5, "Series -0.5.cbz"),
+    (0.5, "Series 0.5.cbz"),
+    (7, "Series 7.cbz"),
+])
+def test_zero_width_template_formats_every_chapter(number, expected):
+    template = "{series} {chapter:00.1f}"
+    assert chapter_filename(template, template, "Series", number) == expected
 
 
 def test_two_decimal_chapters_get_distinct_names_that_parse_back():
