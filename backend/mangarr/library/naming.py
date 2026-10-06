@@ -25,8 +25,10 @@ def _format_chapter(template: str, chapter: float) -> str:
         width = int(m.group(1))
         if float(chapter).is_integer():
             return f"{int(chapter):0{width}d}"
-        whole, _, fraction = repr(float(chapter)).partition(".")
-        return f"{int(whole):0{width}d}.{fraction}"
+        # sign handled apart: int("-0") is 0, which would name -0.5 like 0.5
+        sign = "-" if chapter < 0 else ""
+        whole, _, fraction = repr(abs(float(chapter))).partition(".")
+        return f"{sign}{int(whole):0{width - len(sign)}d}.{fraction}"
 
     return _CHAPTER_FMT.sub(repl, template)
 

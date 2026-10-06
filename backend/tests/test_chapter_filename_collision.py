@@ -36,6 +36,10 @@ def name(chapter: float) -> str:
     (0.5, "Series - Ch. 0000.5.cbz"),
     (1100.125, "Series - Ch. 1100.125.cbz"),
     (21, "Series - Ch. 0021.cbz"),
+    # negative specials keep their sign, as before: -0.5 must not become 0.5
+    (-0.5, "Series - Ch. -000.5.cbz"),
+    (-1.5, "Series - Ch. -001.5.cbz"),
+    (-1, "Series - Ch. -001.cbz"),
 ])
 def test_default_name_keeps_every_decimal(number, expected):
     assert name(number) == expected
