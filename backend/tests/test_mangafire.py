@@ -66,6 +66,7 @@ async def test_list_chapters_keeps_decimals_and_prefers_first_edition():
             200,
             json={
                 "items": [
+                    {"id": 1, "number": 0, "name": "Volume 14: Full Volume", "language": "en"},
                     {"id": 10, "number": 15.5, "name": "(1r0n)", "language": "en"},
                     {"id": 99, "number": 15.5, "name": "Spanish", "language": "es"},
                     {"id": 19, "number": 0.01, "name": "Omake", "language": "en"},

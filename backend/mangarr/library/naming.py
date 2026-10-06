@@ -17,13 +17,22 @@ _CHAPTER_FMT = re.compile(r"\{chapter:0(\d+)\.1f\}")
 
 def _format_chapter(template: str, chapter: float) -> str:
     """Renders {chapter:04.1f} as zero-padded but without a trailing .0 for
-    whole numbers: 21 → 0021, 21.5 → 0021.5"""
+    whole numbers, while preserving source precision beyond one decimal:
+    21 → 0021, 21.5 → 0021.5, 370.371 → 0370.371.
+
+    The historical ``.1f`` token is treated as Mangarr's flexible chapter
+    formatter rather than Python's rounding instruction. Existing one-decimal
+    names stay identical, but combined-chapter identifiers no longer collapse
+    onto a different number (370.371 previously became 370.4).
+    """
 
     def repl(m: re.Match) -> str:
         width = int(m.group(1))
         if float(chapter).is_integer():
             return f"{int(chapter):0{width}d}"
-        return f"{chapter:0{width + 2}.1f}"
+        integer, fraction = str(float(chapter)).split(".", 1)
+        fraction = fraction.rstrip("0")
+        return f"{int(integer):0{width}d}.{fraction}"
 
     return _CHAPTER_FMT.sub(repl, template)
 
