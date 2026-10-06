@@ -1,11 +1,31 @@
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .config import config
 
+# how long a writer waits for another connection's write lock before failing
+# with "database is locked" (the sqlite3 driver's own default is 5s)
+BUSY_TIMEOUT_MS = 30_000
+
 engine = create_async_engine(config.db_url, echo=False)
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def _sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+    # WAL lets API reads and job reads proceed while a job writes, so only
+    # writer-vs-writer contention is left for busy_timeout to absorb. The mode
+    # is persistent in the file; an in-memory database answers "memory" and
+    # stays as it is. busy_timeout goes first so the one-time switch to WAL
+    # also waits out a lock instead of failing.
+    cursor = dbapi_connection.cursor()
+    cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.close()
+
+
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
