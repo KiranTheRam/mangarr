@@ -122,6 +122,10 @@ class SeriesFolder(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
     path: Mapped[str] = mapped_column(String)  # relative to root when under it, else absolute
+    # Optional physical-volume translation for a shared folder. ``None`` is
+    # an ordinary folder; 5 means physical volume 6 belongs to local volume 1.
+    # Zero is meaningful: scope the folder without shifting its numbers.
+    volume_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     series: Mapped[Series] = relationship(back_populates="extra_folders")
 

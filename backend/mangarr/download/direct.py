@@ -4,10 +4,12 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import httpx
 
 from .. import USER_AGENT
+from ..library.matcher import archive_page_signature, page_bytes_signature
 from ..models import Chapter, Series
 from ..sources.base import DirectSource
 from .cbz import build_comicinfo, guess_extension, write_cbz
@@ -18,6 +20,43 @@ PAGE_CONCURRENCY = 3
 
 ProgressCallback = Callable[[int, int], None | Awaitable[None]]
 CancelCallback = Callable[[], None | Awaitable[None]]
+
+
+class DuplicateChapterPagesError(RuntimeError):
+    """A source advertised an existing chapter's exact pages as a new one."""
+
+    def __init__(self, chapter_number: float, existing_number: float, existing_path: str):
+        self.chapter_number = chapter_number
+        self.existing_number = existing_number
+        self.existing_path = existing_path
+        super().__init__(
+            f"chapter {chapter_number:g} has the same ordered page images as "
+            f"chapter {existing_number:g} ({existing_path})"
+        )
+
+
+def _reject_duplicate_pages(
+    series: Series, chapter: Chapter, dest_path: Path, pages: list[bytes]
+) -> None:
+    candidate = page_bytes_signature(pages)
+    checked: set[str] = set()
+    for existing in getattr(series, "chapters", []):
+        if existing is chapter or (chapter.id is not None and existing.id == chapter.id):
+            continue
+        if not existing.downloaded or not existing.file_path:
+            continue
+        path = Path(existing.file_path)
+        try:
+            key = str(path.resolve(strict=False))
+            if key == str(dest_path.resolve(strict=False)) or key in checked:
+                continue
+        except OSError:
+            key = str(path.absolute())
+        checked.add(key)
+        if archive_page_signature(path) == candidate:
+            raise DuplicateChapterPagesError(
+                chapter.number, existing.number, existing.file_path
+            )
 
 
 async def download_chapter_to_cbz(
@@ -109,6 +148,9 @@ async def download_chapter_to_cbz(
 
     await check_cancelled()
 
+    complete_pages: list[bytes] = pages  # type: ignore[assignment]
+    _reject_duplicate_pages(series, chapter, Path(dest_path), complete_pages)
+
     comicinfo = build_comicinfo(
         series=series.title,
         number=chapter.number,
@@ -118,5 +160,5 @@ async def download_chapter_to_cbz(
         web=web_url,
         page_count=len(pages),
     )
-    write_cbz(dest_path, pages, comicinfo)  # type: ignore[arg-type]
+    write_cbz(dest_path, complete_pages, comicinfo)
     log.info("Wrote %s (%d pages)", dest_path, len(pages))

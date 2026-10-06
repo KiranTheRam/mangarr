@@ -11,13 +11,20 @@ of them and, where a chapter is available both as a loose file and inside a
 whole-volume archive, the exact chapter file wins."""
 
 import logging
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ..chapter_metadata import apply_title
 from ..models import Chapter, Series
 from ..util import BRACKET_GROUPS, normalize_title
-from .matcher import MediaFile, comicinfo_title, find_media_files, match_files
+from .matcher import (
+    MediaFile,
+    comicinfo_number,
+    comicinfo_title,
+    find_series_media_files,
+    match_files,
+)
 from .naming import series_folder
 
 log = logging.getLogger(__name__)
@@ -26,6 +33,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class ScanResult:
     matched_chapters: int = 0  # chapters newly marked owned
+    added_chapters: int = 0  # explicit on-disk decimal/one-volume rows created
     volume_files: int = 0  # whole-volume archives found
     cleared: int = 0  # chapters whose recorded file vanished
     unmatched: list[MediaFile] = field(default_factory=list)
@@ -55,6 +63,27 @@ def resolve_folders(root: Path, series: Series, extra_paths: list[str]) -> list[
             seen.add(str(p))
             folders.append(p)
     return folders
+
+
+def resolve_volume_offsets(root: Path, series: Series) -> dict[str, int]:
+    """Resolved shared-folder paths whose physical volumes need translating.
+
+    ``None`` means an ordinary extra folder. An integer, including zero,
+    scopes that folder to this series' tracked local volumes and translates
+    physical volume ``N + offset`` to local volume ``N``.
+    """
+    root = Path(root)
+    offsets: dict[str, int] = {}
+    for folder in series.extra_folders:
+        if folder.volume_offset is None:
+            continue
+        path = root / folder.path
+        try:
+            key = str(path.resolve(strict=False))
+        except OSError:
+            key = str(path.absolute())
+        offsets[key] = folder.volume_offset
+    return offsets
 
 
 def _folder_match_titles(name: str) -> set[str]:
@@ -103,7 +132,84 @@ def find_existing_folder(root: Path, series: Series) -> str | None:
     return best
 
 
-def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) -> ScanResult:
+def _ownership_key(chapter: Chapter) -> tuple[str, int]:
+    return ("db", chapter.id) if chapter.id is not None else ("memory", id(chapter))
+
+
+def _title_only_volume(media: list[MediaFile], series: Series) -> list[MediaFile]:
+    if series.total_volumes != 1:
+        return media
+    titles = {normalize_title(series.title)}
+    titles.update(normalize_title(title) for title in series.alt_titles.split("\n") if title)
+    return [
+        replace(item, volume_number=1)
+        if item.chapter_number is None
+        and item.volume_number is None
+        and not item.is_dir
+        and normalize_title(item.path.stem) in titles
+        else item
+        for item in media
+    ]
+
+
+def _add_disk_chapters(
+    series: Series, chapters: list[Chapter], media: list[MediaFile]
+) -> int:
+    """Create only chapter rows that disk evidence makes unambiguous.
+
+    Decimal filenames explicitly identify specials that catalogue sources
+    often omit. A title-named archive for a known one-volume series covers
+    its provider-reported chapter count. Excluded tombstones in the full
+    relationship always win and are never recreated.
+    """
+    known = {chapter.number for chapter in series.chapters}
+    known.update(chapter.number for chapter in chapters)
+    added = 0
+
+    def add(chapter: Chapter) -> None:
+        series.chapters.append(chapter)
+        if chapters is not series.chapters:
+            chapters.append(chapter)
+
+    if not known and series.total_volumes == 1 and series.total_chapters:
+        if any(item.volume_number == 1 and item.chapter_number is None for item in media):
+            for number in range(1, series.total_chapters + 1):
+                chapter = Chapter(
+                    series_id=series.id, number=float(number), volume=1,
+                    volume_source="disk-inferred", monitored=series.monitored,
+                )
+                add(chapter)
+                known.add(chapter.number)
+                added += 1
+
+    by_number = {chapter.number: chapter for chapter in chapters}
+    for item in media:
+        number = item.chapter_number
+        if number is None or number in known or float(number).is_integer():
+            continue
+        if not item.is_dir and comicinfo_number(item.path) in known:
+            continue
+        base = by_number.get(float(math.floor(number)))
+        chapter = Chapter(
+            series_id=series.id,
+            number=number,
+            volume=base.volume if base is not None else None,
+            volume_source="disk-inferred" if base is not None and base.volume is not None else "",
+            monitored=series.monitored,
+        )
+        add(chapter)
+        by_number[number] = chapter
+        known.add(number)
+        added += 1
+    return added
+
+
+def scan_series(
+    series: Series,
+    chapters: list[Chapter],
+    folders: list[Path],
+    volume_offsets: dict[str, int] | None = None,
+) -> ScanResult:
     """Mark chapters present across `folders` as downloaded (in place)."""
     folders = [Path(f) for f in folders]
     result = ScanResult()
@@ -112,10 +218,11 @@ def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) ->
         result.cleared = _reconcile(chapters, keep=set())
         return result
 
-    media: list[MediaFile] = []
-    for folder in existing:
-        media.extend(find_media_files(folder))
+    media = find_series_media_files(existing, chapters, volume_offsets)
+    media = _title_only_volume(media, series)
+    result.added_chapters = _add_disk_chapters(series, chapters, media)
     match = match_files(media, chapters)
+    scanned_paths = {str(item.path.resolve(strict=False)) for item in media}
 
     # Explicit page labels can disprove an old original-edition assignment
     # to an omnibus even though the recorded file still exists.
@@ -133,7 +240,7 @@ def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) ->
             chapter.downloaded = False
             chapter.file_path = ""
 
-    owned_now: set[int] = set()
+    owned_now: set[tuple[str, int]] = set()
 
     # exact chapter files first — they take precedence over volume coverage
     for mf in match.matched:
@@ -148,14 +255,15 @@ def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) ->
             if title:
                 apply_title(chapter, title, "comicinfo", series.title)
         path_str = str(mf.media.path)
-        if chapter.id not in owned_now and (
+        chapter_key = _ownership_key(chapter)
+        if chapter_key not in owned_now and (
             not chapter.downloaded or chapter.file_path != path_str
         ):
             if not chapter.downloaded:
                 result.matched_chapters += 1
             chapter.downloaded = True
             chapter.file_path = path_str
-        owned_now.add(chapter.id)
+        owned_now.add(chapter_key)
 
     # whole-volume archives fill in any chapters not already covered exactly
     for mf in match.matched:
@@ -165,28 +273,39 @@ def scan_series(series: Series, chapters: list[Chapter], folders: list[Path]) ->
             result.volume_files += 1
         path_str = str(mf.media.path)
         for chapter in mf.covered_chapters:
-            if chapter.id in owned_now:
+            chapter_key = _ownership_key(chapter)
+            if chapter_key in owned_now:
                 continue
-            if not chapter.downloaded or not chapter.file_path:
+            recorded_is_scanned = False
+            if chapter.file_path:
+                try:
+                    recorded_is_scanned = str(
+                        Path(chapter.file_path).resolve(strict=False)
+                    ) in scanned_paths
+                except OSError:
+                    recorded_is_scanned = False
+            if not chapter.downloaded or not chapter.file_path or not recorded_is_scanned:
+                was_downloaded = chapter.downloaded
                 chapter.downloaded = True
                 chapter.file_path = path_str
-                result.matched_chapters += 1
-            owned_now.add(chapter.id)
+                if not was_downloaded:
+                    result.matched_chapters += 1
+            owned_now.add(chapter_key)
 
     result.unmatched = match.unmatched
     result.cleared += _reconcile(chapters, keep=owned_now)
-    log.info("Scanned %r across %d folder(s): +%d chapters, %d volume files, "
+    log.info("Scanned %r across %d folder(s): +%d owned, +%d rows, %d volume files, "
              "%d unmatched, -%d cleared", series.title, len(existing),
-             result.matched_chapters, result.volume_files, result.unmatched_count,
-             result.cleared)
+             result.matched_chapters, result.added_chapters, result.volume_files,
+             result.unmatched_count, result.cleared)
     return result
 
 
-def _reconcile(chapters: list[Chapter], keep: set[int]) -> int:
+def _reconcile(chapters: list[Chapter], keep: set[tuple[str, int]]) -> int:
     """Clear downloaded state for chapters whose recorded file is gone."""
     cleared = 0
     for chapter in chapters:
-        if not chapter.downloaded or chapter.id in keep:
+        if not chapter.downloaded or _ownership_key(chapter) in keep:
             continue
         if not chapter.file_path or not Path(chapter.file_path).exists():
             chapter.downloaded = False
