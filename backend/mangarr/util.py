@@ -178,11 +178,30 @@ async def rl_get_limited_bytes(
 
 
 ILLEGAL_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# CON, NUL, COM1… can't be created on Windows or an SMB share, even with an
+# extension after them
+WINDOWS_RESERVED_NAME = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?= ?\.|$)", re.I)
+
+# ext4, xfs, btrfs and ZFS allow 255 bytes per path component (NTFS/SMB 255
+# UTF-16 units, which the UTF-8 byte count never undercounts). A title gets
+# 200 of them because names are built around it: a volume template's
+# " - Vol. 03 Ch. 0012.5" (21 bytes) plus ".cbz.partial" (12) while the
+# archive is written still leaves 22 bytes for a custom template.
+NAME_MAX_BYTES = 255
+TITLE_MAX_BYTES = 200
 
 
-def sanitize_filename(name: str) -> str:
-    cleaned = ILLEGAL_PATH_CHARS.sub("", name).strip().rstrip(".")
-    return re.sub(r"\s+", " ", cleaned) or "Unknown"
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    """text cut to at most max_bytes of UTF-8, on a character boundary."""
+    return text.encode()[:max(max_bytes, 0)].decode(errors="ignore")
+
+
+def sanitize_filename(name: str, max_bytes: int = TITLE_MAX_BYTES) -> str:
+    cleaned = re.sub(r"\s+", " ", ILLEGAL_PATH_CHARS.sub("", name))
+    # both ends, after the cut: a leading dot hides the entry (".hack//Sign"),
+    # and Windows/SMB drop trailing dots and spaces in any order ("Why ...?")
+    cleaned = truncate_utf8(cleaned, max_bytes).strip(" .")
+    return WINDOWS_RESERVED_NAME.sub(r"\1_", cleaned) or "Unknown"
 
 
 # "c002", "ch 21", "Ch. 21", "Chapter 3", "_Chapter_1" — the lookbehind (no

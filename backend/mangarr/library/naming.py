@@ -7,7 +7,7 @@ import re
 from decimal import Decimal
 from pathlib import Path
 
-from ..util import sanitize_filename
+from ..util import NAME_MAX_BYTES, TITLE_MAX_BYTES, sanitize_filename, truncate_utf8
 
 # Chapter files are named by chapter only — the volume is kept in ComicInfo.xml
 # (Komga/Kavita read it there), and volume in the filename just adds noise.
@@ -40,6 +40,12 @@ def _format_chapter(template: str, chapter: float) -> str:
     return _CHAPTER_FMT.sub(repl, template)
 
 
+def _finish(name: str, ext: str) -> str:
+    # the whole name may use the full component limit, less the extension and
+    # the ".partial" suffix write_cbz adds while the archive is written
+    return sanitize_filename(name, NAME_MAX_BYTES - len(f"{ext}.partial".encode())) + ext
+
+
 def chapter_filename(
     template: str,
     template_no_volume: str,
@@ -52,17 +58,19 @@ def chapter_filename(
     chosen = template if volume is not None else template_no_volume
     chosen = _format_chapter(chosen, chapter)
     name = chosen.format(
-        series=series_title,
+        # cap the series title, not the finished name: cutting the end off
+        # would drop the chapter number and give two chapters one file
+        series=truncate_utf8(series_title, TITLE_MAX_BYTES),
         volume=volume if volume is not None else 0,
         chapter=chapter,
         title=title,
     )
-    return sanitize_filename(name) + ext
+    return _finish(name, ext)
 
 
 def volume_filename(series_title: str, volume: int, ext: str = ".cbz") -> str:
     """Name for a whole-volume archive (no per-chapter number)."""
-    return sanitize_filename(f"{series_title} - Vol. {volume:02d}") + ext
+    return _finish(f"{truncate_utf8(series_title, TITLE_MAX_BYTES)} - Vol. {volume:02d}", ext)
 
 
 def series_folder(series_title: str) -> str:
