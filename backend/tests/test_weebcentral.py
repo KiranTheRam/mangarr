@@ -34,3 +34,22 @@ async def test_list_chapters_ignores_last_read_and_timestamp():
     # both chapters parsed as 264/265 — NOT the 2026 year from the <time>
     assert [c.number for c in chapters] == [264.0, 265.0]
     assert chapters[1].external_id == "01KW7C7HP8RPGDEMRKQVMQ32ZD"
+
+
+@respx.mock
+async def test_list_chapters_converts_season_resets_to_one_based_overall_numbers():
+    source = WeebCentralSource(client=httpx.AsyncClient())
+    html = """
+    <a href="/chapters/S2B"><span>S2 - Chapter 1</span></a>
+    <a href="/chapters/S2A"><span>S2 - Chapter 0</span></a>
+    <a href="/chapters/S1B"><span>S1 - Chapter 1</span></a>
+    <a href="/chapters/S1A"><span>S1 - Chapter 0</span></a>
+    """
+    respx.get(f"{BASE_URL}/series/ABC/full-chapter-list").respond(text=html)
+
+    chapters = await source.list_chapters("ABC")
+
+    assert [(chapter.number, chapter.external_id) for chapter in chapters] == [
+        (1.0, "S1A"), (2.0, "S1B"), (3.0, "S2A"), (4.0, "S2B"),
+    ]
+    await source._client.aclose()

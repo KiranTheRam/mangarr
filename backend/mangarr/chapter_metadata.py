@@ -111,6 +111,14 @@ def apply_title(
     if not value or is_generic_title(value, series_title, chapter.number):
         return False
     current_source = getattr(chapter, "title_source", "") or "legacy"
+    if source == current_source and value != chapter.title:
+        # A provider can correct its own title/number association. This is
+        # particularly important after fixing a season-reset offset: the same
+        # authoritative Webtoons source must be able to move Ep. 1's title
+        # from chapter 1 to chapter 2 even when the replacement is shorter.
+        chapter.title = value
+        chapter.title_source = source
+        return True
     if title_score(value, source, series_title, chapter.number) <= title_score(
         chapter.title, current_source, series_title, chapter.number
     ):

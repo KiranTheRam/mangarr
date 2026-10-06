@@ -26,6 +26,9 @@ class TestChapterFilename:
     def test_fractional_chapter(self):
         assert name(21.5, volume=3) == "Ashita no Joe - Ch. 0021.5.cbz"
 
+    def test_combined_chapter_precision_is_not_rounded(self):
+        assert name(370.371, volume=37) == "Ashita no Joe - Ch. 0370.371.cbz"
+
     def test_no_volume(self):
         assert name(7) == "Ashita no Joe - Ch. 0007.cbz"
 
