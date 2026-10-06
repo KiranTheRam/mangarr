@@ -1,6 +1,7 @@
 """CBZ packaging with ComicInfo.xml (Anansi/ComicRack schema, as read by
 Komga and Kavita)."""
 
+import re
 import zipfile
 from pathlib import Path
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -11,6 +12,12 @@ EXT_BY_SIGNATURE = {
     b"\x89PNG": ".png",
     b"GIF8": ".gif",
 }
+
+# XML 1.0 allows tab, newline and carriage return but no other control
+# characters (nor U+FFFE/U+FFFF or lone surrogates). Metadata providers do
+# occasionally send one — a stray form feed in a summary — and a single one
+# makes the whole ComicInfo unparseable.
+XML_ILLEGAL_CHARS = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 
 def guess_extension(data: bytes, fallback: str = ".jpg") -> str:
@@ -42,7 +49,7 @@ def build_comicinfo(
     def add(tag: str, value) -> None:
         if value is None or value == "":
             return
-        SubElement(root, tag).text = str(value)
+        SubElement(root, tag).text = XML_ILLEGAL_CHARS.sub("", str(value))
 
     add("Series", series)
     if number is not None:
