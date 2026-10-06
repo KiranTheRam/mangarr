@@ -62,9 +62,14 @@ def write_cbz(dest: Path, pages: list[bytes], comicinfo_xml: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".cbz.partial")
     width = max(3, len(str(len(pages))))
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
-        zf.writestr("ComicInfo.xml", comicinfo_xml)
-        for i, data in enumerate(pages, start=1):
-            zf.writestr(f"{i:0{width}d}{guess_extension(data)}", data)
-    tmp.rename(dest)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("ComicInfo.xml", comicinfo_xml)
+            for i, data in enumerate(pages, start=1):
+                zf.writestr(f"{i:0{width}d}{guess_extension(data)}", data)
+        tmp.rename(dest)
+    finally:
+        # a failed write (e.g. a full disk) must not leave the partial archive
+        # in the library; after a successful rename there is nothing to remove
+        tmp.unlink(missing_ok=True)
     return dest
