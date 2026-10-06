@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -17,6 +18,8 @@ from .util import (
     parse_chapter_number,
     parse_volume_number,
 )
+
+log = logging.getLogger(__name__)
 
 INSPECTION_LIMIT = 20
 MAX_BENCODE_DEPTH = 100
@@ -240,7 +243,9 @@ async def select_best_torrent(
         for query in queries:
             try:
                 releases = await indexer.search(query)
-            except Exception:
+            except Exception as exc:
+                # logged so a blocked indexer is told apart from "no results"
+                log.warning("indexer %s search failed for %r: %r", indexer.name, query, exc)
                 continue
             for release in releases:
                 key = release.magnet

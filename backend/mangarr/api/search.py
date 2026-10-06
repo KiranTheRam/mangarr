@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, TypeVar
 
@@ -17,6 +18,8 @@ from ..sources import registry
 from ..sources.base import DirectSource
 from ..titles import english_title, plausible_title_match, split_alt_titles, title_queries
 from ..util import normalize_title
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/search", tags=["search"])
 
@@ -98,7 +101,9 @@ async def _find_direct_source_ids(
             continue
         try:
             candidates = await src.search_series(query)
-        except Exception:
+        except Exception as exc:
+            # logged so a blocked source is told apart from "no results"
+            log.warning("source %s search failed for %r: %r", src.name, query, exc)
             return matches
         for cand in candidates:
             if cand.external_id in seen:
@@ -185,7 +190,8 @@ async def search_releases(
         for external_id, _title, _url in source_ids:
             try:
                 source_chapters = await src.list_chapters(external_id)
-            except Exception:
+            except Exception as exc:
+                log.warning("chapter list failed on %s for %r: %r", src.name, external_id, exc)
                 continue
             if selected is None:
                 # the open-ended search shows the release a grab would take;
@@ -246,7 +252,8 @@ async def search_releases(
             for query in queries:
                 try:
                     torrents = await indexer.search(query)
-                except Exception:
+                except Exception as exc:
+                    log.warning("indexer %s search failed for %r: %r", indexer.name, query, exc)
                     continue
                 for t in torrents[:25]:
                     key = t.magnet or t.url or t.title
