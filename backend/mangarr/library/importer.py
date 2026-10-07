@@ -14,7 +14,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from ..models import Chapter, Series
-from ..util import NEW_FILE_MODE
+from ..util import NEW_FILE_MODE, natural_key
 from .matcher import (
     IMAGE_EXTS,
     MediaFile,
@@ -222,7 +222,8 @@ def import_torrent_payload(
 
 def _pack_images(img_dir: Path, dest: Path) -> None:
     images = sorted(
-        p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+        (p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS),
+        key=lambda p: natural_key(p.name),  # 1, 2, 10 — not 1, 10, 2
     )
     with _atomic_destination(dest) as temporary:
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as zf:

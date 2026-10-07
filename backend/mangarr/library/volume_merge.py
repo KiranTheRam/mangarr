@@ -12,7 +12,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from ..download.cbz import build_comicinfo
-from ..util import NEW_FILE_MODE
+from ..util import NEW_FILE_MODE, natural_key
 from .matcher import IMAGE_EXTS
 
 log = logging.getLogger(__name__)
@@ -23,9 +23,10 @@ def _page_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
         info for info in archive.infolist()
         if not info.is_dir() and Path(info.filename).suffix.lower() in IMAGE_EXTS
     ]
-    # page names are zero-padded by every writer mangarr imports from, so a
-    # plain path sort is reading order (and keeps subfolders together)
-    return sorted(pages, key=lambda info: info.filename)
+    # mangarr's own writers zero-pad page names, but torrent-imported archives
+    # often don't (1.jpg … 10.jpg): order numbers by value. Subfolders still
+    # stay together, since the key compares the path prefix first.
+    return sorted(pages, key=lambda info: natural_key(info.filename))
 
 
 def merge_chapter_archives(
