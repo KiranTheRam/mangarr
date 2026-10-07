@@ -37,13 +37,15 @@ def test_names_merely_starting_like_reserved_ones_are_untouched(title):
 
 def test_long_names_are_cut_on_a_character_boundary():
     result = sanitize_filename(LONG_TITLE)
+    start, _, digest = result.rpartition("~")
     assert len(result.encode()) <= 200
-    assert LONG_TITLE.startswith(result)
-    assert len(result) == 200 // 3
+    # 191 bytes of title, then "~" and an 8-digit digest of the whole title
+    assert LONG_TITLE.startswith(start) and len(start) == 191 // 3
+    assert len(digest) == 8 and digest.isdecimal()
 
 
 def test_a_cut_does_not_leave_a_trailing_space():
-    assert sanitize_filename("a" * 199 + " b") == "a" * 199
+    assert sanitize_filename("a" * 190 + " b" + "c" * 20).startswith("a" * 190 + "~")
 
 
 def test_long_series_keeps_the_chapter_number():
@@ -145,3 +147,82 @@ def test_torrent_import_gives_two_chapters_two_files(tmp_path):
     pages = {chapter.number: len(zipfile.ZipFile(dest).namelist())
              for dest, chapter, _ in imported}
     assert pages == {1.0: 2, 2.0: 5}
+
+
+def test_long_titles_that_start_alike_get_their_own_folders_and_files():
+    part1, part2 = "A" * 200 + "B", "A" * 200 + "C"
+    assert series_folder(part1) != series_folder(part2)
+    assert series_folder(part1) == series_folder(part1)  # stable
+    assert all(len(series_folder(t).encode()) <= 200 for t in (part1, part2))
+    assert (chapter_filename(DEFAULT_TEMPLATE, DEFAULT_TEMPLATE, part1, 1)
+            != chapter_filename(DEFAULT_TEMPLATE, DEFAULT_TEMPLATE, part2, 1))
+    assert volume_filename(series_folder(part1), 1) != volume_filename(series_folder(part2), 1)
+
+
+def test_torrent_import_keeps_series_that_start_alike_apart(tmp_path):
+    import zipfile
+
+    from mangarr.library.importer import import_torrent_payload
+    from mangarr.models import Chapter, Series
+
+    placed = {}
+    for title, pages in (("A" * 200 + "B", 2), ("A" * 200 + "C", 5)):
+        payload = tmp_path / f"payload{pages}"
+        payload.mkdir()
+        with zipfile.ZipFile(payload / "Series - c001.cbz", "w") as zf:
+            for i in range(pages):
+                zf.writestr(f"{i:03d}.png", b"\x89PNG\r\n\x1a\n" + bytes([i]))
+        # create_series names the folder the same way
+        series = Series(id=pages, title=title, folder_name=sanitize_filename(title))
+        chapter = Chapter(id=pages, series_id=pages, number=1.0, title="")
+        [(dest, _, _)] = import_torrent_payload(payload, series, [chapter], tmp_path / "lib",
+                                                DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME)
+        placed[pages] = dest
+
+    assert placed[2] != placed[5]
+    assert {n: len(zipfile.ZipFile(dest).namelist()) for n, dest in placed.items()} == {2: 2, 5: 5}
+
+
+@pytest.mark.parametrize("padding", ["?" * 10, " " * 10, "?" * 300, " ?" * 150, ":*" * 40],
+                         ids=["question-marks", "spaces", "300-question-marks", "mixed", "colons"])
+def test_a_title_padded_with_dropped_characters_is_shortened_not_dropped(padding):
+    padded = chapter_filename(TITLED, TITLED, "S" * 200, 1, None, "T" * 40 + padding)
+    assert padded == chapter_filename(TITLED, TITLED, "S" * 200, 1, None, "T" * 40)
+    assert padded.endswith(" " + "T" * 31 + " - Ch. 0001.cbz")
+    assert fits(padded)
+
+
+def test_a_cut_digest_is_not_read_as_a_chapter_or_volume_number():
+    from mangarr.util import parse_chapter_number, parse_volume_number
+
+    for stem in ("c", "ch", "Vol", "v", "Magic ", "長"):
+        series = stem * (300 // len(stem.encode()))
+        for n in (1, 12.5, 300):
+            name = chapter_filename(DEFAULT_TEMPLATE, DEFAULT_TEMPLATE, series, n)
+            assert "~" in name and parse_chapter_number(name[:-4]) == n, name
+        name = volume_filename(series_folder(series), 7)
+        assert parse_volume_number(name[:-4]) == 7, name
+
+
+@pytest.mark.parametrize("char", ["a", "é", "長", "😀"])
+def test_series_sharing_a_long_start_never_share_a_folder_or_file(char):
+    width = len(char.encode())
+    for series_bytes in range(150, 300, 11):
+        start = char * (series_bytes // width)
+        titles = [start + end for end in ("1", "2", "B", " Part 2", "é")]
+        folders = [series_folder(title) for title in titles]
+        assert len(set(folders)) == len(folders), folders
+        assert all(len(folder.encode()) <= 200 for folder in folders)
+        for template in (DEFAULT_TEMPLATE, TITLED):
+            names = [chapter_filename(template, template, title, n, None, start)
+                     for title in titles for n in (1, 2)]
+            assert all(fits(name) for name in names), names
+            assert len(set(names)) == len(names), names
+            # a chapter title padded with characters the name drops anyway
+            for pad in ("  ", "??", " ?:*", "?" * 300):
+                for title_bytes in (10, 35, 47):
+                    chapter_title = char * (title_bytes // width)
+                    assert (chapter_filename(template, template, titles[0], 1, None,
+                                             chapter_title + pad)
+                            == chapter_filename(template, template, titles[0], 1, None,
+                                                chapter_title))

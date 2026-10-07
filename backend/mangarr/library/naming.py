@@ -8,7 +8,9 @@ from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 
-from ..util import NAME_MAX_BYTES, TITLE_MAX_BYTES, sanitize_filename, truncate_utf8
+from ..util import (
+    NAME_MAX_BYTES, TITLE_MAX_BYTES, sanitize_filename, shorten_utf8, truncate_utf8,
+)
 
 # Chapter files are named by chapter only — the volume is kept in ComicInfo.xml
 # (Komga/Kavita read it there), and volume in the filename just adds noise.
@@ -49,26 +51,41 @@ def _finish(render: Callable[[str, str], str], series: str, title: str, number: 
 
     A name that is too long gives up the end of its title, then of its
     series, not its own end: that holds the chapter or volume number, and
-    cutting it would give two chapters one file. Only when the template's own
-    text is too long is the name cut, with number appended to keep it apart."""
+    cutting it would give two chapters one file. A shortened series ends in a
+    digest of the whole title (shorten_utf8), as a cut series folder does, so
+    two series that start alike stay apart; the title needs none, as the
+    number keeps chapters apart. Only when the template's own text is too long
+    is the name cut, with number appended to keep it apart."""
     budget = NAME_MAX_BYTES - len(f"{ext}.partial".encode())
-    fields = {"series": truncate_utf8(series, TITLE_MAX_BYTES), "title": title}
+    fields = {"series": shorten_utf8(series, TITLE_MAX_BYTES), "title": title}
 
     def build() -> str:
         rendered = render(fields["series"], fields["title"])
         # not cut here: the fields are shortened instead
         return sanitize_filename(rendered, len(rendered.encode()) + 1)
 
+    def fits() -> bool:
+        return len(build().encode()) <= budget
+
+    for key, cut in (("title", truncate_utf8), ("series", shorten_utf8)):
+        whole = fields[key]
+        if fits() or not whole:
+            continue
+        fields[key] = ""
+        if not fits():
+            continue  # even without this field it is too long
+        # the longest cut of the field that fits, measured on the finished
+        # name: a cut that only removes characters sanitize_filename drops
+        # anyway (spaces, "?") doesn't shorten the name. keep is a length
+        # measured to fit and drop one measured not to; the gap between them
+        # halves each round, so this ends, with a field that fits.
+        keep, drop = 0, len(whole.encode())
+        while drop - keep > 1:
+            middle = (keep + drop) // 2
+            fields[key] = cut(whole, middle)
+            keep, drop = (middle, drop) if fits() else (keep, middle)
+        fields[key] = cut(whole, keep)
     name = build()
-    for key in ("title", "series"):
-        while len(name.encode()) > budget and fields[key]:
-            over = len(name.encode()) - budget
-            fields[key] = truncate_utf8(fields[key], len(fields[key].encode()) - over)
-            shorter = build()
-            if len(shorter.encode()) >= len(name.encode()):
-                fields[key] = ""  # the template doesn't show this field
-                shorter = build()
-            name = shorter
     if len(name.encode()) > budget:
         tag = f" {number}"
         name = sanitize_filename(name, budget - len(tag.encode())) + tag

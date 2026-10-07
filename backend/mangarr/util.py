@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -196,16 +197,32 @@ def truncate_utf8(text: str, max_bytes: int) -> str:
     return text.encode()[:max(max_bytes, 0)].decode(errors="ignore")
 
 
+def shorten_utf8(text: str, max_bytes: int) -> str:
+    """text, or if it is longer than max_bytes, its start (cut on a character
+    boundary) plus "~" and 8 digits of a digest of the whole text. Two long
+    titles that start alike ("…Part 1", "…Part 2") still get two names.
+
+    The digest is digits, not hex: the library scanner reads "c" + digits as
+    a chapter number, and the "~" keeps them from joining a preceding "c" or
+    "v". With no room for it (max_bytes of 9 or less) the text is only cut."""
+    if len(text.encode()) <= max_bytes:
+        return text
+    digest = int.from_bytes(hashlib.blake2s(text.encode(), digest_size=8).digest(), "big")
+    tag = f"~{digest % 10**8:08d}"
+    if max_bytes <= len(tag):
+        return truncate_utf8(text, max_bytes).rstrip(" .")
+    return truncate_utf8(text, max_bytes - len(tag)).rstrip(" .") + tag
+
+
 def sanitize_filename(name: str, max_bytes: int = TITLE_MAX_BYTES) -> str:
     cleaned = re.sub(r"\s+", " ", ILLEGAL_PATH_CHARS.sub("", name))
-    # both ends, after the cut: a leading dot hides the entry (".hack//Sign"),
-    # and Windows/SMB drop trailing dots and spaces in any order ("Why ...?")
-    cleaned = truncate_utf8(cleaned, max_bytes).strip(" .")
-    if WINDOWS_RESERVED_NAME.match(cleaned):
-        # the "_" must fit under max_bytes too
-        cleaned = truncate_utf8(cleaned, max_bytes - 1).strip(" .")
-        cleaned = WINDOWS_RESERVED_NAME.sub(r"\1_", cleaned)
-    return cleaned or "Unknown"
+    # both ends: a leading dot hides the entry (".hack//Sign"), and Windows/SMB
+    # drop trailing dots and spaces in any order ("Why ...?")
+    cleaned = cleaned.strip(" .")
+    # the "_" goes on before the cut, so it counts toward max_bytes; a cut
+    # can't expose a reserved name, as the "~" after it is not a dot
+    cleaned = WINDOWS_RESERVED_NAME.sub(r"\1_", cleaned)
+    return shorten_utf8(cleaned, max_bytes) or "Unknown"
 
 
 # "c002", "ch 21", "Ch. 21", "Chapter 3", "_Chapter_1" — the lookbehind (no
