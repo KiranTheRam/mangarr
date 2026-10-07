@@ -69,6 +69,12 @@ BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 # chapter on that source)
 REMOVED_BY_USER = "removed by user"
 
+# error prefix marking a direct download that never reached its source
+# because the library root was unavailable (unmounted, or empty while
+# files are expected) — not a source failure either, so once the library
+# is back the monitor grabs that chapter from that source again
+LIBRARY_UNAVAILABLE = "library unavailable"
+
 # upgrades share the single direct queue with new chapters; a series that
 # just had upgrades enabled must not flood it in one pass
 UPGRADES_PER_PASS = 25
@@ -1054,7 +1060,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     if unavailable:
         # writing now would recreate the series folder on the bare mount point
         dl.status = DownloadStatus.FAILED
-        dl.error = unavailable[:500]
+        dl.error = f"{LIBRARY_UNAVAILABLE}: {unavailable}"[:500]
         await session.commit()
         return
 
@@ -1497,7 +1503,8 @@ async def grab_missing_chapters(
 
     # a chapter that recently failed on a source shouldn't be retried there —
     # fall through to the next source instead. Old failures expire (sources
-    # fix broken chapters), and user cancellations don't count as failures.
+    # fix broken chapters), and neither user cancellations nor downloads an
+    # unavailable library stopped count as failures.
     retry_cutoff = datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER
     result = await session.execute(
         select(Download.chapter_id, Download.source_name).where(
@@ -1505,6 +1512,7 @@ async def grab_missing_chapters(
             Download.status == DownloadStatus.FAILED,
             Download.chapter_id.isnot(None),
             Download.error != REMOVED_BY_USER,
+            ~Download.error.startswith(LIBRARY_UNAVAILABLE),
             Download.updated_at >= retry_cutoff,
         )
     )
