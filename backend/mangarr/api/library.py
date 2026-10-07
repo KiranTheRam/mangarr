@@ -11,11 +11,12 @@ from sqlalchemy.orm import selectinload
 
 from .. import settings_service
 from ..db import get_session
-from ..library.matcher import find_media_files, match_files
+from ..library.matcher import find_series_media_files, match_files
 from ..library.rename import apply_renames, plan_renames
 from ..library.scanner import (
     find_existing_folder,
     resolve_folders,
+    resolve_volume_offsets,
     scan_series,
     series_dir,
 )
@@ -41,6 +42,7 @@ from ..schemas import (
     SeriesFileOut,
     SeriesFolderIn,
     SeriesFolderOut,
+    SeriesFolderUpdateIn,
     SourceCandidateOut,
     SourceLinkIn,
     SourceLinkOut,
@@ -84,9 +86,29 @@ def _folders_of(series: Series) -> list[Path]:
     return resolve_folders(_root_of(series), series, [f.path for f in series.extra_folders])
 
 
+def _volume_offsets_of(series: Series) -> dict[str, int]:
+    return resolve_volume_offsets(_root_of(series), series)
+
+
+def _media_of(series: Series):
+    return find_series_media_files(
+        _folders_of(series), _active_chapters(series), _volume_offsets_of(series)
+    )
+
+
 def _active_chapters(series: Series) -> list[Chapter]:
     """Chapters visible to library workflows; excluded rows are tombstones."""
     return [chapter for chapter in series.chapters if not chapter.excluded]
+
+
+async def _require_root_available(session: AsyncSession, series: Series) -> None:
+    """409 while the library root looks unmounted, before anything that would
+    read the missing files as gone (see tasks.library_root_unavailable)."""
+    from ..jobs.tasks import library_root_unavailable
+
+    reason = await library_root_unavailable(session, series)
+    if reason:
+        raise HTTPException(409, reason)
 
 
 def _canonical_path(path: str | Path) -> str:
@@ -100,11 +122,8 @@ def _canonical_path(path: str | Path) -> str:
 def _media_paths_of(series: Series) -> dict[str, Path]:
     """Media files currently visible in the series folders, keyed canonically."""
     media: dict[str, Path] = {}
-    for folder in _folders_of(series):
-        if not folder.exists():
-            continue
-        for mf in find_media_files(folder):
-            media[_canonical_path(mf.path)] = mf.path
+    for mf in _media_of(series):
+        media[_canonical_path(mf.path)] = mf.path
     return media
 
 
@@ -127,6 +146,7 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
     try:
         series = await _load(session, series_id)
         root = _root_of(series)
+        await _require_root_available(session, series)
         folders = _folders_of(series)
         # adopt a matching folder if the primary one doesn't exist yet — unless
         # the user picked the folder deliberately
@@ -135,12 +155,18 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
             if found:
                 series.folder_name = found
                 folders = _folders_of(series)
-        result = scan_series(series, _active_chapters(series), folders)
+        result = scan_series(
+            series, _active_chapters(series), folders, _volume_offsets_of(series),
+            root=root,
+        )
+        if result.root_unavailable:
+            raise HTTPException(409, result.root_unavailable)
         await session.commit()
         return ScanResultOut(
             folder=", ".join(str(f) for f in folders),
             folder_exists=any(f.exists() for f in folders),
             matched_chapters=result.matched_chapters,
+            added_chapters=result.added_chapters,
             volume_files=result.volume_files,
             cleared=result.cleared,
             unmatched=[m.path.name for m in result.unmatched],
@@ -205,10 +231,7 @@ async def rename_apply(
 @router.get("/series/{series_id}/files", response_model=list[SeriesFileOut])
 async def series_files(series_id: int, session: AsyncSession = Depends(get_session)):
     series = await _load(session, series_id)
-    media = []
-    for folder in _folders_of(series):
-        if folder.exists():
-            media.extend(find_media_files(folder))
+    media = _media_of(series)
     result = match_files(media, _active_chapters(series))
     out: list[SeriesFileOut] = []
     for mf in result.matched:
@@ -247,8 +270,11 @@ async def cleanup_plan(series_id: int, session: AsyncSession = Depends(get_sessi
 
     series = await _load(session, series_id)
     values = await settings_service.get_all(session)
-    plan = analyze(series, _active_chapters(series), _folders_of(series),
-                   values["naming_template"], values["naming_template_no_volume"])
+    plan = analyze(
+        series, _active_chapters(series), _folders_of(series),
+        values["naming_template"], values["naming_template_no_volume"],
+        media=_media_of(series),
+    )
 
     def out(f):
         return CleanupFileOut(path=f.path, name=Path(f.path).name, size=f.size,
@@ -273,7 +299,10 @@ async def cleanup_apply(
     lock = await acquire_series_lock(series_id)
     try:
         series = await _load(session, series_id)
-        result = apply_cleanup(series, _active_chapters(series), _folders_of(series), body.delete)
+        result = apply_cleanup(
+            series, _active_chapters(series), _folders_of(series), body.delete,
+            media=_media_of(series),
+        )
         await session.commit()
         return CleanupResultOut(
             deleted=result.deleted, repointed=result.repointed,
@@ -331,12 +360,13 @@ async def list_folders(series_id: int, session: AsyncSession = Depends(get_sessi
     root = _root_of(series)
     out = [SeriesFolderOut(
         id=None, path=series.folder_name, resolved=str(series_dir(root, series)),
-        primary=True, exists=series_dir(root, series).exists(),
+        primary=True, exists=series_dir(root, series).exists(), volume_offset=None,
     )]
     for f in series.extra_folders:
         p = root / f.path
         out.append(SeriesFolderOut(
             id=f.id, path=f.path, resolved=str(p), primary=False, exists=p.exists(),
+            volume_offset=f.volume_offset,
         ))
     return out
 
@@ -350,14 +380,37 @@ async def add_folder(
     path = _relative_to_root(root, body.path)
     if not path or path == series.folder_name or any(f.path == path for f in series.extra_folders):
         raise HTTPException(400, "Folder already configured for this series")
-    folder = SeriesFolder(series_id=series.id, path=path)
+    folder = SeriesFolder(
+        series_id=series.id, path=path, volume_offset=body.volume_offset
+    )
     session.add(folder)
     await session.commit()
     await session.refresh(folder)
     resolved = root / path
     return SeriesFolderOut(
         id=folder.id, path=folder.path, resolved=str(resolved),
-        primary=False, exists=resolved.exists(),
+        primary=False, exists=resolved.exists(), volume_offset=folder.volume_offset,
+    )
+
+
+@router.put("/series/{series_id}/folders/{folder_id}", response_model=SeriesFolderOut)
+async def update_folder(
+    series_id: int,
+    folder_id: int,
+    body: SeriesFolderUpdateIn,
+    session: AsyncSession = Depends(get_session),
+):
+    series = await _load(session, series_id)
+    folder = next((item for item in series.extra_folders if item.id == folder_id), None)
+    if folder is None:
+        raise HTTPException(404, "Folder not found")
+    folder.volume_offset = body.volume_offset
+    await session.commit()
+    root = _root_of(series)
+    resolved = root / folder.path
+    return SeriesFolderOut(
+        id=folder.id, path=folder.path, resolved=str(resolved), primary=False,
+        exists=resolved.exists(), volume_offset=folder.volume_offset,
     )
 
 
@@ -448,6 +501,8 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     try:
         active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
         series = await _load(session, series_id)
+        # the rebuild relies on a rescan to restore downloaded state
+        await _require_root_available(session, series)
         preserved_metadata = {
             ch.number: (
                 ch.title, ch.volume, ch.title_source, ch.volume_source,
@@ -553,7 +608,10 @@ def _run_resync(
                 and file_volume != ch.volume:
             ch.downloaded = False
             ch.file_path = ""
-    scan_series(series, [ch for ch in chapters if not ch.excluded], _folders_of(series))
+    scan_series(
+        series, [ch for ch in chapters if not ch.excluded], _folders_of(series),
+        _volume_offsets_of(series), root=_root_of(series),
+    )
 
     repointed = sum(
         1 for ch in chapters
@@ -592,6 +650,7 @@ async def resync_volumes_preview(series_id: int, session: AsyncSession = Depends
     from ..volumes import rank_labeled_volume_maps, select_ranked_volume_maps
 
     series = await _load(session, series_id)
+    await _require_root_available(session, series)
     values = await registry.apply_settings(session)
     labeled = await collect_volume_maps(series, values)
     ranked = rank_labeled_volume_maps(labeled)
@@ -648,6 +707,8 @@ async def resync_volumes(
     lock = await acquire_series_lock(series_id)
     try:
         series = await _load(session, series_id)
+        # re-pointing clears volume files and relies on a rescan to re-adopt
+        await _require_root_available(session, series)
         values = await registry.apply_settings(session)
         labeled = await collect_volume_maps(series, values)
         if body is not None and body.source and body.source != "auto":
@@ -678,7 +739,10 @@ async def resync_volumes(
 
 async def _scan_now(session: AsyncSession, series: Series) -> int:
     from ..library.scanner import scan_series
-    result = scan_series(series, _active_chapters(series), _folders_of(series))
+    result = scan_series(
+        series, _active_chapters(series), _folders_of(series),
+        _volume_offsets_of(series), root=_root_of(series),
+    )
     await session.commit()
     return result.matched_chapters
 

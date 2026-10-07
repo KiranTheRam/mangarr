@@ -24,6 +24,7 @@ API_URL = f"{BASE_URL}/api"
 _limiter = RateLimiter(rate=2, per_seconds=1)
 _image_limiter = RateLimiter(rate=5, per_seconds=1)
 _UPLOAD_TAG = re.compile(r"^\([^()]{1,30}\)$")
+_VOLUME_RELEASE = re.compile(r"^\s*vol(?:ume)?\.?\s*\d+\b", re.IGNORECASE)
 _TITLE_NUMBER = re.compile(
     r"^\s*(?:class|chapter|ch\.?|#)\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE
 )
@@ -143,6 +144,13 @@ class MangaFireSource(DirectSource):
                 if not chapter_id:
                     continue
                 raw_title = str(item.get("name") or "").strip()
+                # MangaFire occasionally mixes a complete official volume
+                # into its chapter feed (Vinland Saga exposed "Volume 14" as
+                # chapter 0, yielding a 401-page Ch. 0000 catch-all). Volume
+                # packs belong to torrent/volume import, never direct chapter
+                # monitoring.
+                if _VOLUME_RELEASE.match(raw_title):
+                    continue
                 # Some official-volume imports expose positional API numbers
                 # such as 0.01/97.01 while their names say "Class 2"/"Class
                 # 98".  The explicit display number is the canonical chapter;

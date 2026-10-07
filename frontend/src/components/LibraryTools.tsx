@@ -26,6 +26,7 @@ export function FoldersPanel({
 }) {
   const queryClient = useQueryClient();
   const [picking, setPicking] = useState<null | "add" | "primary">(null);
+  const [volumeOffset, setVolumeOffset] = useState("");
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["folders", seriesId] });
     onChanged();
@@ -36,7 +37,10 @@ export function FoldersPanel({
   });
 
   const addExtra = useMutation({
-    mutationFn: (path: string) => api.post(`/series/${seriesId}/folders`, { path }),
+    mutationFn: (path: string) => api.post(`/series/${seriesId}/folders`, {
+      path,
+      volume_offset: volumeOffset === "" ? null : Number(volumeOffset),
+    }),
     onSuccess: invalidate,
   });
   const removeExtra = useMutation({
@@ -54,6 +58,11 @@ export function FoldersPanel({
         <div className="folder-line" key={f.id ?? "primary"}>
           📁 <code>{f.path || "(unset)"}</code>
           {f.primary && <span className="tag">primary</span>}
+          {f.volume_offset !== null && (
+            <span className="tag" title="Physical volume minus this offset becomes the series-local volume">
+              volume offset +{f.volume_offset}
+            </span>
+          )}
           {!f.exists && <span className="tag" style={{ color: "var(--danger)" }}>missing</span>}
           {f.primary ? (
             <button className="btn sm" onClick={() => setPicking("primary")}>
@@ -69,6 +78,14 @@ export function FoldersPanel({
       <button className="btn sm" onClick={() => setPicking("add")}>
         + Add folder
       </button>
+      <input
+        type="number"
+        value={volumeOffset}
+        onChange={(event) => setVolumeOffset(event.target.value)}
+        placeholder="shared-folder volume offset (optional)"
+        title="For a shared folder, physical volume N + offset maps to this series' local volume N"
+        style={{ width: "16rem" }}
+      />
       {picking && (
         <FolderBrowser
           onPick={(path) => {

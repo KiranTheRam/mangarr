@@ -25,6 +25,14 @@ def test_generic_feed_title_does_not_replace_real_metadata():
     assert ch.title == "A Quiet Morning" and ch.title_source == "wikipedia"
 
 
+def test_same_source_can_correct_a_stale_numbered_title_even_when_shorter():
+    ch = chapter(1, title="1F.Headon's Floor")
+    ch.title_source = "webtoons"
+
+    assert apply_title(ch, "[Season 1] Ep. 0", "webtoons", "Tower of God")
+    assert ch.title == "[Season 1] Ep. 0"
+
+
 def test_manual_locks_are_never_overwritten():
     ch = chapter(4, 7, "My title")
     ch.title_locked = ch.volume_locked = True
@@ -96,4 +104,3 @@ def test_equal_volume_from_stronger_source_upgrades_provenance():
     # and a weaker source can neither change the value nor the label
     assert not apply_volume(ch, 6, "mangadex")
     assert (ch.volume, ch.volume_source) == (5, "viz")
-

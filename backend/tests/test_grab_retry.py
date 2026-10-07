@@ -443,3 +443,38 @@ async def test_queued_direct_download_is_stopped_after_chapter_exclusion(
     assert dl.status == DownloadStatus.FAILED
     assert "excluded" in dl.error
     assert chapter.downloaded is False
+
+
+async def test_duplicate_direct_download_excludes_phantom_chapter(
+    db_session, tmp_path, monkeypatch
+):
+    root = RootFolder(path=str(tmp_path))
+    series = Series(
+        title="Test Series", sort_title="test series", root_folder=root,
+        folder_name="Test Series",
+    )
+    chapter = Chapter(number=2.0, monitored=True)
+    series.chapters.append(chapter)
+    db_session.add(series)
+    await db_session.commit()
+    dl = Download(
+        series_id=series.id, chapter_id=chapter.id, kind=DownloadKind.DIRECT,
+        status=DownloadStatus.QUEUED, source_name="fake", payload="c2",
+    )
+    db_session.add(dl)
+    await db_session.commit()
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource([2]))
+
+    async def reject(*args, **kwargs):
+        raise tasks.DuplicateChapterPagesError(2, 1, "/library/chapter-1.cbz")
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", reject)
+
+    await tasks._run_direct_download(db_session, dl)
+    await db_session.refresh(dl)
+    await db_session.refresh(chapter)
+
+    assert dl.status == DownloadStatus.FAILED
+    assert "duplicate pages rejected" in dl.error
+    assert chapter.excluded is True
+    assert chapter.monitored is False

@@ -387,6 +387,7 @@ class ScanResultOut(BaseModel):
     folder: str
     folder_exists: bool
     matched_chapters: int
+    added_chapters: int = 0
     volume_files: int
     cleared: int
     unmatched: list[str] = []
@@ -542,10 +543,16 @@ class SeriesFolderOut(BaseModel):
     resolved: str
     primary: bool
     exists: bool
+    volume_offset: int | None = None
 
 
 class SeriesFolderIn(BaseModel):
     path: str
+    volume_offset: int | None = Field(default=None, ge=0)
+
+
+class SeriesFolderUpdateIn(BaseModel):
+    volume_offset: int | None = Field(default=None, ge=0)
 
 
 class FilesystemEntryOut(BaseModel):

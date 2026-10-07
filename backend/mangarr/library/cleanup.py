@@ -122,8 +122,9 @@ def analyze(
     folders: list[Path],
     template: str,
     template_no_volume: str,
+    media: list[MediaFile] | None = None,
 ) -> CleanupPlan:
-    media = _all_media(folders)
+    media = list(media) if media is not None else _all_media(folders)
     referenced = {_canonical(c.file_path) for c in chapters if c.file_path}
     tracked_ch = {c.number for c in chapters}
     tracked_vol = {c.volume for c in chapters if c.volume is not None}
@@ -216,9 +217,13 @@ class CleanupResult:
 
 
 def apply_cleanup(
-    series: Series, chapters: list[Chapter], folders: list[Path], delete_paths: list[str]
+    series: Series,
+    chapters: list[Chapter],
+    folders: list[Path],
+    delete_paths: list[str],
+    media: list[MediaFile] | None = None,
 ) -> CleanupResult:
-    media = _all_media(folders)
+    media = list(media) if media is not None else _all_media(folders)
     media_by_path = {_canonical(mf.path): mf for mf in media}
     coverage = _coverage(media, chapters)
     required = _requirements(coverage, chapters)

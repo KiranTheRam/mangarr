@@ -1105,6 +1105,8 @@ export default function SeriesDetail() {
           <div className="scan-banner" onClick={() => setScanResult(null)}>
             <strong>Scan complete.</strong> {scanResult.matched_chapters} chapter
             {scanResult.matched_chapters === 1 ? "" : "s"} matched
+            {scanResult.added_chapters > 0 &&
+              `, ${scanResult.added_chapters} chapter row(s) inferred from disk`}
             {scanResult.volume_files > 0 && `, ${scanResult.volume_files} volume file(s)`}
             {scanResult.unmatched.length > 0 &&
               `, ${scanResult.unmatched.length} unmatched`}

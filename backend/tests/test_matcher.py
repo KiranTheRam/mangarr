@@ -72,6 +72,14 @@ class TestFindMediaFiles:
         assert len(found) == 1
         assert found[0].is_dir and found[0].chapter_number == 5.0
 
+    def test_cover_sidecar_does_not_turn_series_folder_into_loose_media(self, tmp_path):
+        touch(tmp_path / "cover.png", PNG)
+        make_cbz(tmp_path / "Series - Ch. 0001.cbz")
+
+        found = find_media_files(tmp_path)
+
+        assert [item.path.name for item in found] == ["Series - Ch. 0001.cbz"]
+
 
 class TestMatchFiles:
     def test_chapter_and_volume_coverage(self, tmp_path):
@@ -96,6 +104,21 @@ class TestMatchFiles:
         res = match_files(find_media_files(tmp_path), chs)
         m = res.matched[0]
         assert m.volume == 9 and m.covered_chapters == [] and not res.unmatched
+
+    def test_comicinfo_number_repairs_rounded_combined_chapter_filename(self, tmp_path):
+        path = tmp_path / "Black Clover - Ch. 0370.4.cbz"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("001.png", PNG)
+            archive.writestr(
+                "ComicInfo.xml", "<ComicInfo><Number>370.371</Number></ComicInfo>"
+            )
+        combined = Chapter(id=1, series_id=1, number=370.371)
+
+        result = match_files(find_media_files(tmp_path), [combined])
+
+        assert not result.unmatched
+        assert result.matched[0].chapter is combined
+        assert result.matched[0].media.chapter_number == 370.371
 
 
 class TestArchiveCoverage:

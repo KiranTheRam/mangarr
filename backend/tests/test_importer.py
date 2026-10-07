@@ -121,6 +121,70 @@ class TestImportTorrentPayload:
 
         assert second[0][0].stat().st_mtime_ns == mtime
 
+    def test_rejects_season_local_numbering_before_import(self, tmp_path, series, chapters):
+        payload = tmp_path / "payload"
+        payload.mkdir()
+        make_cbz(payload / "[Season 2] Ep. 1.cbz")
+
+        with pytest.raises(ValueError, match="per-season numbering reset"):
+            run_import(payload, series, chapters, tmp_path / "lib")
+
+        assert not list((tmp_path / "lib").rglob("*.cbz"))
+
+    def test_explicit_overall_number_allows_season_episode_label(
+        self, tmp_path, series, chapters
+    ):
+        payload = tmp_path / "payload"
+        payload.mkdir()
+        make_cbz(payload / "Ashita no Joe - Ch. 004 - [Season 2] Ep. 1.cbz")
+
+        imported = run_import(payload, series, chapters, tmp_path / "lib")
+
+        assert imported[0][1] is chapters[3]
+        assert imported[0][0].name == "Ashita no Joe - Ch. 0004.cbz"
+
+    def test_rejects_exact_pages_mapped_to_different_chapters(
+        self, tmp_path, series, chapters
+    ):
+        payload = tmp_path / "payload"
+        payload.mkdir()
+        make_cbz(payload / "Ashita no Joe - Ch. 001.cbz")
+        make_cbz(payload / "Ashita no Joe - Ch. 002.cbz")
+
+        with pytest.raises(ValueError, match="identical page images"):
+            run_import(payload, series, chapters, tmp_path / "lib")
+
+        assert not list((tmp_path / "lib").rglob("*.cbz"))
+
+    def test_rejects_exact_pages_matching_an_existing_different_chapter(
+        self, tmp_path, series, chapters
+    ):
+        existing = tmp_path / "lib" / "Ashita no Joe" / "chapter-1.cbz"
+        existing.parent.mkdir(parents=True)
+        make_cbz(existing)
+        chapters[0].downloaded = True
+        chapters[0].file_path = str(existing)
+        payload = tmp_path / "payload"
+        payload.mkdir()
+        make_cbz(payload / "Ashita no Joe - Ch. 002.cbz")
+
+        with pytest.raises(ValueError, match="same page images as existing chapter 1"):
+            run_import(payload, series, chapters, tmp_path / "lib")
+
+        assert not (existing.parent / "Ashita no Joe - Ch. 0002.cbz").exists()
+
+    def test_payload_already_inside_library_is_adopted_without_second_copy(
+        self, tmp_path, series, chapters
+    ):
+        source = tmp_path / "lib" / "Ashita no Joe" / "Ashita no Joe - c002.cbz"
+        source.parent.mkdir(parents=True)
+        make_cbz(source)
+
+        imported = run_import(source, series, chapters, tmp_path / "lib")
+
+        assert imported[0][0] == source
+        assert list(source.parent.glob("*.cbz")) == [source]
+
 
 class TestImportModes:
     def test_hardlink_mode_links_instead_of_copying(self, tmp_path, series, chapters):

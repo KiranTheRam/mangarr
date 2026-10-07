@@ -36,10 +36,10 @@ from ..chapter_metadata import (
     reconcile_decimal_volumes,
 )
 from ..db import session_scope
-from ..download.direct import download_chapter_to_cbz
+from ..download.direct import DuplicateChapterPagesError, download_chapter_to_cbz
 from ..download.qbittorrent import QbtClient
 from ..library.importer import import_torrent_payload
-from ..library.matcher import archive_chapter_numbers, find_media_files
+from ..library.matcher import archive_chapter_numbers, find_series_media_files
 from ..library.naming import chapter_path, series_folder, volume_filename
 from ..library.volume_merge import merge_chapter_archives
 from ..metadata.anilist import provider as anilist
@@ -540,15 +540,54 @@ def _series_folders(series: Series) -> list[Path]:
     return folders
 
 
+async def root_expects_content(session: AsyncSession, series: Series) -> bool:
+    """Whether the series' library root should hold files: any series in it —
+    not just this one — has a downloaded chapter. A new series has none of its
+    own, yet the root it shares can't be empty while its neighbours own files."""
+    if any(c.downloaded and not c.excluded for c in series.chapters):
+        return True
+    owned = await session.execute(
+        select(Chapter.id)
+        .join(Series, Chapter.series_id == Series.id)
+        .where(
+            Series.root_folder_id == series.root_folder.id,
+            Chapter.downloaded == True,  # noqa: E712
+            Chapter.excluded == False,  # noqa: E712
+        )
+        .limit(1)
+    )
+    return owned.first() is not None
+
+
+async def library_root_unavailable(session: AsyncSession, series: Series) -> str:
+    """Why the series' library root can't be trusted right now ("" when it
+    can, or when there is no root to protect) — see scanner.root_unavailable."""
+    from ..library.scanner import root_unavailable
+
+    if series.root_folder is None:
+        return ""
+    return root_unavailable(
+        Path(series.root_folder.path),
+        expect_content=await root_expects_content(session, series),
+    )
+
+
 def disk_volume_numbers(series: Series) -> set[int]:
     """Volume numbers of whole-volume archives present in the series' folders."""
+    from ..library.scanner import resolve_volume_offsets
+
     volumes: set[int] = set()
-    for folder in _series_folders(series):
-        if not folder.exists():
-            continue
-        for mf in find_media_files(folder):
-            if mf.volume_number is not None and mf.chapter_number is None:
-                volumes.add(mf.volume_number)
+    folders = _series_folders(series)
+    offsets = (
+        resolve_volume_offsets(Path(series.root_folder.path), series)
+        if series.root_folder is not None else {}
+    )
+    media = find_series_media_files(
+        folders, [chapter for chapter in series.chapters if not chapter.excluded], offsets
+    )
+    for mf in media:
+        if mf.volume_number is not None and mf.chapter_number is None:
+            volumes.add(mf.volume_number)
     return volumes
 
 
@@ -586,6 +625,10 @@ def refine_volume_map_with_disk(
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
     """Clear downloaded state for chapters whose recorded media file is gone."""
+    reason = await library_root_unavailable(session, series)
+    if reason:
+        log.warning("Not checking files of %r: %s", series.title, reason)
+        return 0
     missing = 0
     for chapter in series.chapters:
         if chapter.excluded:
@@ -605,12 +648,18 @@ async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> i
 async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     """Adopt existing library folders for the series and mark chapters that are
     already on disk as owned (so they aren't re-downloaded)."""
-    from ..library.scanner import scan_series
+    from ..library.scanner import resolve_volume_offsets, scan_series
 
     folders = _series_folders(series)
     if not folders:
         return
-    scan_series(series, [chapter for chapter in series.chapters if not chapter.excluded], folders)
+    offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
+    scan_series(
+        series, [chapter for chapter in series.chapters if not chapter.excluded],
+        folders, offsets,
+        root=Path(series.root_folder.path),
+        expect_content=await root_expects_content(session, series),
+    )
     await session.commit()
 
 
@@ -1001,6 +1050,13 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         dl.error = "series has no root folder configured"
         await session.commit()
         return
+    unavailable = await library_root_unavailable(session, series)
+    if unavailable:
+        # writing now would recreate the series folder on the bare mount point
+        dl.status = DownloadStatus.FAILED
+        dl.error = unavailable[:500]
+        await session.commit()
+        return
 
     # page fetches run concurrently and call back into ensure_not_cancelled /
     # on_progress; the shared AsyncSession is not task-safe, so every session
@@ -1041,17 +1097,18 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         nonlocal last_progress_commit, last_activity
         last_activity = time.monotonic()
         await ensure_not_cancelled()
-        progress = done / total
-        now = time.monotonic()
-        if done < total and now - last_progress_commit < 1.0:
-            dl.progress = progress
+        # dl is only touched right before a throttled commit: a pending
+        # progress change would be autoflushed by the next cancellation
+        # check's SELECT, holding SQLite's write lock (and blocking every
+        # other writer) until the next page finished. Skipped values were
+        # never visible to other connections anyway.
+        if done < total and time.monotonic() - last_progress_commit < 1.0:
             return
         async with db_lock:
             now = time.monotonic()
             if done < total and now - last_progress_commit < 1.0:
-                dl.progress = progress
                 return
-            dl.progress = progress
+            dl.progress = done / total
             last_progress_commit = now
             await session.commit()
 
@@ -1067,6 +1124,20 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             series.title, series.folder_name,
             chapter.number, chapter.volume, chapter.title,
         )
+        # a template that drops precision can still map two chapters to one
+        # file; writing would silently replace the other chapter's archive
+        owner = await session.scalar(
+            select(Chapter.number).where(
+                Chapter.series_id == series.id,
+                Chapter.id != chapter.id,
+                Chapter.file_path == str(dest),
+            )
+        )
+        if owner is not None:
+            raise RuntimeError(
+                f"{dest.name} already holds chapter {owner:g}; "
+                "use a naming template that keeps chapter numbers distinct"
+            )
         dest_preexisted = dest.exists()
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
@@ -1109,6 +1180,29 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             current.error = str(cancel_exc)
             await session.commit()
         log.info("direct download %d cancelled: %s", download_id, cancel_exc)
+        return
+    except DuplicateChapterPagesError as duplicate:
+        # This is a source-listing alias, not a transient network failure. Keep
+        # the chapter as an excluded tombstone so refreshes cannot recreate or
+        # repeatedly fetch it. The guard runs before write_cbz, so no media
+        # artifact needs to be removed here.
+        await session.rollback()
+        current_dl = await session.get(Download, download_id)
+        current_chapter = await session.get(Chapter, chapter_id)
+        if current_dl is None or current_chapter is None:
+            return
+        current_chapter.excluded = True
+        current_chapter.monitored = False
+        current_chapter.downloaded = False
+        current_chapter.file_path = ""
+        current_dl.status = DownloadStatus.FAILED
+        current_dl.error = f"duplicate pages rejected and chapter excluded: {duplicate}"[:500]
+        session.add(HistoryEvent(
+            series_id=series_id, chapter_id=chapter_id, event="duplicate_rejected",
+            source_name=source_name, detail=current_dl.error,
+        ))
+        await session.commit()
+        log.warning("direct download %d rejected: %s", download_id, duplicate)
         return
     except Exception as exc:
         log.exception("direct download %d failed", download_id)
@@ -1225,8 +1319,10 @@ async def sync_qbittorrent() -> None:
                     # import only the torrent's own files: under qBittorrent's
                     # "Don't create subfolder" layout content_path is the shared
                     # category folder, holding every other torrent's payload too
+                    # (no save_path reported: keep the old whole-folder import)
                     files = [Path(torrent.save_path) / name
-                             for name in await client.torrent_files(torrent.hash)]
+                             for name in await client.torrent_files(torrent.hash)
+                             ] if torrent.save_path else None
                     dl.status = DownloadStatus.IMPORTING
                     await session.commit()
                     await _import_torrent(session, dl, Path(torrent.content_path), values,
@@ -1245,6 +1341,14 @@ async def _import_torrent(
     if series is None or not series.root_folder:
         dl.status = DownloadStatus.FAILED
         dl.error = "torrent has no linked series/root folder; import manually"
+        await session.commit()
+        return
+    unavailable = await library_root_unavailable(session, series)
+    if unavailable:
+        # an unmounted library is transient: keep the finished torrent and
+        # retry the import on a later sync instead of writing beside the mount
+        dl.status = DownloadStatus.DOWNLOADING
+        dl.error = f"waiting for the library: {unavailable}"[:500]
         await session.commit()
         return
     if not content_path.exists():
@@ -1339,6 +1443,12 @@ async def grab_missing_chapters(
     source links and chapter list have been created. `only_monitored=False`
     (explicit user-requested search) also grabs unmonitored missing chapters.
     """
+    # with the library unmounted every chapter would look missing, and new
+    # files would land on the bare mount point
+    reason = await library_root_unavailable(session, series)
+    if reason:
+        log.warning("Not grabbing for %r: %s", series.title, reason)
+        return 0
     result = await session.execute(
         select(Download.id, Download.chapter_id).where(
             Download.series_id == series.id,
