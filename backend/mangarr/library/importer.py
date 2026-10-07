@@ -167,6 +167,35 @@ def _preflight_duplicates(result, chapters: list[Chapter]) -> None:
             )
 
 
+def _preflight_destinations(planned: list[tuple[Path, Chapter]], chapters: list[Chapter]) -> None:
+    """Refuse two chapters that would share one library file.
+
+    An existing file is adopted as the chapter's own, so a name that is
+    already another chapter's file, or that an earlier chapter of this
+    torrent gets, would record both chapters on one archive and drop this
+    chapter's pages. Checked before anything is placed."""
+    holders: dict[str, list[float]] = {}
+    for chapter in chapters:
+        if chapter.file_path:
+            holders.setdefault(chapter.file_path, []).append(chapter.number)
+    claimed: dict[str, float] = {}
+    for dest, chapter in planned:
+        other = claimed.setdefault(str(dest), chapter.number)
+        if other != chapter.number:
+            raise ValueError(
+                f"torrent chapters {other:g} and {chapter.number:g} would both be "
+                f"saved as {dest.name}; use a naming template that keeps chapter "
+                "numbers distinct"
+            )
+        owner = next((n for n in holders.get(str(dest), ()) if n != chapter.number), None)
+        if owner is not None:
+            raise ValueError(
+                f"torrent chapter {chapter.number:g}: {dest.name} already holds "
+                f"chapter {owner:g}; use a naming template that keeps chapter "
+                "numbers distinct"
+            )
+
+
 def import_torrent_payload(
     content_path: Path,
     series: Series,
@@ -202,7 +231,12 @@ def import_torrent_payload(
     result = match_files(media, chapters)
     _preflight_duplicates(result, chapters)
 
-    def place(media: MediaFile, chapter: Chapter | None, volume: int | None) -> None:
+    def destination(media: MediaFile, chapter: Chapter | None, volume: int | None) -> Path:
+        # A qBittorrent category must normally live outside the library, but
+        # older configurations sometimes downloaded straight into it. Do not
+        # create a second hardlink/copy beside an already-valid source file.
+        if not media.is_dir and _inside(media.path, folder):
+            return media.path
         ext = _dest_ext(media)
         if chapter is not None:
             dest_name = Path(
@@ -213,14 +247,17 @@ def import_torrent_payload(
             dest_name = volume_filename(series_folder(series.title), volume, ext)
         else:
             dest_name = f"{series_folder(series.title)} - {media.path.stem}{ext}"
-        dest = folder / dest_name
-        # A qBittorrent category must normally live outside the library, but
-        # older configurations sometimes downloaded straight into it. Do not
-        # create a second hardlink/copy beside an already-valid source file.
-        if not media.is_dir and _inside(media.path, folder):
-            dest = media.path
-            _validate_existing(dest)
-        elif dest.exists():
+        return folder / dest_name
+
+    _preflight_destinations(
+        [(destination(mf.media, mf.chapter, None), mf.chapter)
+         for mf in result.matched if mf.chapter is not None],
+        chapters,
+    )
+
+    def place(media: MediaFile, chapter: Chapter | None, volume: int | None) -> None:
+        dest = destination(media, chapter, volume)
+        if dest == media.path or dest.exists():
             _validate_existing(dest)
         else:
             if media.is_dir:
