@@ -70,6 +70,17 @@ def fits(name):
     return len(f"{name}.partial".encode()) <= 255
 
 
+def reads_back(name, chapter=None, volume=None):
+    """The library scanner, reading name, finds this chapter or volume."""
+    from pathlib import Path
+
+    from mangarr.library.matcher import _media_of
+
+    media = _media_of(Path("/library/Series") / name, is_dir=False)
+    return ((chapter is None or media.chapter_number == chapter)
+            and (volume is None or media.volume_number == volume))
+
+
 def test_a_long_title_gives_way_before_the_chapter_number():
     one, two = (chapter_filename(TITLED, TITLED, "S" * 200, n, None, "T" * 35) for n in (1, 2))
     assert one.endswith(" - Ch. 0001.cbz") and two.endswith(" - Ch. 0002.cbz")
@@ -121,9 +132,12 @@ def test_every_name_fits_and_chapters_never_share_one(char, template):
                      for n in (1, 2, 12.5, 100, 1000.25)]
             assert all(fits(name) for name in names), names
             assert len(set(names)) == len(names), names
+            assert all(reads_back(name, chapter=n)
+                       for name, n in zip(names, (1, 2, 12.5, 100, 1000.25))), names
             volumes = [volume_filename(series, v) for v in (1, 2, 10)]
             assert all(fits(name) for name in volumes)
             assert len(set(volumes)) == len(volumes)
+            assert all(reads_back(name, volume=v) for name, v in zip(volumes, (1, 2, 10)))
 
 
 def test_torrent_import_gives_two_chapters_two_files(tmp_path):
@@ -217,6 +231,7 @@ def test_series_sharing_a_long_start_never_share_a_folder_or_file(char):
             names = [chapter_filename(template, template, title, n, None, start)
                      for title in titles for n in (1, 2)]
             assert all(fits(name) for name in names), names
+            assert all(reads_back(name, chapter=n) for name, n in zip(names, (1, 2) * 5)), names
             assert len(set(names)) == len(names), names
             # a chapter title padded with characters the name drops anyway
             for pad in ("  ", "??", " ?:*", "?" * 300):
@@ -226,3 +241,48 @@ def test_series_sharing_a_long_start_never_share_a_folder_or_file(char):
                                              chapter_title + pad)
                             == chapter_filename(template, template, titles[0], 1, None,
                                                 chapter_title))
+
+
+# templates whose own text doesn't fit in a file name, with the chapter marker
+# at the end, in the middle, at the start, and one that fits only short numbers
+OVERSIZED_TEMPLATES = [
+    "x" * 220 + " Ch. {chapter:04.1f}" + "x" * 30,
+    "x" * 235 + " Ch. {chapter:04.1f}",
+    "x" * 120 + " Ch. {chapter:04.1f} {title} " + "x" * 120,
+    "Ch. {chapter:04.1f} " + "x" * 240,
+    "{series} - Vol. {volume:02d} " + "y" * 230 + " c{chapter:04.1f}",
+    "{series} " + "x" * 230 + " - Ch. {chapter:04.1f}",
+]
+
+
+@pytest.mark.parametrize("template", OVERSIZED_TEMPLATES, ids=[
+    "marker-before-text", "marker-at-end", "marker-in-middle", "marker-at-start",
+    "c-marker-at-end", "fits-short-numbers",
+])
+def test_a_template_too_long_by_itself_never_hides_the_chapter_number(template):
+    numbers = (0.5, 1, 2, 7, 12.5, 100, 1000.25, 12.21, 12.24)
+    for series in ("Series", "S" * 200, LONG_TITLE):
+        names = [chapter_filename(template, template, series, n, 3, "Title") for n in numbers]
+        assert all(fits(name) for name in names), names
+        assert len(set(names)) == len(names), names
+        assert all(reads_back(name, chapter=n) for name, n in zip(names, numbers)), names
+
+
+def test_a_template_too_long_by_itself_names_files_like_the_default(monkeypatch, caplog):
+    from mangarr.library import naming
+
+    monkeypatch.setattr(naming, "_TOO_LONG_TEMPLATES", set())
+    template = OVERSIZED_TEMPLATES[0]
+    with caplog.at_level("WARNING", logger="mangarr.library.naming"):
+        for n in (1000.25, 1, 12.5):
+            assert (chapter_filename(template, template, "Series", n)
+                    == chapter_filename(DEFAULT_TEMPLATE, DEFAULT_TEMPLATE, "Series", n))
+    assert sum("too long" in record.getMessage() for record in caplog.records) == 1
+
+
+def test_a_number_too_long_for_any_name_still_fits():
+    huge = [float("1" * 300), float("2" * 300)]
+    names = [chapter_filename(DEFAULT_TEMPLATE, DEFAULT_TEMPLATE, "Series", n) for n in huge]
+    assert all(fits(name) for name in names) and names[0] != names[1]
+    volumes = [volume_filename("Series", v) for v in (10**300, 2 * 10**300)]
+    assert all(fits(name) for name in volumes) and volumes[0] != volumes[1]

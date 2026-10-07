@@ -2,6 +2,7 @@
   {root}/{Series Title}/{Series Title} - Vol. 03 Ch. 0021.5.cbz
 Templates use Python format-spec style with {series}, {volume}, {chapter}, {title}."""
 
+import logging
 import math
 import re
 from collections.abc import Callable
@@ -11,6 +12,8 @@ from pathlib import Path
 from ..util import (
     NAME_MAX_BYTES, TITLE_MAX_BYTES, sanitize_filename, shorten_utf8, truncate_utf8,
 )
+
+log = logging.getLogger(__name__)
 
 # Chapter files are named by chapter only — the volume is kept in ComicInfo.xml
 # (Komga/Kavita read it there), and volume in the filename just adds noise.
@@ -43,20 +46,25 @@ def _format_chapter(template: str, chapter: float) -> str:
     return _CHAPTER_FMT.sub(repl, template)
 
 
-def _finish(render: Callable[[str, str], str], series: str, title: str, number: str,
-            ext: str) -> str:
-    """render(series, title) sanitized as a file name that fits the component
-    limit, less the extension and the ".partial" suffix write_cbz adds while
-    the archive is written.
+def _budget(ext: str) -> int:
+    # the component limit, less the extension and the ".partial" suffix
+    # write_cbz adds while the archive is written
+    return NAME_MAX_BYTES - len(f"{ext}.partial".encode())
+
+
+def _finish(render: Callable[[str, str], str], series: str, title: str,
+            ext: str) -> str | None:
+    """render(series, title) sanitized as a file name that fits _budget(ext),
+    or None when the template's own text doesn't fit even with no series and
+    no title.
 
     A name that is too long gives up the end of its title, then of its
     series, not its own end: that holds the chapter or volume number, and
     cutting it would give two chapters one file. A shortened series ends in a
     digest of the whole title (shorten_utf8), as a cut series folder does, so
     two series that start alike stay apart; the title needs none, as the
-    number keeps chapters apart. Only when the template's own text is too long
-    is the name cut, with number appended to keep it apart."""
-    budget = NAME_MAX_BYTES - len(f"{ext}.partial".encode())
+    number keeps chapters apart."""
+    budget = _budget(ext)
     fields = {"series": shorten_utf8(series, TITLE_MAX_BYTES), "title": title}
 
     def build() -> str:
@@ -85,11 +93,32 @@ def _finish(render: Callable[[str, str], str], series: str, title: str, number: 
             fields[key] = cut(whole, middle)
             keep, drop = (middle, drop) if fits() else (keep, middle)
         fields[key] = cut(whole, keep)
-    name = build()
-    if len(name.encode()) > budget:
-        tag = f" {number}"
-        name = sanitize_filename(name, budget - len(tag.encode())) + tag
-    return name + ext
+    return build() + ext if fits() else None
+
+
+def _cut(render: Callable[[str, str], str], ext: str) -> str:
+    # last resort, for a number too long for any name: the digest a cut name
+    # ends in still keeps two of them apart
+    return sanitize_filename(render("", ""), _budget(ext)) + ext
+
+
+def _chapter_render(template: str, chapter: float,
+                    volume: int | None) -> Callable[[str, str], str]:
+    chosen = _format_chapter(template, chapter)
+
+    def render(series: str, title: str) -> str:
+        return chosen.format(
+            series=series,
+            volume=volume if volume is not None else 0,
+            chapter=chapter,
+            title=title,
+        )
+
+    return render
+
+
+# templates already warned about, so a library rename logs each one once
+_TOO_LONG_TEMPLATES: set[str] = set()
 
 
 def chapter_filename(
@@ -102,23 +131,29 @@ def chapter_filename(
     ext: str = ".cbz",
 ) -> str:
     chosen = template if volume is not None else template_no_volume
-    chosen = _format_chapter(chosen, chapter)
-
-    def render(series: str, title: str) -> str:
-        return chosen.format(
-            series=series,
-            volume=volume if volume is not None else 0,
-            chapter=chapter,
-            title=title,
-        )
-
-    return _finish(render, series_title, title, _format_chapter("{chapter:04.1f}", chapter), ext)
+    render = _chapter_render(chosen, chapter, volume)
+    name = _finish(render, series_title, title, ext)
+    if name is None:
+        # the template's own text doesn't fit in a file name. Cutting it could
+        # leave part of a chapter marker ("Ch. 1" of "Ch. 1000.25") ahead of
+        # the number, and the scanner reads the first one, so the default
+        # template names the file instead
+        if chosen not in _TOO_LONG_TEMPLATES:
+            _TOO_LONG_TEMPLATES.add(chosen)
+            log.warning("naming template %r is too long for a file name; using %r",
+                        chosen, DEFAULT_TEMPLATE)
+        render = _chapter_render(DEFAULT_TEMPLATE, chapter, volume)
+        name = _finish(render, series_title, title, ext)
+    return name or _cut(render, ext)
 
 
 def volume_filename(series_title: str, volume: int, ext: str = ".cbz") -> str:
     """Name for a whole-volume archive (no per-chapter number)."""
-    return _finish(lambda series, _: f"{series} - Vol. {volume:02d}", series_title, "",
-                   f"Vol. {volume:02d}", ext)
+
+    def render(series: str, _: str) -> str:
+        return f"{series} - Vol. {volume:02d}"
+
+    return _finish(render, series_title, "", ext) or _cut(render, ext)
 
 
 def series_folder(series_title: str) -> str:
