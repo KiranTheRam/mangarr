@@ -52,7 +52,7 @@ class FakeSource(DirectSource):
 
 
 @pytest.fixture
-async def db_session(monkeypatch):
+async def db_session(monkeypatch, tmp_path):
     from mangarr import settings_service
     monkeypatch.setitem(settings_service.DEFAULTS, "source_fake_enabled", "true")
     engine = create_async_engine("sqlite+aiosqlite://")
@@ -60,12 +60,16 @@ async def db_session(monkeypatch):
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
+        # the monitor only grabs for a series with a root folder
+        (tmp_path / "library").mkdir()
+        session.info["library"] = RootFolder(path=str(tmp_path / "library"))
         yield session
     await engine.dispose()
 
 
 async def _make_series(session, chapter_numbers):
-    series = Series(title="Test Series", sort_title="test series")
+    series = Series(title="Test Series", sort_title="test series",
+                    root_folder=session.info["library"])
     series.source_links.append(
         SeriesSourceLink(source_name="fake", external_id="x")
     )

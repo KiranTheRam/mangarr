@@ -68,12 +68,16 @@ def _values(*names):
 
 
 @pytest.fixture
-async def db_session():
+async def db_session(tmp_path):
     engine = create_async_engine("sqlite+aiosqlite://")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
+        # the monitor only grabs for a series with a mounted root folder (one
+        # holding files when the series has downloaded chapters)
+        (tmp_path / "library" / "Other Series").mkdir(parents=True)
+        session.info["library"] = RootFolder(path=str(tmp_path / "library"))
         yield session
     await engine.dispose()
 
@@ -90,6 +94,7 @@ async def _load(session, series_id):
 
 
 async def _series(session, chapters=(), links=(), **fields):
+    fields.setdefault("root_folder", session.info["library"])
     series = Series(title="Test Series", sort_title="test series", **fields)
     for name in links:
         series.source_links.append(SeriesSourceLink(source_name=name, external_id="x"))
