@@ -21,7 +21,7 @@ ENV MANGARR_DATA_DIR=/config \
     MANGARR_HOST=0.0.0.0 \
     MANGARR_PORT=6996
 
-VOLUME ["/config", "/manga"]
+VOLUME ["/config"]
 EXPOSE 6996
 
 CMD ["uvicorn", "mangarr.main:app", "--host", "0.0.0.0", "--port", "6996"]
