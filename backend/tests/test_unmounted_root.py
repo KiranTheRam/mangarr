@@ -379,3 +379,86 @@ async def test_scan_endpoint_409s_for_a_new_series_in_an_empty_root_others_own(
         await library_api.scan(newcomer.id, session=db_session)
 
     assert err.value.status_code == 409
+
+
+# ---- a download the library stopped is not a source failure
+
+async def _grab_chapter_4(session, root):
+    """A mounted series owning chapters 1-3 whose chapter 4 the monitor has
+    queued from the fake source; returns (series, values, queued download)."""
+    for n in (1, 2, 3):
+        path = root / "Series" / f"Series - Ch. {n:04d}.cbz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"cbz")
+    series = await _series_in(session, root)
+    values = await tasks.registry.apply_settings(session)
+    assert await tasks.grab_missing_chapters(session, series, values) == 1
+    dl = (await session.execute(select(Download))).scalar_one()
+    assert (dl.status, dl.source_name) == (DownloadStatus.QUEUED, "fake")
+    return series, values, dl
+
+
+@pytest.mark.parametrize("unmounted_as", ["missing", "empty"])
+async def test_a_download_the_library_stopped_does_not_block_its_source(
+    db_session, tmp_path, monkeypatch, unmounted_as
+):
+    # a NAS drops between the monitor queueing a chapter and the worker
+    # reaching it: the source was never asked, so once the library is back
+    # the chapter must be grabbed from that same source again
+    root = tmp_path / "manga"
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    series, values, dl = await _grab_chapter_4(db_session, root)
+    away = tmp_path / "away"
+    if unmounted_as == "missing":
+        root.rename(away)
+    else:
+        (root / "Series").rename(away)
+    started = []
+
+    async def fake_download(*args, **kwargs):
+        started.append(args)
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", fake_download)
+
+    await tasks._run_direct_download(db_session, dl)
+    await db_session.refresh(dl)
+
+    assert started == []
+    assert dl.status == DownloadStatus.FAILED
+    assert unmounted_as in dl.error
+    # still a visible failure in Activity
+    from mangarr.api.queue import get_queue
+    assert [item.id for item in await get_queue(session=db_session)] == [dl.id]
+
+    if unmounted_as == "missing":
+        away.rename(root)
+    else:
+        away.rename(root / "Series")
+
+    assert await tasks.grab_missing_chapters(db_session, series, values) == 1
+    retry = (
+        await db_session.execute(select(Download).where(Download.id != dl.id))
+    ).scalar_one()
+    assert retry.chapter_id == dl.chapter_id
+    assert (retry.status, retry.source_name) == (DownloadStatus.QUEUED, "fake")
+    assert dl.error.startswith(tasks.LIBRARY_UNAVAILABLE)
+
+
+async def test_a_source_failure_still_blocks_its_source(db_session, tmp_path, monkeypatch):
+    root = tmp_path / "manga"
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    series, values, dl = await _grab_chapter_4(db_session, root)
+
+    async def failing_download(*args, **kwargs):
+        raise RuntimeError("page 3 failed")
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", failing_download)
+
+    await tasks._run_direct_download(db_session, dl)
+    await db_session.refresh(dl)
+
+    assert dl.status == DownloadStatus.FAILED
+    assert dl.error == "page 3 failed"
+    # the failure path rolled the session back, expiring the loaded series
+    series = await tasks._load_series(db_session, dl.series_id)
+    assert await tasks.grab_missing_chapters(db_session, series, values) == 0
