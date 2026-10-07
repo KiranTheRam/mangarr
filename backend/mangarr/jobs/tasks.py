@@ -1327,10 +1327,26 @@ async def sync_qbittorrent() -> None:
                     files = [Path(torrent.save_path) / name
                              for name in await client.torrent_files(torrent.hash)
                              ] if torrent.save_path else None
-                    dl.status = DownloadStatus.IMPORTING
-                    await session.commit()
-                    await _import_torrent(session, dl, Path(torrent.content_path), values,
-                                          files=files)
+                    # the import maps files onto the series' chapter rows, which
+                    # a resync deletes and rebuilds under the series lock (and
+                    # refuses to start while a torrent is IMPORTING): hold the
+                    # lock from that transition until the import commits, or
+                    # leave the torrent for a later sync while the lock is busy
+                    lock = (await try_acquire_series_lock(dl.series_id)
+                            if dl.series_id else None)
+                    if dl.series_id and lock is None:
+                        log.debug("torrent download %d: series %d is busy; importing "
+                                  "on a later sync", dl.id, dl.series_id)
+                        await session.commit()
+                        continue
+                    try:
+                        dl.status = DownloadStatus.IMPORTING
+                        await session.commit()
+                        await _import_torrent(session, dl, Path(torrent.content_path),
+                                              values, files=files)
+                    finally:
+                        if lock is not None:
+                            lock.release()
                 else:
                     await session.commit()
         finally:
