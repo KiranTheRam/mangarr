@@ -24,4 +24,6 @@ ENV MANGARR_DATA_DIR=/config \
 VOLUME ["/config", "/manga"]
 EXPOSE 6996
 
-CMD ["uvicorn", "mangarr.main:app", "--host", "0.0.0.0", "--port", "6996"]
+# mangarr.main's __main__ entry runs uvicorn with config.host/config.port,
+# so MANGARR_HOST / MANGARR_PORT (defaults above) take effect.
+CMD ["python", "-m", "mangarr.main"]
