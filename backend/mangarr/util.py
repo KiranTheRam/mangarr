@@ -201,7 +201,11 @@ def sanitize_filename(name: str, max_bytes: int = TITLE_MAX_BYTES) -> str:
     # both ends, after the cut: a leading dot hides the entry (".hack//Sign"),
     # and Windows/SMB drop trailing dots and spaces in any order ("Why ...?")
     cleaned = truncate_utf8(cleaned, max_bytes).strip(" .")
-    return WINDOWS_RESERVED_NAME.sub(r"\1_", cleaned) or "Unknown"
+    if WINDOWS_RESERVED_NAME.match(cleaned):
+        # the "_" must fit under max_bytes too
+        cleaned = truncate_utf8(cleaned, max_bytes - 1).strip(" .")
+        cleaned = WINDOWS_RESERVED_NAME.sub(r"\1_", cleaned)
+    return cleaned or "Unknown"
 
 
 # "c002", "ch 21", "Ch. 21", "Chapter 3", "_Chapter_1" — the lookbehind (no

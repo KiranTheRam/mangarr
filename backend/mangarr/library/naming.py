@@ -4,6 +4,7 @@ Templates use Python format-spec style with {series}, {volume}, {chapter}, {titl
 
 import math
 import re
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 
@@ -40,10 +41,38 @@ def _format_chapter(template: str, chapter: float) -> str:
     return _CHAPTER_FMT.sub(repl, template)
 
 
-def _finish(name: str, ext: str) -> str:
-    # the whole name may use the full component limit, less the extension and
-    # the ".partial" suffix write_cbz adds while the archive is written
-    return sanitize_filename(name, NAME_MAX_BYTES - len(f"{ext}.partial".encode())) + ext
+def _finish(render: Callable[[str, str], str], series: str, title: str, number: str,
+            ext: str) -> str:
+    """render(series, title) sanitized as a file name that fits the component
+    limit, less the extension and the ".partial" suffix write_cbz adds while
+    the archive is written.
+
+    A name that is too long gives up the end of its title, then of its
+    series, not its own end: that holds the chapter or volume number, and
+    cutting it would give two chapters one file. Only when the template's own
+    text is too long is the name cut, with number appended to keep it apart."""
+    budget = NAME_MAX_BYTES - len(f"{ext}.partial".encode())
+    fields = {"series": truncate_utf8(series, TITLE_MAX_BYTES), "title": title}
+
+    def build() -> str:
+        rendered = render(fields["series"], fields["title"])
+        # not cut here: the fields are shortened instead
+        return sanitize_filename(rendered, len(rendered.encode()) + 1)
+
+    name = build()
+    for key in ("title", "series"):
+        while len(name.encode()) > budget and fields[key]:
+            over = len(name.encode()) - budget
+            fields[key] = truncate_utf8(fields[key], len(fields[key].encode()) - over)
+            shorter = build()
+            if len(shorter.encode()) >= len(name.encode()):
+                fields[key] = ""  # the template doesn't show this field
+                shorter = build()
+            name = shorter
+    if len(name.encode()) > budget:
+        tag = f" {number}"
+        name = sanitize_filename(name, budget - len(tag.encode())) + tag
+    return name + ext
 
 
 def chapter_filename(
@@ -57,20 +86,22 @@ def chapter_filename(
 ) -> str:
     chosen = template if volume is not None else template_no_volume
     chosen = _format_chapter(chosen, chapter)
-    name = chosen.format(
-        # cap the series title, not the finished name: cutting the end off
-        # would drop the chapter number and give two chapters one file
-        series=truncate_utf8(series_title, TITLE_MAX_BYTES),
-        volume=volume if volume is not None else 0,
-        chapter=chapter,
-        title=title,
-    )
-    return _finish(name, ext)
+
+    def render(series: str, title: str) -> str:
+        return chosen.format(
+            series=series,
+            volume=volume if volume is not None else 0,
+            chapter=chapter,
+            title=title,
+        )
+
+    return _finish(render, series_title, title, _format_chapter("{chapter:04.1f}", chapter), ext)
 
 
 def volume_filename(series_title: str, volume: int, ext: str = ".cbz") -> str:
     """Name for a whole-volume archive (no per-chapter number)."""
-    return _finish(f"{truncate_utf8(series_title, TITLE_MAX_BYTES)} - Vol. {volume:02d}", ext)
+    return _finish(lambda series, _: f"{series} - Vol. {volume:02d}", series_title, "",
+                   f"Vol. {volume:02d}", ext)
 
 
 def series_folder(series_title: str) -> str:
