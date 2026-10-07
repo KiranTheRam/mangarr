@@ -767,13 +767,16 @@ async def scan_all_series() -> None:
 def _notify_kavita(values: dict[str, str], series: Series) -> None:
     """Ask Kavita to scan the library this series' files live in.
 
-    Kavita names a series from what its parser reads on disk, which is usually
-    the folder name — but a scanned-in folder can also carry a localized or
-    alternate title, so every name mangarr knows is offered as a candidate.
+    Kavita names a series from the ComicInfo <Series> mangarr writes (the
+    series title) or else from the folder name, so only those two are offered.
+    Alternate titles are not: a series Kavita has not seen yet matches nothing
+    under its own name, and an alternate such as "Berserk" (for "Berserk of
+    Gluttony") would then pick an unrelated series and scan it instead of the
+    library that holds the new folder.
     """
     if series.root_folder is None:
         return
-    titles = [series.title, series.folder_name, *split_alt_titles(series.alt_titles)]
+    titles = [series.title, series.folder_name]
     kavita.notify_import(values, series.root_folder_id, series.root_folder.path, titles)
 
 

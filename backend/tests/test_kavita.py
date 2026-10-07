@@ -29,9 +29,11 @@ ENABLED = {
 @pytest.fixture(autouse=True)
 def _reset_pending():
     kavita._pending.clear()
+    kavita._last_scanned.clear()
     kavita._flush_task = None
     yield
     kavita._pending.clear()
+    kavita._last_scanned.clear()
     kavita._flush_task = None
 
 
@@ -327,9 +329,9 @@ def test_validate_settings_requires_a_usable_connection_when_enabled():
 # ------------------------------------------------- wiring into the import path
 
 @respx.mock
-async def test_import_path_notifies_kavita_with_every_known_title(monkeypatch):
+async def test_import_path_notifies_kavita_with_the_series_own_names(monkeypatch):
     """tasks._notify_kavita is what downloads actually call: it must hand over
-    the series' root folder and all the names Kavita might have parsed."""
+    the series' root folder and the names Kavita reads from mangarr's files."""
     from mangarr.jobs import tasks
     from mangarr.models import RootFolder, Series
 
@@ -350,9 +352,7 @@ async def test_import_path_notifies_kavita_with_every_known_title(monkeypatch):
     await asyncio.sleep(0.3)
 
     queried = {call.request.url.params["queryString"] for call in search.calls}
-    assert "Spy x Family" in queried
-    assert "Spy x Family (2019)" in queried
-    assert "SPY×FAMILY" in queried
+    assert queried == {"Spy x Family", "Spy x Family (2019)"}
     # /library/manga matched Kavita's /data/manga on the folder name
     assert lib_scan.calls[0].request.url.params["libraryId"] == "3"
 
@@ -411,3 +411,121 @@ async def test_a_title_held_twice_by_kavita_is_treated_as_no_match():
         assert await client.find_series_id(3, ["Berserk"]) is None
     finally:
         await client.close()
+
+
+# --------------------------------------------------- scan targeting and pacing
+
+def _berserk_kavita(scans: list):
+    """Kavita library 3 already holds an unrelated "Berserk" (id 7); search is
+    a substring match, like Kavita's own."""
+    known = [
+        {"seriesId": 7, "name": "Berserk", "libraryId": 3},
+        {"seriesId": 9, "name": "Kagurabachi", "libraryId": 3},
+        {"seriesId": 10, "name": "Dandadan", "libraryId": 3},
+    ]
+
+    def search(request):
+        query = request.url.params["queryString"].lower()
+        return Response(200, json={
+            "series": [s for s in known if query in s["name"].lower()]
+        })
+
+    def scan(request):
+        scans.append(json.loads(request.content)["seriesId"])
+        return Response(200)
+
+    mock_auth()
+    mock_libraries()
+    respx.get(f"{BASE}/api/Search/search").mock(side_effect=search)
+    respx.post(f"{BASE}/api/Series/scan").mock(side_effect=scan)
+    return respx.post(f"{BASE}/api/Library/scan").mock(return_value=Response(200))
+
+
+@respx.mock
+async def test_a_new_series_never_scans_the_series_its_alternate_title_names(monkeypatch):
+    """Kavita has not seen "Berserk of Gluttony" yet; its alternate title
+    "Berserk" names a different series that must not be scanned instead."""
+    from mangarr.jobs import tasks
+    from mangarr.models import RootFolder, Series
+
+    monkeypatch.setattr(kavita, "DEBOUNCE_SECONDS", 0.05)
+    scans: list[int] = []
+    lib_scan = _berserk_kavita(scans)
+    series = Series(
+        id=1, title="Berserk of Gluttony", folder_name="Berserk of Gluttony",
+        alt_titles="Boushoku no Berserk\nBerserk", root_folder_id=1,
+    )
+    series.root_folder = RootFolder(id=1, path="/data/manga")
+    tasks._notify_kavita(ENABLED, series)
+    await asyncio.sleep(0.3)
+    assert scans == []
+    assert lib_scan.calls[0].request.url.params["libraryId"] == "3"
+
+
+@respx.mock
+async def test_similar_titles_in_search_results_pick_the_exact_series():
+    scans: list[int] = []
+    _berserk_kavita(scans)
+    await kavita.run_scans(ENABLED, {ScanRequest(1, "/data/manga", ("Berserk",))})
+    assert scans == [7]
+
+
+@respx.mock
+async def test_chapters_arriving_slower_than_the_debounce_scan_once(monkeypatch):
+    """A direct queue finishes a chapter every ~40s — longer than the debounce
+    window — and must not request a scan per chapter (scaled down here)."""
+    monkeypatch.setattr(kavita, "DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(kavita, "RESCAN_SECONDS", 1.5)
+    scans: list[int] = []
+    _berserk_kavita(scans)
+    for _ in range(5):
+        kavita.notify_import(ENABLED, 1, "/data/manga", ["Kagurabachi"])
+        await asyncio.sleep(0.15)
+    await asyncio.sleep(0.3)
+    # the first chapter is scanned promptly, the rest wait for the rescan floor
+    assert scans == [9]
+    await asyncio.sleep(1.0)
+    assert scans == [9, 9]
+
+
+@respx.mock
+async def test_each_import_restarts_the_debounce(monkeypatch):
+    monkeypatch.setattr(kavita, "DEBOUNCE_SECONDS", 0.2)
+    scans: list[int] = []
+    _berserk_kavita(scans)
+    for _ in range(4):
+        kavita.notify_import(ENABLED, 1, "/data/manga", ["Kagurabachi"])
+        await asyncio.sleep(0.1)
+    # 0.4s since the first import, but only 0.1s since the last
+    assert scans == []
+    await asyncio.sleep(0.4)
+    assert scans == [9]
+
+
+@respx.mock
+async def test_distinct_series_are_each_scanned_once(monkeypatch):
+    monkeypatch.setattr(kavita, "DEBOUNCE_SECONDS", 0.05)
+    scans: list[int] = []
+    _berserk_kavita(scans)
+    for _ in range(3):
+        kavita.notify_import(ENABLED, 1, "/data/manga", ["Kagurabachi"])
+        kavita.notify_import(ENABLED, 1, "/data/manga", ["Dandadan"])
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.3)
+    assert sorted(scans) == [9, 10]
+
+
+@respx.mock
+async def test_the_rescan_floor_does_not_delay_other_series(monkeypatch):
+    monkeypatch.setattr(kavita, "DEBOUNCE_SECONDS", 0.05)
+    monkeypatch.setattr(kavita, "RESCAN_SECONDS", 60.0)
+    scans: list[int] = []
+    _berserk_kavita(scans)
+    kavita.notify_import(ENABLED, 1, "/data/manga", ["Kagurabachi"])
+    await asyncio.sleep(0.2)
+    # Kagurabachi is held back by the floor; Dandadan arrives while it waits
+    kavita.notify_import(ENABLED, 1, "/data/manga", ["Kagurabachi"])
+    await asyncio.sleep(0.1)
+    kavita.notify_import(ENABLED, 1, "/data/manga", ["Dandadan"])
+    await asyncio.sleep(0.3)
+    assert scans == [9, 10]
