@@ -16,6 +16,9 @@ class AppConfig(BaseSettings):
     log_level: str = "INFO"
     # When unset, an API key is generated on first run and stored in data_dir/api_key
     api_key: str | None = None
+    # SQLite write-ahead log. Needs local storage for data_dir; set to false
+    # if /config lives on NFS/SMB, where WAL's shared memory file is unreliable.
+    sqlite_wal: bool = True
 
     @property
     def db_path(self) -> Path:

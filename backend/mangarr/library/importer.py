@@ -6,6 +6,7 @@ shared with the library scanner via library.matcher."""
 
 import logging
 import os
+import re
 import shutil
 import zipfile
 from contextlib import contextmanager
@@ -14,10 +15,21 @@ from pathlib import Path
 
 from ..models import Chapter, Series
 from ..util import NEW_FILE_MODE
-from .matcher import IMAGE_EXTS, MediaFile, find_media_files, match_files
+from .matcher import (
+    IMAGE_EXTS,
+    MediaFile,
+    archive_page_signature,
+    find_media_files,
+    match_files,
+)
 from .naming import chapter_filename, series_folder, volume_filename
 
 log = logging.getLogger(__name__)
+
+_SEASON_EPISODE = re.compile(
+    r"(?:\bseason\s*|\bs\s*)(\d+)\b.*?\b(?:episode|ep)\.?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 
 
 def _dest_ext(media: MediaFile) -> str:
@@ -79,6 +91,81 @@ def place_file(src: Path, dest: Path, mode: str) -> None:
     log.info("Imported %s -> %s", src.name, dest)
 
 
+def _inside(path: Path, folder: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(folder.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _preflight_numbering(media: list[MediaFile]) -> None:
+    """Refuse filenames that expose a season-local episode as a chapter.
+
+    ``Ch.081 - [Season 2] Ep.1`` is safe because the explicit global chapter
+    wins. ``[Season 2] Ep.1`` parses as chapter 1 and would silently overwrite
+    or alias Season 1, so the whole batch is stopped before any file is placed.
+    """
+    for item in media:
+        match = _SEASON_EPISODE.search(item.path.stem)
+        if not match or int(match.group(1)) <= 1 or item.chapter_number is None:
+            continue
+        episode = float(match.group(2))
+        if item.chapter_number == episode:
+            raise ValueError(
+                f"possible per-season numbering reset in {item.path.name}: "
+                f"season {match.group(1)} episode {match.group(2)} would map to "
+                f"chapter {item.chapter_number:g}; use overall-series numbers"
+            )
+
+
+def _preflight_duplicates(result, chapters: list[Chapter]) -> None:
+    """Reject ambiguous chapter mappings and exact cross-number duplicates."""
+    by_number: dict[float, list[MediaFile]] = {}
+    signature_numbers: dict[tuple[tuple[int, int], ...], tuple[float, Path]] = {}
+
+    for matched in result.matched:
+        if matched.chapter is None:
+            continue
+        number = matched.chapter.number
+        by_number.setdefault(number, []).append(matched.media)
+        signature = archive_page_signature(matched.media.path)
+        if signature is None:
+            continue
+        previous = signature_numbers.get(signature)
+        if previous is not None and previous[0] != number:
+            raise ValueError(
+                f"torrent contains identical page images for chapters "
+                f"{previous[0]:g} ({previous[1].name}) and {number:g} "
+                f"({matched.media.path.name})"
+            )
+        signature_numbers[signature] = (number, matched.media.path)
+
+    collisions = {
+        number: files for number, files in by_number.items() if len(files) > 1
+    }
+    if collisions:
+        number, files = next(iter(collisions.items()))
+        names = ", ".join(item.path.name for item in files[:3])
+        raise ValueError(
+            f"torrent maps multiple files to chapter {number:g} ({names}); "
+            "possible per-season numbering reset"
+        )
+
+    for chapter in chapters:
+        if not chapter.downloaded or not chapter.file_path:
+            continue
+        signature = archive_page_signature(Path(chapter.file_path))
+        if signature is None:
+            continue
+        candidate = signature_numbers.get(signature)
+        if candidate is not None and candidate[0] != chapter.number:
+            raise ValueError(
+                f"torrent chapter {candidate[0]:g} ({candidate[1].name}) has the "
+                f"same page images as existing chapter {chapter.number:g}"
+            )
+
+
 def import_torrent_payload(
     content_path: Path,
     series: Series,
@@ -94,7 +181,10 @@ def import_torrent_payload(
     folder = library_root / (series.folder_name or series_folder(series.title))
     folder.mkdir(parents=True, exist_ok=True)
     imported: list[tuple[Path, Chapter | None, int | None]] = []
-    result = match_files(find_media_files(content_path), chapters)
+    media = find_media_files(content_path)
+    _preflight_numbering(media)
+    result = match_files(media, chapters)
+    _preflight_duplicates(result, chapters)
 
     def place(media: MediaFile, chapter: Chapter | None, volume: int | None) -> None:
         ext = _dest_ext(media)
@@ -108,7 +198,13 @@ def import_torrent_payload(
         else:
             dest_name = f"{series_folder(series.title)} - {media.path.stem}{ext}"
         dest = folder / dest_name
-        if dest.exists():
+        # A qBittorrent category must normally live outside the library, but
+        # older configurations sometimes downloaded straight into it. Do not
+        # create a second hardlink/copy beside an already-valid source file.
+        if not media.is_dir and _inside(media.path, folder):
+            dest = media.path
+            _validate_existing(dest)
+        elif dest.exists():
             _validate_existing(dest)
         else:
             if media.is_dir:

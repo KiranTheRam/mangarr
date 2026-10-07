@@ -5,6 +5,8 @@ import pytest
 
 from mangarr import settings_service
 from mangarr.download import direct
+from mangarr.download.cbz import write_cbz
+from mangarr.models import Chapter, Series
 from mangarr.sources import registry
 from mangarr.sources.base import DirectSource
 
@@ -197,4 +199,23 @@ async def test_non_images_never_become_completed_archives(tmp_path, monkeypatch,
     dest = tmp_path / "chapter.cbz"
     with pytest.raises(RuntimeError, match="not a supported image"):
         await direct.download_chapter_to_cbz(source, "c1", series, chapter, dest)
+    assert not dest.exists()
+
+
+async def test_exact_duplicate_pages_are_rejected_before_writing(tmp_path):
+    source = FakeSource()
+    page = b"\xff\xd8\xff\xe0image"
+    existing_path = tmp_path / "chapter-1.cbz"
+    write_cbz(existing_path, [page], "<ComicInfo/>")
+    series = Series(id=1, title="Test Series")
+    existing = Chapter(
+        id=1, series_id=1, number=1, downloaded=True, file_path=str(existing_path)
+    )
+    candidate = Chapter(id=2, series_id=1, number=2)
+    series.chapters.extend([existing, candidate])
+    dest = tmp_path / "chapter-2.cbz"
+
+    with pytest.raises(direct.DuplicateChapterPagesError, match="chapter 1"):
+        await direct.download_chapter_to_cbz(source, "c2", series, candidate, dest)
+
     assert not dest.exists()

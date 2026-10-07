@@ -43,12 +43,12 @@ def test_numbers_start_at_episode_zero():
 
 def test_season_resets_fall_back_to_release_order():
     titles = ["[Season 1] Ep. 0", "[Season 1] Ep. 1", "[Season 2] Ep. 1", "[Season 2] Ep. 2"]
-    assert assign_numbers(titles) == [0.0, 1.0, 2.0, 3.0]
+    assert assign_numbers(titles) == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_season_restart_below_the_previous_season_falls_back_too():
     titles = ["[Season 1] Ep. 0", "[Season 1] Ep. 1", "[Season 1] Ep. 2", "[Season 2] Ep. 1"]
-    assert assign_numbers(titles) == [0.0, 1.0, 2.0, 3.0]
+    assert assign_numbers(titles) == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_untitled_episodes_are_counted_from_one():
@@ -106,6 +106,27 @@ async def test_list_chapters_uses_free_episode_api():
     assert chapters[1].external_id == "/en/action/omniscient-reader/episode-1/viewer?title_no=2154&episode_no=2"
     assert chapters[1].url == SITE_URL + chapters[1].external_id
     assert route.calls.last.request.url.params["pageSize"] == "99999"
+    await source._client.aclose()
+
+
+@respx.mock
+async def test_list_chapters_keeps_season_label_after_overall_renumbering():
+    respx.get(f"{MOBILE_URL}/api/v1/webtoon/95/episodes").mock(
+        return_value=httpx.Response(200, json={"result": {"episodeList": [
+            {"episodeNo": 1, "episodeTitle": "[Season 1] Ep. 0", "viewerLink": "/s1-0"},
+            {"episodeNo": 2, "episodeTitle": "[Season 1] Ep. 1 - First", "viewerLink": "/s1-1"},
+            {"episodeNo": 3, "episodeTitle": "[Season 2] Ep. 0", "viewerLink": "/s2-0"},
+        ]}}),
+    )
+    source = WebtoonsSource()
+
+    chapters = await source.list_chapters("95")
+
+    assert [(chapter.number, chapter.title) for chapter in chapters] == [
+        (1.0, "[Season 1] Ep. 0"),
+        (2.0, "First"),
+        (3.0, "[Season 2] Ep. 0"),
+    ]
     await source._client.aclose()
 
 

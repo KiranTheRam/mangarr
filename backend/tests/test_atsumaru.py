@@ -116,3 +116,31 @@ async def test_get_pages_orders_pages_and_resolves_cdn_urls():
     ]
     assert dict(route.calls.last.request.url.params) == {"mangaId": "RxJM9", "chapterId": "b1"}
     await source._client.aclose()
+
+
+@respx.mock
+async def test_season_local_and_zero_based_overall_copies_share_one_based_numbers():
+    respx.get(f"{SITE_URL}/api/manga/page").mock(
+        return_value=httpx.Response(200, json={"mangaPage": {"scanlators": []}})
+    )
+    rows = [
+        {"id": "s1-0", "number": 0, "title": "Chapter 0 S1", "pageCount": 1},
+        {"id": "s1-1", "number": 1, "title": "Chapter 1 S1", "pageCount": 1},
+        {"id": "s2-0", "number": 0, "title": "Chapter 0 S2", "pageCount": 1},
+        {"id": "s2-1", "number": 1, "title": "Chapter 1 S2", "pageCount": 1},
+        *[
+            {"id": f"all-{number}", "number": number, "title": "", "pageCount": 1}
+            for number in range(4)
+        ],
+    ]
+    respx.get(f"{SITE_URL}/api/manga/info").mock(
+        return_value=httpx.Response(200, json={"chapters": rows})
+    )
+    source = AtsumaruSource()
+
+    chapters = await source.list_chapters("TOWER")
+
+    assert sorted(set(chapter.number for chapter in chapters)) == [1.0, 2.0, 3.0, 4.0]
+    assert len(chapters) == 8
+    assert all(chapter.title == "" for chapter in chapters)
+    await source._client.aclose()
