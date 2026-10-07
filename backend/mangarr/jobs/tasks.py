@@ -1277,6 +1277,35 @@ _torrent_missing_counts: dict[int, int] = {}
 IMPORT_PATH_MISSING_LIMIT = 40  # ~5 min at 8s intervals
 _import_path_missing_counts: dict[int, int] = {}
 
+# the torrent downloads sync_qbittorrent tracks; any other status was settled
+# elsewhere (the user removed it from the queue, or a pass finished it)
+SYNCED_TORRENT_STATUSES = (
+    DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+)
+
+
+async def _update_if_still_synced(session: AsyncSession, dl: Download, **values) -> bool:
+    """Write `values` to a torrent download and commit, but only while it is
+    still in SYNCED_TORRENT_STATUSES. Returns whether the row was updated.
+
+    The sync loads its downloads once and then awaits qBittorrent for each
+    one, so the user may remove a download from the queue (in the API's own
+    session) after it was loaded. Writing the status through `dl` would flush
+    its stale value over that removal; this checks and writes in one UPDATE,
+    so a removal that committed first stands."""
+    result = await session.execute(
+        sa_update(Download)
+        .where(Download.id == dl.id, Download.status.in_(SYNCED_TORRENT_STATUSES))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    if result.rowcount != 1:
+        return False
+    # later writes through `dl` are diffed against what it holds
+    await session.refresh(dl, ["status", "error"])
+    return True
+
 
 async def sync_qbittorrent() -> None:
     async with session_scope() as session:
@@ -1286,8 +1315,7 @@ async def sync_qbittorrent() -> None:
         result = await session.execute(
             select(Download).where(
                 Download.kind == DownloadKind.TORRENT,
-                Download.status.in_([DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING,
-                                     DownloadStatus.IMPORTING]),
+                Download.status.in_(SYNCED_TORRENT_STATUSES),
             )
         )
         downloads = result.scalars().all()
@@ -1307,11 +1335,12 @@ async def sync_qbittorrent() -> None:
                     _torrent_missing_counts[dl.id] = misses
                     if misses >= TORRENT_MISSING_LIMIT:
                         _torrent_missing_counts.pop(dl.id, None)
-                        dl.status = DownloadStatus.FAILED
-                        dl.error = "torrent not found in qBittorrent (removed externally?)"
-                        log.warning("torrent download %d (%r) vanished from qBittorrent; "
-                                    "marking failed", dl.id, dl.title)
-                        await session.commit()
+                        if await _update_if_still_synced(
+                            session, dl, status=DownloadStatus.FAILED,
+                            error="torrent not found in qBittorrent (removed externally?)",
+                        ):
+                            log.warning("torrent download %d (%r) vanished from qBittorrent; "
+                                        "marking failed", dl.id, dl.title)
                     continue
                 _torrent_missing_counts.pop(dl.id, None)
                 dl.progress = torrent.progress
@@ -1323,8 +1352,12 @@ async def sync_qbittorrent() -> None:
                     files = [Path(torrent.save_path) / name
                              for name in await client.torrent_files(torrent.hash)
                              ] if torrent.save_path else None
-                    dl.status = DownloadStatus.IMPORTING
-                    await session.commit()
+                    if not await _update_if_still_synced(
+                        session, dl, status=DownloadStatus.IMPORTING,
+                    ):
+                        log.info("torrent download %d left the queue during sync; "
+                                 "not importing it", dl.id)
+                        continue
                     await _import_torrent(session, dl, Path(torrent.content_path), values,
                                           files=files)
                 else:
