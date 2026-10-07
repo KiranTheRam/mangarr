@@ -57,7 +57,7 @@ from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
 from ..titles import plausible_title_match, split_alt_titles, title_queries
 from ..torrent_selection import select_best_torrent
-from ..util import normalize_title
+from ..util import is_transient_error, normalize_title
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
 
 log = logging.getLogger(__name__)
@@ -92,6 +92,28 @@ DIRECT_STALL_TIMEOUT = timedelta(minutes=15)
 # it between update_chapters() and grab_missing_chapters()
 ChapterListCache = dict[tuple[str, str], list[SourceChapter]]
 
+# a source that just failed with a transient error (down, timing out,
+# rate-limiting us) is left alone for a few minutes instead of being asked
+# again for every series in the pass: each attempt can sit through
+# rl_request's whole back-off, so a few hundred series on one dead source
+# could make a pass outlast the monitor interval. In-memory, by source name;
+# the first call after the cooldown probes the source again.
+SOURCE_COOLDOWN_SECONDS = 10 * 60.0
+_source_retry_at: dict[str, float] = {}
+
+
+class SourceCoolingDown(RuntimeError):
+    """Raised instead of calling a source that just failed transiently."""
+
+
+def _source_cooling_down(name: str) -> bool:
+    return time.monotonic() < _source_retry_at.get(name, 0.0)
+
+
+def _note_source_failure(name: str, exc: BaseException) -> None:
+    if is_transient_error(exc):
+        _source_retry_at[name] = time.monotonic() + SOURCE_COOLDOWN_SECONDS
+
 
 class DownloadCancelled(RuntimeError):
     """Raised inside the direct worker when the user removes the queue item."""
@@ -118,7 +140,13 @@ async def _list_chapters_cached(
     if cache is not None and key in cache:
         chapters = cache[key]
     else:
-        chapters = await src.list_chapters(external_id)
+        if _source_cooling_down(src.name):
+            raise SourceCoolingDown(f"{src.name} failed moments ago; skipped for now")
+        try:
+            chapters = await src.list_chapters(external_id)
+        except Exception as exc:
+            _note_source_failure(src.name, exc)
+            raise
         if cache is not None:
             cache[key] = chapters
     return select_for_series(chapters, series)
@@ -236,8 +264,11 @@ async def link_sources(
         backoff_key = (series.id, src.name)
         if respect_backoff and time.monotonic() < _link_retry_at.get(backoff_key, 0.0):
             continue
+        if _source_cooling_down(src.name):
+            continue
         match = None
         searched = False
+        failure: Exception | None = None
         # try each known title variant until the source yields a match
         for query in titles[:4]:
             nq = normalize_title(query)
@@ -247,6 +278,8 @@ async def link_sources(
                 candidates = await src.search_series(query)
             except Exception as exc:
                 log.warning("source %s search failed for %r: %s", src.name, query, exc)
+                _note_source_failure(src.name, exc)
+                failure = exc
                 break
             searched = True
             for cand in candidates:
@@ -263,7 +296,15 @@ async def link_sources(
                     match = top
             if match:
                 break
-        if match is None and searched:
+        if failure is not None:
+            # a failed search is not "no match": try again once a source that
+            # was merely down has cooled off, but give a broken search the
+            # no-match window
+            _link_retry_at[backoff_key] = time.monotonic() + (
+                SOURCE_COOLDOWN_SECONDS if is_transient_error(failure)
+                else LINK_RETRY_AFTER_SECONDS
+            )
+        elif match is None and searched:
             _link_retry_at[backoff_key] = time.monotonic() + LINK_RETRY_AFTER_SECONDS
         if match:
             _link_retry_at.pop(backoff_key, None)

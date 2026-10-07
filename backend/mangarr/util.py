@@ -177,6 +177,30 @@ async def rl_get_limited_bytes(
     raise RuntimeError(f"GET {url} exhausted retries")
 
 
+# statuses that mean the server is busy or broken right now, not that the
+# request is wrong (with any 5xx)
+_TRANSIENT_STATUS = {408, 429}
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True when a failure means the source is down, overloaded or unreachable
+    right now — network errors, timeouts, 408/429/5xx — so a later attempt
+    can be expected to work. False for everything else (no pages, a parse
+    error, a 404): trying again soon would fail the same way. A wrapped error (``raise ... from exc``) is judged by
+    its cause, so "page 3 failed: ConnectTimeout" is transient."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (httpx.TransportError, TimeoutError, ConnectionError)):
+            return True
+        if isinstance(current, httpx.HTTPStatusError):
+            status = current.response.status_code
+            return status in _TRANSIENT_STATUS or status >= 500
+        current = current.__cause__
+    return False
+
+
 ILLEGAL_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
