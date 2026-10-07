@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -8,6 +9,16 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 log = logging.getLogger(__name__)
+
+# Reading the umask means setting it, which would race file creation in worker
+# threads — so read it once, at import, while startup is single-threaded.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+# The mode open() gives a new file. Temporary files are created 0600, and an
+# atomic rename keeps that mode, so library files written through one must be
+# reset to this or a reader running as another user (Kavita, Komga) can't open
+# them.
+NEW_FILE_MODE = 0o666 & ~_UMASK
 
 
 class RateLimiter:
@@ -229,3 +240,19 @@ def normalize_title(title: str) -> str:
     t = t.replace("×", "x")
     t = re.sub(r"[^a-z0-9]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()
+
+
+_DIGIT_RUNS = re.compile(r"(\d+)")
+
+
+def natural_key(text: str) -> tuple:
+    """Sort key that orders embedded numbers by value, so unpadded page names
+    sort in reading order: 1.jpg, 2.jpg, 10.jpg (a plain sort gives 1, 10, 2).
+    Ties fall back to the original text so the order is total."""
+    parts = tuple(
+        # isdecimal, not isdigit: "①" or "²" are digits to isdigit() but not
+        # matched by \d, and int() rejects them
+        (0, int(part), "") if part.isdecimal() else (1, 0, part.casefold())
+        for part in _DIGIT_RUNS.split(text) if part
+    )
+    return parts, text

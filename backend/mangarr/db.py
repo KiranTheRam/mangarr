@@ -1,11 +1,33 @@
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .config import config
 
+# how long a writer waits for another connection's write lock before failing
+# with "database is locked" (the sqlite3 driver's own default is 5s)
+BUSY_TIMEOUT_MS = 30_000
+
 engine = create_async_engine(config.db_url, echo=False)
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def _sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+    # WAL lets API reads and job reads proceed while a job writes, so only
+    # writer-vs-writer contention is left for busy_timeout to absorb. The mode
+    # is persistent in the file; an in-memory database answers "memory" and
+    # stays as it is. busy_timeout goes first so the one-time switch to WAL
+    # also waits out a lock instead of failing.
+    cursor = dbapi_connection.cursor()
+    cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    # MANGARR_SQLITE_WAL=false is the opt-out for network storage; it also
+    # switches a database that is already in WAL back to the rollback journal.
+    cursor.execute(f"PRAGMA journal_mode={'WAL' if config.sqlite_wal else 'DELETE'}")
+    cursor.close()
+
+
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -49,6 +71,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("chapters", "file_source", "VARCHAR NOT NULL DEFAULT ''", None),
     ("chapters", "file_group", "VARCHAR NOT NULL DEFAULT ''", None),
     ("downloads", "release_group", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series_folders", "volume_offset", "INTEGER", None),
 ]
 
 # Chapters mangarr downloaded before file provenance was tracked: the latest

@@ -204,6 +204,7 @@ export interface ScanResult {
   folder: string;
   folder_exists: boolean;
   matched_chapters: number;
+  added_chapters: number;
   volume_files: number;
   cleared: number;
   unmatched: string[];
@@ -303,6 +304,7 @@ export interface SeriesFolder {
   resolved: string;
   primary: boolean;
   exists: boolean;
+  volume_offset: number | null;
 }
 
 export interface FilesystemEntry {

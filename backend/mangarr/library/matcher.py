@@ -6,7 +6,8 @@ volume number matches the metadata edition. Archive directories and ComicInfo
 titles are cached per file version; page images are never read or written."""
 
 import zipfile
-from dataclasses import dataclass, field
+import zlib
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from xml.etree import ElementTree
@@ -16,6 +17,9 @@ from ..util import has_chapter_marker, parse_chapter_number, parse_volume_number
 
 ARCHIVE_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
+SIDECAR_IMAGE_STEMS = {
+    "banner", "cover", "fanart", "folder", "poster", "thumb", "thumbnail",
+}
 
 
 @dataclass
@@ -71,7 +75,7 @@ def find_media_files(content_path: Path) -> list[MediaFile]:
         suffix = p.suffix.lower()
         if suffix in ARCHIVE_EXTS:
             media.append(_media_of(p, is_dir=False))
-        elif suffix in IMAGE_EXTS:
+        elif suffix in IMAGE_EXTS and p.stem.lower() not in SIDECAR_IMAGE_STEMS:
             image_dirs.add(p.parent)
 
     for d in sorted(image_dirs):
@@ -93,6 +97,7 @@ def _media_of(path: Path, is_dir: bool) -> MediaFile:
 # path -> (mtime, size, title); opening every archive on every scan is far too
 # slow for a network-mounted library, so each file version is read only once
 _comicinfo_cache: dict[str, tuple[float, int, str]] = {}
+_comicinfo_number_cache: dict[str, tuple[float, int, float | None]] = {}
 
 
 def comicinfo_title(path: Path) -> str:
@@ -125,6 +130,39 @@ def _read_comicinfo_title(path: Path) -> str:
             return " ".join((root.findtext("Title") or "").split())
     except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError):
         return ""
+
+
+def comicinfo_number(path: Path) -> float | None:
+    """The standard ComicInfo Number field from a CBZ/ZIP, if numeric."""
+    if path.suffix.lower() not in {".cbz", ".zip"}:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    cached = _comicinfo_number_cache.get(str(path))
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    number = _read_comicinfo_number(path)
+    _comicinfo_number_cache[str(path)] = (stat.st_mtime, stat.st_size, number)
+    return number
+
+
+def _read_comicinfo_number(path: Path) -> float | None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            member = next(
+                (name for name in archive.namelist()
+                 if Path(name).name.lower() == "comicinfo.xml"),
+                None,
+            )
+            if member is None:
+                return None
+            root = ElementTree.fromstring(archive.read(member))
+            raw = (root.findtext("Number") or "").strip()
+            return float(raw) if raw else None
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile, ElementTree.ParseError):
+        return None
 
 
 def archive_chapter_numbers(path: Path) -> frozenset[float] | None:
@@ -164,6 +202,83 @@ def _archive_chapter_numbers(path: str, mtime_ns: int, size: int) -> frozenset[f
     return frozenset(numbers) if numbers else None
 
 
+PageSignature = tuple[tuple[int, int], ...]
+
+
+def page_bytes_signature(pages: list[bytes]) -> PageSignature:
+    """Ordered image identity used to reject chapter-number aliases.
+
+    ZIP CRCs are CRC32 values of the uncompressed member payload, so this is
+    directly comparable to :func:`archive_page_signature` without reopening
+    or hashing every existing image.  Member names and ComicInfo are ignored.
+    """
+    return tuple((zlib.crc32(page) & 0xFFFFFFFF, len(page)) for page in pages)
+
+
+def archive_page_signature(path: Path) -> PageSignature | None:
+    """Ordered page CRC/size pairs for a CBZ/ZIP, excluding metadata."""
+    if path.suffix.lower() not in {".cbz", ".zip"}:
+        return None
+    try:
+        stat = path.stat()
+        return _archive_page_signature(str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=1024)
+def _archive_page_signature(path: str, mtime_ns: int, size: int) -> PageSignature | None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            signature = tuple(
+                (member.CRC, member.file_size)
+                for member in archive.infolist()
+                if not member.is_dir() and Path(member.filename).suffix.lower() in IMAGE_EXTS
+            )
+    except (OSError, zipfile.BadZipFile):
+        return None
+    return signature or None
+
+
+def find_series_media_files(
+    folders: list[Path],
+    chapters: list[Chapter],
+    volume_offsets: dict[str, int] | None = None,
+) -> list[MediaFile]:
+    """Discover a series' media, applying optional physical-volume offsets.
+
+    An offset entry scopes a shared folder as well as translating its volume
+    numbers: physical volume ``N + offset`` is exposed as local volume ``N``.
+    Files belonging to other volume ranges in that shared folder are hidden
+    from scan, map and cleanup operations for this series.
+    """
+    offsets = volume_offsets or {}
+    tracked_volumes = {chapter.volume for chapter in chapters if chapter.volume is not None}
+    found: dict[str, MediaFile] = {}
+    for raw_folder in folders:
+        folder = Path(raw_folder)
+        if not folder.exists():
+            continue
+        try:
+            key = str(folder.resolve(strict=False))
+        except OSError:
+            key = str(folder.absolute())
+        scoped = key in offsets
+        offset = offsets.get(key, 0)
+        for media in find_media_files(folder):
+            if scoped and media.volume_number is not None:
+                local_volume = media.volume_number - offset
+                if local_volume not in tracked_volumes:
+                    continue
+                media = replace(media, volume_number=local_volume)
+            try:
+                media_key = str(media.path.resolve(strict=False))
+            except OSError:
+                media_key = str(media.path.absolute())
+            found.setdefault(media_key, media)
+    return list(found.values())
+
+
 def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
     """Match each media file to a chapter (by number) or, for whole-volume
     archives, to every chapter assigned to that volume."""
@@ -177,6 +292,12 @@ def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
     unmatched: list[MediaFile] = []
     for mf in media:
         chapter = by_number.get(mf.chapter_number) if mf.chapter_number is not None else None
+        if chapter is None and not mf.is_dir:
+            embedded_number = comicinfo_number(mf.path)
+            embedded_chapter = by_number.get(embedded_number)
+            if embedded_chapter is not None:
+                mf = replace(mf, chapter_number=embedded_number)
+                chapter = embedded_chapter
         if chapter is not None:
             matched.append(MatchedFile(media=mf, chapter=chapter, volume=None,
                                        covered_chapters=[chapter]))
