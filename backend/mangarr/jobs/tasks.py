@@ -1374,20 +1374,36 @@ async def _import_torrent(
     # session's objects for the updates below.
     candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
     try:
-        placed = await asyncio.to_thread(
-            import_torrent_payload,
-            content_path,
-            SimpleNamespace(title=series.title, folder_name=series.folder_name),
-            [
-                SimpleNamespace(id=chapter.id, number=chapter.number,
-                                volume=chapter.volume, title=chapter.title,
-                                downloaded=chapter.downloaded, file_path=chapter.file_path)
-                for chapter in candidates.values()
-            ],
-            Path(series.root_folder.path),
-            values["naming_template"], values["naming_template_no_volume"],
-            import_mode=values.get("import_mode", "hardlink"), files=files,
-        )
+        try:
+            placed = await asyncio.to_thread(
+                import_torrent_payload,
+                content_path,
+                SimpleNamespace(title=series.title, folder_name=series.folder_name),
+                [
+                    SimpleNamespace(id=chapter.id, number=chapter.number,
+                                    volume=chapter.volume, title=chapter.title,
+                                    downloaded=chapter.downloaded, file_path=chapter.file_path)
+                    for chapter in candidates.values()
+                ],
+                Path(series.root_folder.path),
+                values["naming_template"], values["naming_template_no_volume"],
+                import_mode=values.get("import_mode", "hardlink"), files=files,
+            )
+        except Exception:
+            # the queue stays usable while the worker runs, so the user may
+            # have removed this download meanwhile (which also deletes the
+            # payload, failing the import): their removal stands
+            await _raise_if_download_removed(session, dl.id)
+            raise
+        await _raise_if_download_removed(session, dl.id)
+    except DownloadCancelled as cancelled:
+        # `dl` still holds the pre-import status; writing anything here would
+        # undo the removal. Files the import already placed stay in the
+        # library unrecorded, as after any import that stops partway; a
+        # rescan or a later grab of the chapter picks them up.
+        _import_path_missing_counts.pop(dl.id, None)
+        log.info("torrent import %d discarded: %s", dl.id, cancelled)
+        return
     except FileNotFoundError as exc:
         # qBittorrent may finish downloading and then atomically move the
         # payload from its temporary directory to the category directory.

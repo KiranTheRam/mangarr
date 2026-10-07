@@ -6,6 +6,7 @@ import asyncio
 import threading
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr.jobs import tasks
@@ -15,6 +16,7 @@ from mangarr.models import (
     Download,
     DownloadKind,
     DownloadStatus,
+    HistoryEvent,
     RootFolder,
     Series,
 )
@@ -85,6 +87,93 @@ async def test_slow_import_does_not_block_the_event_loop(db_session, tmp_path, m
     by_number = {c.number: c for c in series.chapters}
     assert by_number[2.0].downloaded and by_number[2.0].file_path == str(dest)
     assert not by_number[1.0].downloaded
+
+
+@pytest.fixture
+async def two_sessions(tmp_path, monkeypatch):
+    """The sync's session and an API request's, on separate connections."""
+    notified = []
+    monkeypatch.setattr(tasks.notifications, "notify_import", lambda *a: notified.append(a))
+    monkeypatch.setattr(tasks, "_notify_kavita", lambda *a: None)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as sync_session, maker() as api_session:
+        yield sync_session, api_session, notified
+    await engine.dispose()
+
+
+@pytest.mark.parametrize("outcome", ["imported", "payload deleted", "failed"])
+async def test_removal_during_import_stands(two_sessions, tmp_path, monkeypatch, outcome):
+    """The import no longer blocks the queue, so the user can remove the
+    download while it runs; whatever the import then does must not overwrite
+    that removal or record its chapters."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from mangarr import settings_service
+    from mangarr.api import queue
+
+    session, api_session, notified = two_sessions
+    (tmp_path / "library").mkdir()  # the API creates a root on add
+    series = Series(title="Vinland Saga", sort_title="vinland saga",
+                    root_folder=RootFolder(path=str(tmp_path / "library")),
+                    folder_name="Vinland Saga")
+    series.chapters = [Chapter(number=1.0), Chapter(number=2.0)]
+    session.add(series)
+    await session.commit()
+    dl = Download(series_id=series.id, kind=DownloadKind.TORRENT,
+                  status=DownloadStatus.IMPORTING, title="Vinland Saga c002",
+                  torrent_hash="a" * 40)
+    session.add(dl)
+    await session.commit()
+    content = tmp_path / "payload"
+    content.mkdir()
+    dest = tmp_path / "library" / "Vinland Saga" / "Vinland Saga - Ch. 02.0.cbz"
+
+    import_started = threading.Event()
+    removal_committed = threading.Event()
+
+    def import_outlived_by_removal(content_path, series_snapshot, chapters, *args, **kwargs):
+        import_started.set()
+        assert removal_committed.wait(timeout=5)
+        if outcome == "payload deleted":
+            raise FileNotFoundError("torrent file missing: payload/c002.cbz")
+        if outcome == "failed":
+            raise OSError("Incomplete library copy")
+        match = next(c for c in chapters if c.number == 2.0)
+        return [(dest, match, None)]
+
+    monkeypatch.setattr(tasks, "import_torrent_payload", import_outlived_by_removal)
+    monkeypatch.setattr(tasks, "_import_path_missing_counts", {})
+    values = dict(settings_service.DEFAULTS, qbittorrent_enabled="true")
+    monkeypatch.setattr(queue.registry, "apply_settings", AsyncMock(return_value=values))
+    client = MagicMock(delete_torrents=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(queue, "QbtClient", lambda *args: client)
+
+    async def remove_while_importing():
+        assert await asyncio.to_thread(import_started.wait, 5)
+        assert await queue._remove_downloads(api_session, [dl.id]) == 1
+        removal_committed.set()
+
+    await asyncio.wait_for(asyncio.gather(
+        tasks._import_torrent(session, dl, content, VALUES),
+        remove_while_importing(),
+    ), timeout=10)
+
+    row = (await api_session.execute(
+        select(Download.status, Download.error).where(Download.id == dl.id)
+    )).one()
+    assert tuple(row) == (DownloadStatus.FAILED, tasks.REMOVED_BY_USER)
+    chapter = await api_session.scalar(
+        select(Chapter).where(Chapter.series_id == series.id, Chapter.number == 2.0)
+    )
+    assert not chapter.downloaded and not chapter.file_path
+    assert await api_session.scalar(
+        select(HistoryEvent.id).where(HistoryEvent.event == "imported")
+    ) is None
+    assert notified == []
+    assert dl.id not in tasks._import_path_missing_counts
 
 
 async def test_importer_errors_still_fail_the_download(db_session, tmp_path, monkeypatch):
