@@ -51,6 +51,7 @@ async def env(tmp_path, monkeypatch):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
+    (tmp_path / "library").mkdir()  # the API creates a root on add
     async with maker() as session:
         series = Series(title="Kagurabachi", sort_title="kagurabachi",
                         root_folder=RootFolder(path=str(tmp_path / "library")),
