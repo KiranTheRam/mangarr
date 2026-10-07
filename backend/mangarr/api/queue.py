@@ -69,6 +69,11 @@ async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
     picks up QUEUED items); active torrents are also deleted from qBittorrent
     along with their partial data so 'remove' really stops the transfer.
 
+    Failed torrents are left alone in qBittorrent. A torrent only fails once it
+    has finished (an import problem) or has already vanished from the client,
+    and the import errors tell the user to import its files manually —
+    deleting them on dismiss would destroy exactly what that message points at.
+
     The REMOVED_BY_USER error text is significant: the monitor's retry logic
     ignores it, so cancelling a queued grab doesn't blacklist that source for
     the chapter the way a real download failure does. Dismissing an
@@ -84,6 +89,7 @@ async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
     hashes = [
         dl.torrent_hash for dl in downloads
         if dl.kind == DownloadKind.TORRENT and dl.torrent_hash
+        and dl.status in ACTIVE
     ]
     # Do not hide work until the download client confirms cancellation.
     if hashes:

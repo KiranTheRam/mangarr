@@ -12,7 +12,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from ..download.cbz import build_comicinfo
-from ..util import natural_key
+from ..util import NEW_FILE_MODE, natural_key
 from .matcher import IMAGE_EXTS
 
 log = logging.getLogger(__name__)
@@ -64,6 +64,9 @@ def merge_chapter_archives(
             out.writestr("ComicInfo.xml", build_comicinfo(
                 series=series_title, volume=volume, summary=summary, page_count=pages,
             ))
+        # not the temp file's 0600 — set once written, in case the umask
+        # leaves no owner write
+        temporary.chmod(NEW_FILE_MODE)
         temporary.replace(dest)
     finally:
         temporary.unlink(missing_ok=True)

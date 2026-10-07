@@ -14,6 +14,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from ..models import Chapter, Series
+from ..util import NEW_FILE_MODE
 from .matcher import (
     IMAGE_EXTS,
     MediaFile,
@@ -43,12 +44,18 @@ def _dest_ext(media: MediaFile) -> str:
 
 
 @contextmanager
-def _atomic_destination(dest: Path):
-    """Never expose a partial copy/archive under its library filename."""
+def _atomic_destination(dest: Path, keep_mode: bool = False):
+    """Never expose a partial copy/archive under its library filename.
+
+    The temp file's 0600 is replaced with NEW_FILE_MODE once it is written
+    (not before: a umask without owner write would make it unwritable).
+    keep_mode leaves the writer's mode, e.g. the source mode copy2 carries."""
     with NamedTemporaryFile(dir=dest.parent, prefix=".mangarr-", suffix=".partial", delete=False) as handle:
         temporary = Path(handle.name)
     try:
         yield temporary
+        if not keep_mode:
+            temporary.chmod(NEW_FILE_MODE)
         temporary.replace(dest)
     finally:
         temporary.unlink(missing_ok=True)
@@ -78,7 +85,7 @@ def place_file(src: Path, dest: Path, mode: str) -> None:
         except OSError as exc:
             log.warning("hardlink %s -> %s failed (%s); copying instead",
                         src.name, dest, exc)
-    with _atomic_destination(dest) as temporary:
+    with _atomic_destination(dest, keep_mode=True) as temporary:
         shutil.copy2(src, temporary)
         if temporary.stat().st_size != src.stat().st_size:
             raise OSError("Incomplete library copy")
