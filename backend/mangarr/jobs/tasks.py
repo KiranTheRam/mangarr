@@ -69,6 +69,21 @@ BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 # chapter on that source)
 REMOVED_BY_USER = "removed by user"
 
+# error prefix marking a direct download that never reached its source
+# because the library root was unavailable (unmounted, or empty while
+# files are expected) — not a source failure either, so once the library
+# is back the monitor grabs that chapter from that source again
+LIBRARY_UNAVAILABLE = "library unavailable"
+
+# error prefixes of direct downloads the worker failed without asking the
+# source: it was disabled, or the series has no root folder to write to
+SOURCE_DISABLED = "source is disabled"
+NO_ROOT_FOLDER = "series has no root folder configured"
+
+# none of these are the source's fault, so the monitor's failed-grab block
+# leaves them out
+NOT_SOURCE_FAILURES = (LIBRARY_UNAVAILABLE, SOURCE_DISABLED, NO_ROOT_FOLDER)
+
 # upgrades share the single direct queue with new chapters; a series that
 # just had upgrades enabled must not flood it in one pass
 UPGRADES_PER_PASS = 25
@@ -1038,7 +1053,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         return
     if values.get(f"source_{source_name}_enabled") != "true":
         dl.status = DownloadStatus.FAILED
-        dl.error = "source is disabled; enable it before retrying"
+        dl.error = f"{SOURCE_DISABLED}; enable it before retrying"
         await session.commit()
         return
     series_id = series.id
@@ -1047,14 +1062,14 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     root = series.root_folder.path if series.root_folder else None
     if not root:
         dl.status = DownloadStatus.FAILED
-        dl.error = "series has no root folder configured"
+        dl.error = NO_ROOT_FOLDER
         await session.commit()
         return
     unavailable = await library_root_unavailable(session, series)
     if unavailable:
         # writing now would recreate the series folder on the bare mount point
         dl.status = DownloadStatus.FAILED
-        dl.error = unavailable[:500]
+        dl.error = f"{LIBRARY_UNAVAILABLE}: {unavailable}"[:500]
         await session.commit()
         return
 
@@ -1443,6 +1458,11 @@ async def grab_missing_chapters(
     source links and chapter list have been created. `only_monitored=False`
     (explicit user-requested search) also grabs unmonitored missing chapters.
     """
+    if series.root_folder is None:
+        # e.g. its root folder was deleted: the worker could only fail every
+        # chapter queued for it
+        log.warning("Not grabbing for %r: it has no root folder", series.title)
+        return 0
     # with the library unmounted every chapter would look missing, and new
     # files would land on the bare mount point
     reason = await library_root_unavailable(session, series)
@@ -1497,7 +1517,8 @@ async def grab_missing_chapters(
 
     # a chapter that recently failed on a source shouldn't be retried there —
     # fall through to the next source instead. Old failures expire (sources
-    # fix broken chapters), and user cancellations don't count as failures.
+    # fix broken chapters), and neither user cancellations nor downloads
+    # stopped before the source was asked (NOT_SOURCE_FAILURES) count.
     retry_cutoff = datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER
     result = await session.execute(
         select(Download.chapter_id, Download.source_name).where(
@@ -1505,6 +1526,7 @@ async def grab_missing_chapters(
             Download.status == DownloadStatus.FAILED,
             Download.chapter_id.isnot(None),
             Download.error != REMOVED_BY_USER,
+            *(~Download.error.startswith(prefix) for prefix in NOT_SOURCE_FAILURES),
             Download.updated_at >= retry_cutoff,
         )
     )
