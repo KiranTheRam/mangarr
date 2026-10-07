@@ -144,3 +144,47 @@ async def test_successful_cancellation_removes_work(db_session, monkeypatch):
     assert await queue._remove_downloads(db_session, [dl.id]) == 1
     client.delete_torrents.assert_awaited_once_with(["a" * 40])
     assert await queue.get_queue(db_session) == []
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_dismissing_failed_torrent_keeps_its_files(db_session, monkeypatch, enabled):
+    """A failed torrent finished downloading (or is already gone), and its
+    error asks the user to import the files by hand — dismissing the row must
+    not delete them, and must work whether or not qBittorrent is enabled."""
+    from unittest.mock import AsyncMock, MagicMock
+    from mangarr import settings_service
+    dl = Download(kind=DownloadKind.TORRENT, status=DownloadStatus.FAILED,
+                  torrent_hash="b" * 40,
+                  error="torrent has no linked series/root folder; import manually")
+    db_session.add(dl)
+    await db_session.commit()
+    values = dict(settings_service.DEFAULTS, qbittorrent_enabled=str(enabled).lower())
+    monkeypatch.setattr(queue.registry, "apply_settings", AsyncMock(return_value=values))
+    client = MagicMock(delete_torrents=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(queue, "QbtClient", lambda *args: client)
+    assert [item.id for item in await queue.get_queue(db_session)] == [dl.id]
+
+    assert await queue._remove_downloads(db_session, [dl.id]) == 1
+
+    client.delete_torrents.assert_not_awaited()
+    assert await queue.get_queue(db_session) == []
+
+
+async def test_bulk_removal_only_stops_active_torrents(db_session, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+    from mangarr import settings_service
+    active = Download(kind=DownloadKind.TORRENT, status=DownloadStatus.DOWNLOADING,
+                      torrent_hash="a" * 40)
+    failed = Download(kind=DownloadKind.TORRENT, status=DownloadStatus.FAILED,
+                      torrent_hash="b" * 40, error="import failed")
+    db_session.add_all([active, failed])
+    await db_session.commit()
+    values = dict(settings_service.DEFAULTS, qbittorrent_enabled="true")
+    monkeypatch.setattr(queue.registry, "apply_settings", AsyncMock(return_value=values))
+    client = MagicMock(delete_torrents=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(queue, "QbtClient", lambda *args: client)
+
+    assert await queue._remove_downloads(db_session, [active.id, failed.id]) == 2
+
+    client.delete_torrents.assert_awaited_once_with(["a" * 40])
+    assert await queue.get_queue(db_session) == []

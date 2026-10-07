@@ -30,6 +30,11 @@ _limiter = RateLimiter(rate=2, per_seconds=1)
 _image_limiter = RateLimiter(rate=5, per_seconds=1)
 # "Chapter 12" / "Episode 12" / "# 12" carry no title of their own
 _GENERIC_TITLE = re.compile(r"^\s*(?:chapter|episode|ch\.?|ep\.?|#)?\s*\d+(?:\.\d+)?\s*$", re.I)
+_SEASON_TITLE = re.compile(
+    r"^\s*(?:chapter|episode|ch\.?|ep\.?)?\s*(\d+(?:\.\d+)?)\s+"
+    r"(?:season|s)\s*(\d+)\s*$",
+    re.IGNORECASE,
+)
 
 
 class AtsumaruSource(DirectSource):
@@ -118,11 +123,49 @@ class AtsumaruSource(DirectSource):
                 continue
             group_rank = groups.get(item.get("scanId"), (len(groups), ""))[0]
             copies.append((number, group_rank, index, item))
+
+        # Some mirrors expose both season-local copies ("Chapter 0 S2") and
+        # an otherwise-identical zero-based overall run. Normalize both to
+        # Mangarr's one-based overall chapter space before group selection.
+        season_numbers: dict[int, set[float]] = {}
+        for _, _, _, item in copies:
+            match = _SEASON_TITLE.match(str(item.get("title") or ""))
+            if match:
+                season_numbers.setdefault(int(match.group(2)), set()).add(float(match.group(1)))
+        offsets: dict[int, float] = {}
+        if len(season_numbers) > 1:
+            next_overall = 1.0
+            for season, numbers in sorted(season_numbers.items()):
+                first = min(numbers)
+                offsets[season] = next_overall - first
+                next_overall = max(numbers) + offsets[season] + 1
+        unseasoned = {
+            number for number, _, _, item in copies
+            if _SEASON_TITLE.match(str(item.get("title") or "")) is None
+        }
+        season_count = sum(len(numbers) for numbers in season_numbers.values())
+        shift_overall = bool(
+            offsets and unseasoned and 0.0 in unseasoned
+            and len(unseasoned) == season_count
+            and max(unseasoned) == season_count - 1
+        )
+        normalized: list[tuple[float, int, int, dict]] = []
+        for number, rank, index, item in copies:
+            match = _SEASON_TITLE.match(str(item.get("title") or ""))
+            if match and offsets:
+                number = float(match.group(1)) + offsets[int(match.group(2))]
+            elif shift_overall:
+                number += 1
+            normalized.append((number, rank, index, item))
+        copies = normalized
+
         # every group's copy, best-ranked first within each chapter number
         copies.sort(key=lambda copy: copy[:3])
         chapters = []
         for number, _, _, item in copies:
             title = str(item.get("title") or "").strip()
+            if _SEASON_TITLE.match(title):
+                title = ""
             chapters.append(
                 SourceChapter(
                     source_name=self.name,

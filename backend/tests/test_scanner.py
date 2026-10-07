@@ -172,3 +172,88 @@ def test_scan_repairs_omnibus_mappings_and_clears_false_ownership(tmp_path):
     # A second scan neither changes ownership nor loses the corrected pointers.
     again = scan_series(series, chapters, [tmp_path])
     assert again.cleared == 0 and again.matched_chapters == 0
+
+
+def test_volume_scan_repoints_stale_path_even_when_old_file_exists_elsewhere(tmp_path):
+    scanned = tmp_path / "scanned"
+    scanned.mkdir()
+    current = scanned / "Series - Vol. 01.cbz"
+    make_cbz(current)
+    old = tmp_path / "old-name.cbz"
+    make_cbz(old)
+    chapters = chs((1, 1), (2, 1))
+    for chapter in chapters:
+        chapter.downloaded = True
+        chapter.file_path = str(old)
+    series = Series(id=1, title="Series", folder_name="Series", alt_titles="")
+
+    result = scan_series(series, chapters, [scanned])
+
+    assert result.cleared == 0
+    assert all(chapter.file_path == str(current) for chapter in chapters)
+
+
+def test_scan_creates_and_adopts_decimal_chapters_explicitly_named_on_disk(tmp_path):
+    make_cbz(tmp_path / "Series - Ch. 0018.1.cbz")
+    chapters = chs((18, 3), (19, 3))
+    series = Series(id=1, title="Series", folder_name="Series", alt_titles="", monitored=True)
+    series.chapters.extend(chapters)
+
+    result = scan_series(series, series.chapters, [tmp_path])
+
+    extra = next(chapter for chapter in series.chapters if chapter.number == 18.1)
+    assert result.added_chapters == 1
+    assert len(series.chapters) == 3
+    assert extra.downloaded and extra.volume == 3
+    assert extra.volume_source == "disk-inferred"
+    assert extra.file_path.endswith("0018.1.cbz")
+
+
+def test_title_named_archive_covers_known_single_volume_series(tmp_path):
+    archive = tmp_path / "There Are Things I Can't Tell You.cbz"
+    make_cbz(archive)
+    series = Series(
+        id=1, title="There Are Things I Can't Tell You", folder_name="",
+        alt_titles="", total_chapters=7, total_volumes=1, monitored=False,
+    )
+
+    result = scan_series(series, [], [tmp_path])
+
+    assert result.added_chapters == 7
+    assert len(series.chapters) == 7
+    assert all(chapter.downloaded and chapter.file_path == str(archive)
+               for chapter in series.chapters)
+
+
+def test_shared_folder_volume_offset_scopes_and_translates_files(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    make_cbz(shared / "Series - Vol. 01.cbz")  # belongs to another part
+    wanted = shared / "Series - Vol. 06.cbz"
+    make_cbz(wanted)
+    chapters = chs((1, 1), (2, 1))
+    series = Series(id=1, title="Part 2", folder_name="Part 2", alt_titles="")
+    key = str(shared.resolve(strict=False))
+
+    result = scan_series(series, chapters, [shared], {key: 5})
+
+    assert result.volume_files == 1
+    assert all(chapter.file_path == str(wanted) for chapter in chapters)
+
+
+def test_scan_prefers_embedded_combined_number_over_rounded_filename(tmp_path):
+    path = tmp_path / "Black Clover - Ch. 0370.4.cbz"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("001.png", PNG)
+        archive.writestr(
+            "ComicInfo.xml", "<ComicInfo><Number>370.371</Number></ComicInfo>"
+        )
+    chapter = Chapter(id=1, series_id=1, number=370.371)
+    series = Series(id=1, title="Black Clover", folder_name="Black Clover", alt_titles="")
+    series.chapters.append(chapter)
+
+    result = scan_series(series, [chapter], [tmp_path])
+
+    assert result.added_chapters == 0
+    assert chapter.downloaded and chapter.file_path == str(path)
+    assert [item.number for item in series.chapters] == [370.371]

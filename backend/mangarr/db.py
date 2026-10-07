@@ -69,6 +69,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("chapters", "file_source", "VARCHAR NOT NULL DEFAULT ''", None),
     ("chapters", "file_group", "VARCHAR NOT NULL DEFAULT ''", None),
     ("downloads", "release_group", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series_folders", "volume_offset", "INTEGER", None),
 ]
 
 # Chapters mangarr downloaded before file provenance was tracked: the latest

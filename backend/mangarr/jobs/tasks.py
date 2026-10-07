@@ -36,10 +36,10 @@ from ..chapter_metadata import (
     reconcile_decimal_volumes,
 )
 from ..db import session_scope
-from ..download.direct import download_chapter_to_cbz
+from ..download.direct import DuplicateChapterPagesError, download_chapter_to_cbz
 from ..download.qbittorrent import QbtClient
 from ..library.importer import import_torrent_payload
-from ..library.matcher import archive_chapter_numbers, find_media_files
+from ..library.matcher import archive_chapter_numbers, find_series_media_files
 from ..library.naming import chapter_path, series_folder, volume_filename
 from ..library.volume_merge import merge_chapter_archives
 from ..metadata.anilist import provider as anilist
@@ -542,13 +542,20 @@ def _series_folders(series: Series) -> list[Path]:
 
 def disk_volume_numbers(series: Series) -> set[int]:
     """Volume numbers of whole-volume archives present in the series' folders."""
+    from ..library.scanner import resolve_volume_offsets
+
     volumes: set[int] = set()
-    for folder in _series_folders(series):
-        if not folder.exists():
-            continue
-        for mf in find_media_files(folder):
-            if mf.volume_number is not None and mf.chapter_number is None:
-                volumes.add(mf.volume_number)
+    folders = _series_folders(series)
+    offsets = (
+        resolve_volume_offsets(Path(series.root_folder.path), series)
+        if series.root_folder is not None else {}
+    )
+    media = find_series_media_files(
+        folders, [chapter for chapter in series.chapters if not chapter.excluded], offsets
+    )
+    for mf in media:
+        if mf.volume_number is not None and mf.chapter_number is None:
+            volumes.add(mf.volume_number)
     return volumes
 
 
@@ -605,12 +612,16 @@ async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> i
 async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     """Adopt existing library folders for the series and mark chapters that are
     already on disk as owned (so they aren't re-downloaded)."""
-    from ..library.scanner import scan_series
+    from ..library.scanner import resolve_volume_offsets, scan_series
 
     folders = _series_folders(series)
     if not folders:
         return
-    scan_series(series, [chapter for chapter in series.chapters if not chapter.excluded], folders)
+    offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
+    scan_series(
+        series, [chapter for chapter in series.chapters if not chapter.excluded],
+        folders, offsets,
+    )
     await session.commit()
 
 
@@ -1068,6 +1079,20 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             series.title, series.folder_name,
             chapter.number, chapter.volume, chapter.title,
         )
+        # a template that drops precision can still map two chapters to one
+        # file; writing would silently replace the other chapter's archive
+        owner = await session.scalar(
+            select(Chapter.number).where(
+                Chapter.series_id == series.id,
+                Chapter.id != chapter.id,
+                Chapter.file_path == str(dest),
+            )
+        )
+        if owner is not None:
+            raise RuntimeError(
+                f"{dest.name} already holds chapter {owner:g}; "
+                "use a naming template that keeps chapter numbers distinct"
+            )
         dest_preexisted = dest.exists()
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
@@ -1110,6 +1135,29 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             current.error = str(cancel_exc)
             await session.commit()
         log.info("direct download %d cancelled: %s", download_id, cancel_exc)
+        return
+    except DuplicateChapterPagesError as duplicate:
+        # This is a source-listing alias, not a transient network failure. Keep
+        # the chapter as an excluded tombstone so refreshes cannot recreate or
+        # repeatedly fetch it. The guard runs before write_cbz, so no media
+        # artifact needs to be removed here.
+        await session.rollback()
+        current_dl = await session.get(Download, download_id)
+        current_chapter = await session.get(Chapter, chapter_id)
+        if current_dl is None or current_chapter is None:
+            return
+        current_chapter.excluded = True
+        current_chapter.monitored = False
+        current_chapter.downloaded = False
+        current_chapter.file_path = ""
+        current_dl.status = DownloadStatus.FAILED
+        current_dl.error = f"duplicate pages rejected and chapter excluded: {duplicate}"[:500]
+        session.add(HistoryEvent(
+            series_id=series_id, chapter_id=chapter_id, event="duplicate_rejected",
+            source_name=source_name, detail=current_dl.error,
+        ))
+        await session.commit()
+        log.warning("direct download %d rejected: %s", download_id, duplicate)
         return
     except Exception as exc:
         log.exception("direct download %d failed", download_id)
