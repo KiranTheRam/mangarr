@@ -69,6 +69,12 @@ BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 # chapter on that source)
 REMOVED_BY_USER = "removed by user"
 
+# error prefix marking a direct download that never reached its source
+# because the library root was unavailable (unmounted, or empty while
+# files are expected) — not a source failure either, so once the library
+# is back the monitor grabs that chapter from that source again
+LIBRARY_UNAVAILABLE = "library unavailable"
+
 # upgrades share the single direct queue with new chapters; a series that
 # just had upgrades enabled must not flood it in one pass
 UPGRADES_PER_PASS = 25
@@ -95,6 +101,11 @@ ChapterListCache = dict[tuple[str, str], list[SourceChapter]]
 
 class DownloadCancelled(RuntimeError):
     """Raised inside the direct worker when the user removes the queue item."""
+
+
+class LibraryUnavailableError(RuntimeError):
+    """Raised inside the direct worker when the library root has become
+    unavailable since the download started."""
 
 
 async def _raise_if_download_removed(session: AsyncSession, download_id: int) -> None:
@@ -1054,9 +1065,21 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     if unavailable:
         # writing now would recreate the series folder on the bare mount point
         dl.status = DownloadStatus.FAILED
-        dl.error = unavailable[:500]
+        dl.error = f"{LIBRARY_UNAVAILABLE}: {unavailable}"[:500]
         await session.commit()
         return
+
+    # the root can also go away while the pages download. It is checked
+    # again with every cancellation check, the last of which runs right
+    # before the archive is written (write_cbz creates missing folders, so it
+    # would recreate the series folder on the bare mount point), and when a
+    # write fails (the library failed then, not the source)
+    expect_content = await root_expects_content(session, series)
+
+    def library_unavailable_now() -> str:
+        from ..library.scanner import root_unavailable
+
+        return root_unavailable(Path(root), expect_content=expect_content)
 
     # page fetches run concurrently and call back into ensure_not_cancelled /
     # on_progress; the shared AsyncSession is not task-safe, so every session
@@ -1080,6 +1103,13 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             )
             if excluded:
                 raise DownloadCancelled("chapter was excluded")
+
+    async def check_still_wanted() -> None:
+        await ensure_not_cancelled(force=True)
+        # last and synchronous: nothing runs between it and the write
+        reason = library_unavailable_now()
+        if reason:
+            raise LibraryUnavailableError(reason)
 
     claimed = await session.execute(
         sa_update(Download)
@@ -1142,7 +1172,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
             progress_cb=on_progress,
-            cancel_cb=lambda: ensure_not_cancelled(force=True),
+            cancel_cb=check_still_wanted,
             web_url="",
         ))
         stall_seconds = DIRECT_STALL_TIMEOUT.total_seconds()
@@ -1205,15 +1235,36 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         log.warning("direct download %d rejected: %s", download_id, duplicate)
         return
     except Exception as exc:
-        log.exception("direct download %d failed", download_id)
+        # a library that went away mid-download is not a source failure: mark
+        # it like the check before the download does, so the monitor grabs
+        # the chapter from this source again once the library is back
+        if isinstance(exc, LibraryUnavailableError):
+            unavailable = str(exc)
+        elif isinstance(exc, OSError):
+            unavailable = library_unavailable_now()
+        else:
+            unavailable = ""
+        if unavailable:
+            log.warning("direct download %d stopped, library unavailable: %s",
+                        download_id, exc)
+        else:
+            log.exception("direct download %d failed", download_id)
         # a progress commit may have been cancelled mid-flight when the page
         # fetches were torn down; reset the session before recording failure
         await session.rollback()
+        if unavailable and dest is not None:
+            partial = dest.with_suffix(".cbz.partial")
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError as os_exc:
+                log.warning("could not remove partial download %s: %s", partial, os_exc)
         dl = await session.get(Download, download_id)
         if dl is None:
             return
         dl.status = DownloadStatus.FAILED
-        dl.error = str(exc)[:500]
+        dl.error = (
+            f"{LIBRARY_UNAVAILABLE}: {unavailable}" if unavailable else str(exc)
+        )[:500]
         session.add(HistoryEvent(
             series_id=series_id, chapter_id=chapter_id, event="failed",
             source_name=source_name, detail=dl.error,
@@ -1497,7 +1548,8 @@ async def grab_missing_chapters(
 
     # a chapter that recently failed on a source shouldn't be retried there —
     # fall through to the next source instead. Old failures expire (sources
-    # fix broken chapters), and user cancellations don't count as failures.
+    # fix broken chapters), and neither user cancellations nor downloads an
+    # unavailable library stopped count as failures.
     retry_cutoff = datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER
     result = await session.execute(
         select(Download.chapter_id, Download.source_name).where(
@@ -1505,6 +1557,7 @@ async def grab_missing_chapters(
             Download.status == DownloadStatus.FAILED,
             Download.chapter_id.isnot(None),
             Download.error != REMOVED_BY_USER,
+            ~Download.error.startswith(LIBRARY_UNAVAILABLE),
             Download.updated_at >= retry_cutoff,
         )
     )
