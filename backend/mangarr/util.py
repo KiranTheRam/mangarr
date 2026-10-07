@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -8,6 +9,16 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 log = logging.getLogger(__name__)
+
+# Reading the umask means setting it, which would race file creation in worker
+# threads — so read it once, at import, while startup is single-threaded.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+# The mode open() gives a new file. Temporary files are created 0600, and an
+# atomic rename keeps that mode, so library files written through one must be
+# reset to this or a reader running as another user (Kavita, Komga) can't open
+# them.
+NEW_FILE_MODE = 0o666 & ~_UMASK
 
 
 class RateLimiter:
