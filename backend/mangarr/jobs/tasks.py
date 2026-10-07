@@ -1052,17 +1052,18 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         nonlocal last_progress_commit, last_activity
         last_activity = time.monotonic()
         await ensure_not_cancelled()
-        progress = done / total
-        now = time.monotonic()
-        if done < total and now - last_progress_commit < 1.0:
-            dl.progress = progress
+        # dl is only touched right before a throttled commit: a pending
+        # progress change would be autoflushed by the next cancellation
+        # check's SELECT, holding SQLite's write lock (and blocking every
+        # other writer) until the next page finished. Skipped values were
+        # never visible to other connections anyway.
+        if done < total and time.monotonic() - last_progress_commit < 1.0:
             return
         async with db_lock:
             now = time.monotonic()
             if done < total and now - last_progress_commit < 1.0:
-                dl.progress = progress
                 return
-            dl.progress = progress
+            dl.progress = done / total
             last_progress_commit = now
             await session.commit()
 
