@@ -20,6 +20,8 @@ class FailingSource(DirectSource):
         self.error = error
         self.list_calls = 0
         self.search_calls = 0
+        self.volume_calls = 0
+        self.metadata_calls = 0
 
     async def search_series(self, query):
         self.search_calls += 1
@@ -30,6 +32,23 @@ class FailingSource(DirectSource):
         raise self.error
 
     async def get_pages(self, chapter_external_id):
+        return []
+
+    async def get_volume_map(self, external_id):
+        self.volume_calls += 1
+        raise self.error
+
+    async def get_chapter_metadata(self, external_id):
+        self.metadata_calls += 1
+        raise self.error
+
+
+class MetadataOnlySource(FailingSource):
+    """Like Wikipedia/VIZ: serves no chapters, so only its metadata calls
+    can find out that it is down."""
+
+    async def list_chapters(self, external_id):
+        self.list_calls += 1
         return []
 
 
@@ -76,6 +95,14 @@ async def _make_series(session, title, external_id=None):
     session.add(series)
     await session.commit()
     return await tasks._load_series(session, series.id)
+
+
+async def _monitor_pass(session, series):
+    """What monitor_all() does with a series' sources."""
+    cache = {}
+    await tasks.link_sources(session, series, {}, respect_backoff=True)
+    await tasks.update_chapters(session, series, {}, cache)
+    return await tasks.grab_missing_chapters(session, series, {}, chapter_cache=cache)
 
 
 def _http_error(status):
@@ -178,3 +205,81 @@ async def test_broken_search_waits_like_no_match(db_session, monkeypatch, clock)
     clock.now += tasks.LINK_RETRY_AFTER_SECONDS
     await tasks.link_sources(db_session, first, {}, respect_backoff=True)
     assert source.search_calls == 3
+
+
+async def test_cooling_source_gets_no_volume_or_metadata_calls(
+    db_session, monkeypatch, clock
+):
+    # a MangaDex-style source: its listing fails, and the series lacks volume
+    # data, so update_chapters goes on to ask it for the aggregate
+    source = FailingSource(httpx.ConnectError("connection refused"))
+    _use_source(monkeypatch, source)
+    first = await _make_series(db_session, "First", "a")
+    second = await _make_series(db_session, "Second", "b")
+
+    for series in (first, second):
+        await _monitor_pass(db_session, series)
+
+    assert source.list_calls == 1
+    assert source.volume_calls == 0
+    assert source.metadata_calls == 0
+
+
+async def test_failing_metadata_source_cools_down(db_session, monkeypatch, clock):
+    # Wikipedia/VIZ list no chapters, so a dead one is only noticed through
+    # its volume-map/metadata calls — which must open the cooldown too
+    source = MetadataOnlySource(httpx.ReadTimeout("timed out"))
+    _use_source(monkeypatch, source)
+    first = await _make_series(db_session, "First", "a")
+    second = await _make_series(db_session, "Second", "b")
+
+    for series in (first, second):
+        await _monitor_pass(db_session, series)
+    assert source.volume_calls + source.metadata_calls == 1
+
+    clock.now += COOLDOWN + 1  # cooled off: probe the source again
+    await _monitor_pass(db_session, second)
+    assert source.volume_calls + source.metadata_calls == 2
+
+
+async def test_volume_resync_still_asks_a_cooling_source(
+    db_session, monkeypatch, clock
+):
+    # the resync endpoints pick and overwrite volume data from what
+    # collect_volume_maps returns: they must not quietly lose a source
+    source = FailingSource(httpx.ConnectError("connection refused"))
+    _use_source(monkeypatch, source)
+    series = await _make_series(db_session, "First", "a")
+
+    await _monitor_pass(db_session, series)  # opens the cooldown
+    calls = source.volume_calls
+    await tasks.collect_volume_maps(series, {})
+    assert source.volume_calls == calls + 1
+
+
+async def test_cooling_source_is_logged_once_not_per_series(
+    db_session, monkeypatch, clock, caplog
+):
+    source = FailingSource(httpx.ConnectError("connection refused"))
+    _use_source(monkeypatch, source)
+    series = [await _make_series(db_session, f"S{i}", str(i)) for i in range(3)]
+
+    caplog.set_level("DEBUG", logger=tasks.log.name)
+    await _monitor_pass(db_session, series[0])  # the failure opens the cooldown
+    first_pass = list(caplog.records)
+
+    caplog.clear()
+    for s in series[1:]:
+        await _monitor_pass(db_session, s)
+    # skipping a cooling source is not a failure of every series that uses it
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == []
+    skipped = [r for r in caplog.records
+               if r.levelname == "DEBUG" and "skipped" in r.getMessage()]
+    # per series: the listing in update and in grab, and the volume map
+    assert len(skipped) == 6
+
+    # the cooldown itself is announced once
+    opened = [r for r in first_pass
+              if r.levelname == "WARNING" and "skipping it for" in r.getMessage()]
+    assert len(opened) == 1

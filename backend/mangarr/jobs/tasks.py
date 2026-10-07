@@ -112,6 +112,10 @@ def _source_cooling_down(name: str) -> bool:
 
 def _note_source_failure(name: str, exc: BaseException) -> None:
     if is_transient_error(exc):
+        if not _source_cooling_down(name):
+            # once per cooldown: the series skipped during it log at debug
+            log.warning("source %s is failing (%s); skipping it for %d min",
+                        name, exc, SOURCE_COOLDOWN_SECONDS // 60)
         _source_retry_at[name] = time.monotonic() + SOURCE_COOLDOWN_SECONDS
 
 
@@ -251,7 +255,9 @@ async def link_sources(
     """Auto-match the series on every enabled direct source it isn't linked to.
 
     `respect_backoff=True` (the scheduled monitor) skips sources that recently
-    yielded no match; user-driven refreshes pass False to always retry."""
+    yielded no match; user-driven refreshes pass False to always retry. A
+    source that just failed transiently is skipped either way (see
+    SOURCE_COOLDOWN_SECONDS)."""
     linked = {sl.source_name for sl in series.source_links}
     titles = _titles_of(series)
     # normalized titles that are empty (e.g. a title written only in CJK) must
@@ -360,6 +366,9 @@ async def update_chapters(
             source_chapters = await _list_chapters_cached(
                 src, link.external_id, chapter_cache, series
             )
+        except SourceCoolingDown as exc:
+            log.debug("chapter list skipped on %s for %r: %s", src.name, series.title, exc)
+            continue
         except Exception as exc:
             log.warning("chapter list failed on %s for %r: %s", src.name, series.title, exc)
             continue
@@ -427,7 +436,9 @@ async def update_chapters(
         or _has_internal_number_gap(existing)
     )
     if needs_volume_map:
-        _, volume_map, map_sources = await fetch_volume_map(series, values)
+        _, volume_map, map_sources = await fetch_volume_map(
+            series, values, skip_cooling_sources=True
+        )
         added += _add_volume_map_gap_chapters(series, existing, volume_map, map_sources)
         # refine (and its decimal reconciliation) adds inferred entries the
         # sources never claimed — those fall back to the "disk-inferred" label
@@ -445,7 +456,7 @@ async def update_chapters(
     # concurrently; results apply in source order for determinism.
     metadata_sources = [
         (src, links[src.name]) for src in enabled_sources
-        if src.name in links
+        if src.name in links and not _source_cooling_down(src.name)
     ]
     results = await asyncio.gather(
         *(src.get_chapter_metadata(link.external_id) for src, link in metadata_sources),
@@ -454,6 +465,7 @@ async def update_chapters(
     for (src, _), rows in zip(metadata_sources, results):
         if isinstance(rows, BaseException):
             log.warning("chapter metadata failed on %s for %r: %s", src.name, series.title, rows)
+            _note_source_failure(src.name, rows)
             continue
         apply_metadata_rows(
             (chapter for chapter in existing.values() if not chapter.excluded),
@@ -523,21 +535,28 @@ def _add_volume_map_gap_chapters(
 
 
 async def collect_volume_maps(
-    series: Series, values: dict[str, str]
+    series: Series, values: dict[str, str], skip_cooling_sources: bool = False,
 ) -> list[tuple[str, dict[float, int]]]:
     """Every linked source's volume data, labeled by source name, in priority
     order. MangaUpdates' per-release volume tags compete too — usually sparse,
-    but listed last so structured source data (MangaDex aggregate) wins ties."""
+    but listed last so structured source data (MangaDex aggregate) wins ties.
+    `skip_cooling_sources` (the chapter refresh) leaves out a source that just
+    failed transiently instead of asking it again."""
     links = {sl.source_name: sl for sl in series.source_links}
     maps: list[tuple[str, dict[float, int]]] = []
     for src in registry.enabled_direct_sources(values):
         link = links.get(src.name)
         if link is None:
             continue
+        if skip_cooling_sources and _source_cooling_down(src.name):
+            log.debug("volume map skipped on %s for %r: source cooling down",
+                      src.name, series.title)
+            continue
         try:
             volume_map = await src.get_volume_map(link.external_id)
         except Exception as exc:
             log.warning("volume map failed on %s for %r: %s", src.name, series.title, exc)
+            _note_source_failure(src.name, exc)
             continue
         if volume_map:
             maps.append((src.name, volume_map))
@@ -552,14 +571,16 @@ async def collect_volume_maps(
 
 
 async def fetch_volume_map(
-    series: Series, values: dict[str, str]
+    series: Series, values: dict[str, str], skip_cooling_sources: bool = False,
 ) -> tuple[str, dict[float, int], dict[float, str]]:
     """Authority-ranked chapter→volume assignments for a series.
 
     Returns (primary source name, mapping, per-chapter source labels) so
     callers can stamp honest provenance; see :mod:`mangarr.volumes`.
     """
-    return select_labeled_volume_map(await collect_volume_maps(series, values))
+    return select_labeled_volume_map(
+        await collect_volume_maps(series, values, skip_cooling_sources)
+    )
 
 
 def _series_folders(series: Series) -> list[Path]:
@@ -1568,6 +1589,9 @@ async def grab_missing_chapters(
             source_chapters = await _list_chapters_cached(
                 src, link.external_id, chapter_cache, series
             )
+        except SourceCoolingDown as exc:
+            log.debug("monitor: %s list skipped for %r: %s", src.name, series.title, exc)
+            continue
         except Exception as exc:
             log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
             continue
