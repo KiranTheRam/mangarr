@@ -103,6 +103,11 @@ class DownloadCancelled(RuntimeError):
     """Raised inside the direct worker when the user removes the queue item."""
 
 
+class LibraryUnavailableError(RuntimeError):
+    """Raised inside the direct worker when the library root has become
+    unavailable since the download started."""
+
+
 async def _raise_if_download_removed(session: AsyncSession, download_id: int) -> None:
     row = (
         await session.execute(
@@ -1064,6 +1069,18 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         await session.commit()
         return
 
+    # the root can also go away while the pages download. It is checked
+    # again with every cancellation check, the last of which runs right
+    # before the archive is written (write_cbz creates missing folders, so it
+    # would recreate the series folder on the bare mount point), and when a
+    # write fails (the library failed then, not the source)
+    expect_content = await root_expects_content(session, series)
+
+    def library_unavailable_now() -> str:
+        from ..library.scanner import root_unavailable
+
+        return root_unavailable(Path(root), expect_content=expect_content)
+
     # page fetches run concurrently and call back into ensure_not_cancelled /
     # on_progress; the shared AsyncSession is not task-safe, so every session
     # use in those callbacks is serialized through this lock
@@ -1086,6 +1103,13 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             )
             if excluded:
                 raise DownloadCancelled("chapter was excluded")
+
+    async def check_still_wanted() -> None:
+        await ensure_not_cancelled(force=True)
+        # last and synchronous: nothing runs between it and the write
+        reason = library_unavailable_now()
+        if reason:
+            raise LibraryUnavailableError(reason)
 
     claimed = await session.execute(
         sa_update(Download)
@@ -1148,7 +1172,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
             progress_cb=on_progress,
-            cancel_cb=lambda: ensure_not_cancelled(force=True),
+            cancel_cb=check_still_wanted,
             web_url="",
         ))
         stall_seconds = DIRECT_STALL_TIMEOUT.total_seconds()
@@ -1211,15 +1235,36 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         log.warning("direct download %d rejected: %s", download_id, duplicate)
         return
     except Exception as exc:
-        log.exception("direct download %d failed", download_id)
+        # a library that went away mid-download is not a source failure: mark
+        # it like the check before the download does, so the monitor grabs
+        # the chapter from this source again once the library is back
+        if isinstance(exc, LibraryUnavailableError):
+            unavailable = str(exc)
+        elif isinstance(exc, OSError):
+            unavailable = library_unavailable_now()
+        else:
+            unavailable = ""
+        if unavailable:
+            log.warning("direct download %d stopped, library unavailable: %s",
+                        download_id, exc)
+        else:
+            log.exception("direct download %d failed", download_id)
         # a progress commit may have been cancelled mid-flight when the page
         # fetches were torn down; reset the session before recording failure
         await session.rollback()
+        if unavailable and dest is not None:
+            partial = dest.with_suffix(".cbz.partial")
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError as os_exc:
+                log.warning("could not remove partial download %s: %s", partial, os_exc)
         dl = await session.get(Download, download_id)
         if dl is None:
             return
         dl.status = DownloadStatus.FAILED
-        dl.error = str(exc)[:500]
+        dl.error = (
+            f"{LIBRARY_UNAVAILABLE}: {unavailable}" if unavailable else str(exc)
+        )[:500]
         session.add(HistoryEvent(
             series_id=series_id, chapter_id=chapter_id, event="failed",
             source_name=source_name, detail=dl.error,
