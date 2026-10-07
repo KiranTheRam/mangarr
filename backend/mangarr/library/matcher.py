@@ -7,6 +7,7 @@ titles are cached per file version; page images are never read or written."""
 
 import zipfile
 import zlib
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -54,22 +55,27 @@ def _name_source(path: Path, is_dir: bool) -> str:
     return path.name if is_dir else path.stem
 
 
-def find_media_files(content_path: Path) -> list[MediaFile]:
+def find_media_files(
+    content_path: Path, files: Iterable[Path] | None = None
+) -> list[MediaFile]:
     """Archives anywhere under content_path, plus directories that directly
-    hold loose images. Non-media files (json sidecars, etc.) are ignored."""
+    hold loose images. Non-media files (json sidecars, etc.) are ignored.
+    Given `files`, only those are considered instead of walking content_path."""
     content_path = Path(content_path)
     media: list[MediaFile] = []
 
-    if content_path.is_file():
-        if content_path.suffix.lower() in ARCHIVE_EXTS:
-            media.append(_media_of(content_path, is_dir=False))
-        return media
+    if files is None:
+        if content_path.is_file():
+            if content_path.suffix.lower() in ARCHIVE_EXTS:
+                media.append(_media_of(content_path, is_dir=False))
+            return media
 
-    if not content_path.is_dir():
-        return media
+        if not content_path.is_dir():
+            return media
+        files = content_path.rglob("*")
 
     image_dirs: set[Path] = set()
-    for p in sorted(content_path.rglob("*")):
+    for p in sorted(files):
         if not p.is_file():
             continue
         suffix = p.suffix.lower()
