@@ -92,6 +92,7 @@ async def test_import_retries_when_qbittorrent_moves_content(tmp_path, monkeypat
 
     try:
         async with maker() as session:
+            (tmp_path / "library").mkdir()  # the API creates a root on add
             root = RootFolder(path=str(tmp_path / "library"))
             series = Series(
                 title="Vinland Saga",
@@ -148,6 +149,7 @@ async def test_torrent_import_maps_english_book_to_actual_chapters(tmp_path, mon
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with maker() as session:
+            (tmp_path / 'library').mkdir()  # the API creates a root on add
             series = Series(title='Vinland Saga', sort_title='vinland saga',
                             root_folder=RootFolder(path=str(tmp_path / 'library')),
                             folder_name='Vinland Saga')
