@@ -14,7 +14,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from ..models import Chapter, Series
-from ..util import NEW_FILE_MODE
+from ..util import NEW_FILE_MODE, natural_key
 from .matcher import (
     IMAGE_EXTS,
     MediaFile,
@@ -22,7 +22,6 @@ from .matcher import (
     find_media_files,
     match_files,
 )
-from ..util import natural_key
 from .naming import chapter_filename, series_folder, volume_filename
 
 log = logging.getLogger(__name__)
