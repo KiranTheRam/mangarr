@@ -139,13 +139,15 @@ async def _list_chapters_cached(
 ) -> list[SourceChapter]:
     """A source's chapter listing, one release per chapter number: `series`
     applies its scanlation-group preferences (the cache keeps every group's
-    copy, so the selection never leaks between series)."""
+    copy, so the selection never leaks between series). A source that is
+    cooling down is skipped even when its listing is cached: a volume-map or
+    metadata failure later in the pass must keep grabs off it too."""
+    if _source_cooling_down(src.name):
+        raise SourceCoolingDown(f"{src.name} failed moments ago; skipped for now")
     key = (src.name, external_id)
     if cache is not None and key in cache:
         chapters = cache[key]
     else:
-        if _source_cooling_down(src.name):
-            raise SourceCoolingDown(f"{src.name} failed moments ago; skipped for now")
         try:
             chapters = await src.list_chapters(external_id)
         except Exception as exc:

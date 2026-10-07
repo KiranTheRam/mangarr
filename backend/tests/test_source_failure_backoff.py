@@ -4,11 +4,12 @@ request back-off — for every series in the monitor pass."""
 
 import httpx
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr.jobs import tasks
-from mangarr.models import Base, Chapter, Series, SeriesSourceLink
-from mangarr.sources.base import DirectSource
+from mangarr.models import Base, Chapter, Download, Series, SeriesSourceLink
+from mangarr.sources.base import DirectSource, SourceChapter
 
 COOLDOWN = 600.0
 
@@ -49,6 +50,31 @@ class MetadataOnlySource(FailingSource):
 
     async def list_chapters(self, external_id):
         self.list_calls += 1
+        return []
+
+
+class ListingSource(FailingSource):
+    """Lists chapter 1 fine; only the call named by `failing` errors."""
+
+    def __init__(self, name, failing=None, error=None):
+        super().__init__(error)
+        self.name = name
+        self.failing = failing
+
+    async def list_chapters(self, external_id):
+        self.list_calls += 1
+        return [SourceChapter(source_name=self.name, external_id=f"{self.name}-1", number=1.0)]
+
+    async def get_volume_map(self, external_id):
+        self.volume_calls += 1
+        if self.failing == "volume":
+            raise self.error
+        return {}
+
+    async def get_chapter_metadata(self, external_id):
+        self.metadata_calls += 1
+        if self.failing == "metadata":
+            raise self.error
         return []
 
 
@@ -283,3 +309,26 @@ async def test_cooling_source_is_logged_once_not_per_series(
     opened = [r for r in first_pass
               if r.levelname == "WARNING" and "skipping it for" in r.getMessage()]
     assert len(opened) == 1
+
+
+@pytest.mark.parametrize("failing", ["volume", "metadata"])
+async def test_source_failing_after_its_listing_is_not_grabbed_from(
+    db_session, monkeypatch, clock, failing
+):
+    # the listing succeeds and is cached for the grab, then the volume-map or
+    # metadata call fails transiently: the grab must skip the cooling source
+    # and take the chapter from the next one, not queue it on the dead one
+    primary = ListingSource("fake", failing, httpx.ConnectError("connection refused"))
+    backup = ListingSource("backup")
+    monkeypatch.setattr(
+        tasks.registry, "enabled_direct_sources", lambda values: [primary, backup]
+    )
+    series = await _make_series(db_session, "First", "a")
+    series.source_links.append(SeriesSourceLink(source_name="backup", external_id="b"))
+    await db_session.commit()
+
+    assert await _monitor_pass(db_session, series) == 1
+
+    grabbed = (await db_session.execute(select(Download.source_name))).scalars().all()
+    assert grabbed == ["backup"]
+    assert primary.list_calls == 1
