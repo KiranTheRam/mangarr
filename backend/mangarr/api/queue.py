@@ -11,6 +11,7 @@ from ..jobs.tasks import (
     REMOVED_BY_USER,
     enqueue_direct,
     enqueue_torrent,
+    failed_grab_blocks,
     magnet_btih_hex,
     submit_torrent,
 )
@@ -38,7 +39,8 @@ FAILED_VISIBLE_FOR = timedelta(hours=48)
 
 @router.get("/queue", response_model=list[QueueItemOut])
 async def get_queue(session: AsyncSession = Depends(get_session)):
-    failed_cutoff = datetime.now(timezone.utc) - FAILED_VISIBLE_FOR
+    now = datetime.now(timezone.utc)
+    failed_cutoff = now - FAILED_VISIBLE_FOR
     result = await session.execute(
         select(Download, Series.title)
         .outerjoin(Series, Download.series_id == Series.id)
@@ -51,6 +53,9 @@ async def get_queue(session: AsyncSession = Depends(get_session)):
                 Download.error != REMOVED_BY_USER,
                 Download.updated_at >= failed_cutoff,
             ),
+            # ...and for as long as it keeps the monitor from retrying that
+            # chapter on that source, however long that is
+            failed_grab_blocks(now),
         ))
         .order_by(Download.id)
     )
@@ -160,6 +165,7 @@ async def retry_failed_download(
 
     dl.progress = 0.0
     dl.error = ""
+    dl.transient_error = False
     session.add(HistoryEvent(
         series_id=dl.series_id,
         chapter_id=dl.chapter_id,

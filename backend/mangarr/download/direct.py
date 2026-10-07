@@ -141,7 +141,10 @@ async def download_chapter_to_cbz(
                 for i, u in enumerate(page_urls):
                     tg.create_task(fetch(i, u))
         except* Exception as group:
-            raise group.exceptions[0] from None
+            # keep the page's own cause (a network blip or not decides how
+            # soon the chapter is retried), but not the group as context
+            first = group.exceptions[0]
+            raise first from first.__cause__
 
     if any(p is None for p in pages):
         raise RuntimeError("some pages failed to download")
