@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import time
 
 import httpx
@@ -6,12 +8,36 @@ from .. import USER_AGENT
 from ..util import RateLimiter, parse_chapter_number, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
 
+log = logging.getLogger(__name__)
+
 API_URL = "https://api.mangadex.org"
 AUTH_URL = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token"
 
 # Global API limit is ~5 req/s; the at-home (image server) endpoint is 40 req/min.
 _api_limiter = RateLimiter(rate=4, per_seconds=1)
 _athome_limiter = RateLimiter(rate=35, per_seconds=60)
+
+# After a failed login the source carries on anonymously (search, feeds and
+# at-home all work without an account) and leaves the auth server alone for
+# this long. 15 minutes is the access-token lifetime MangaDex issues, so a
+# recovered auth server is back in use within one token cycle, while a wrong
+# password costs at most four login attempts an hour instead of one per API
+# call. Saving different credentials clears it (see configure()).
+AUTH_RETRY_COOLDOWN = 15 * 60.0
+
+
+def _auth_failure_summary(exc: Exception) -> str:
+    """A short reason for a failed login, safe to log (never the form data)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            body = exc.response.json()
+        except ValueError:
+            body = None
+        detail = ""
+        if isinstance(body, dict):
+            detail = str(body.get("error_description") or body.get("error") or "")[:200]
+        return f"HTTP {exc.response.status_code}" + (f": {detail}" if detail else "")
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 # volume assignments change rarely; update_chapters() asks for them every
 # monitor cycle, so cache like the other volume-map sources do
@@ -37,6 +63,9 @@ class MangaDexSource(DirectSource):
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._token_expires_at = 0.0
+        self._auth_lock = asyncio.Lock()
+        self._auth_retry_at = 0.0  # time.monotonic() before which no login is tried
+        self._auth_error = ""  # why the last login failed
         self._map_cache: dict[str, tuple[float, dict[float, int]]] = {}
         self.configure(client_id, client_secret, username, password, language)
 
@@ -52,6 +81,10 @@ class MangaDexSource(DirectSource):
             self._access_token = None
             self._refresh_token = None
             self._token_expires_at = 0.0
+            # new credentials get an immediate login, not the cooldown left
+            # behind by the old ones
+            self._auth_retry_at = 0.0
+            self._auth_error = ""
         self._client_id = client_id
         self._client_secret = client_secret
         self._username = username
@@ -62,37 +95,82 @@ class MangaDexSource(DirectSource):
     def has_credentials(self) -> bool:
         return bool(self._client_id and self._client_secret and self._username and self._password)
 
+    def _token_is_fresh(self) -> bool:
+        return bool(self._access_token) and time.time() < self._token_expires_at - 30
+
+    def _auth_cooling_down(self) -> bool:
+        return time.monotonic() < self._auth_retry_at
+
     async def _ensure_token(self) -> None:
+        """Log in when an account is configured and the token is stale.
+
+        A failed login never fails the request: the source drops to anonymous
+        access and waits AUTH_RETRY_COOLDOWN before trying the auth server
+        again."""
         if not self.has_credentials:
             return  # anonymous access still works for search/feed, limited for images
-        if self._access_token and time.time() < self._token_expires_at - 30:
+        if self._token_is_fresh() or self._auth_cooling_down():
             return
+        # one login at a time: concurrent callers wait here, then reuse the
+        # new token (or the failure) instead of each hitting the auth server
+        async with self._auth_lock:
+            if self._token_is_fresh() or self._auth_cooling_down():
+                return
+            creds = self._creds
+            try:
+                token = await self._request_token()
+                access_token = token["access_token"]
+                expires_in = int(token.get("expires_in", 900))
+            except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                if self._creds != creds:
+                    return  # credentials changed mid-login; the next call tries the new ones
+                # an expired bearer would be refused outright, so go anonymous
+                self._access_token = None
+                self._auth_error = _auth_failure_summary(exc)
+                self._auth_retry_at = time.monotonic() + AUTH_RETRY_COOLDOWN
+                log.warning(
+                    "MangaDex login failed (%s); continuing anonymously, "
+                    "next login attempt in %d min",
+                    self._auth_error, AUTH_RETRY_COOLDOWN // 60,
+                )
+                return
+            if self._creds != creds:
+                return  # the token belongs to credentials that were just replaced
+            if self._auth_error:
+                log.info("MangaDex login succeeded; using the account again")
+                self._auth_error = ""
+            self._access_token = access_token
+            self._refresh_token = token.get("refresh_token")
+            self._token_expires_at = time.time() + expires_in
+
+    async def _request_token(self) -> dict:
+        """The refresh grant while a refresh token is held, else (or once it
+        has expired) the password grant. Raises if the login fails."""
         if self._refresh_token:
-            form = {
+            resp = await self._post_auth({
                 "grant_type": "refresh_token",
                 "refresh_token": self._refresh_token,
                 "client_id": self._client_id,
                 "client_secret": self._client_secret,
-            }
-        else:
-            form = {
-                "grant_type": "password",
-                "username": self._username,
-                "password": self._password,
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-            }
-        resp = await self._client.post(AUTH_URL, data=form)
-        if resp.status_code != 200 and form["grant_type"] == "refresh_token":
+            })
+            if resp.status_code == 200:
+                return resp.json()
             # refresh token expired — retry with password grant
             self._refresh_token = None
-            await self._ensure_token()
-            return
+        resp = await self._post_auth({
+            "grant_type": "password",
+            "username": self._username,
+            "password": self._password,
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+        })
         resp.raise_for_status()
-        token = resp.json()
-        self._access_token = token["access_token"]
-        self._refresh_token = token.get("refresh_token")
-        self._token_expires_at = time.time() + int(token.get("expires_in", 900))
+        return resp.json()
+
+    async def _post_auth(self, form: dict) -> httpx.Response:
+        # logins count against the same MangaDex budget as API calls
+        await _api_limiter.acquire()
+        return await self._client.post(AUTH_URL, data=form)
 
     async def _get(self, path: str, params: dict | None = None, athome: bool = False) -> dict:
         await self._ensure_token()
@@ -124,6 +202,10 @@ class MangaDexSource(DirectSource):
         Needs the account credentials — the library is private."""
         if not self.has_credentials:
             raise RuntimeError("MangaDex account credentials are not configured")
+        await self._ensure_token()
+        if not self._access_token:
+            # anonymous requests only get a 401 here, so say why up front
+            raise RuntimeError(f"MangaDex login failed ({self._auth_error or 'no token'})")
         data = await self._get("/manga/status")
         wanted = set(statuses)
         ids = [mid for mid, status in (data.get("statuses") or {}).items() if status in wanted]
