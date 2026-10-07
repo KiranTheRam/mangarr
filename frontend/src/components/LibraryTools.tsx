@@ -11,7 +11,7 @@ import type {
   SourceCandidate,
   SourceLink,
 } from "../api/types";
-import { Modal, Spinner, chapterLabel, formatBytes } from "./common";
+import { ErrorNotice, Modal, Spinner, chapterLabel, formatBytes } from "./common";
 import { FolderBrowser } from "./FolderBrowser";
 
 /** Lists the folders a series spans (primary + extras) with add/remove and a
@@ -157,6 +157,8 @@ export function SourcesModal({
     mutationFn: () => api.post<{ chapters: number; matched_chapters: number }>(
       `/series/${seriesId}/resync`,
     ),
+    // drop an earlier run's success line so a failed re-sync can't look like one
+    onMutate: () => setResyncMsg(""),
     onSuccess: (r) => {
       setResyncMsg(`Rebuilt: ${r.chapters} chapters, ${r.matched_chapters} adopted from disk.`);
       invalidate();
@@ -187,6 +189,7 @@ export function SourcesModal({
           ))}
         </tbody>
       </table>
+      <ErrorNotice error={remove.error} />
 
       <h4 className="files-heading">Add / fix a source</h4>
       <div className="form-row">
@@ -224,6 +227,7 @@ export function SourcesModal({
           </tbody>
         </table>
       )}
+      <ErrorNotice error={setLink.error} />
 
       <div style={{ marginTop: 16, display: "flex", gap: 10, alignItems: "center" }}>
         <button className="btn danger" disabled={resync.isPending} onClick={() => resync.mutate()}>
@@ -231,6 +235,7 @@ export function SourcesModal({
         </button>
         {resyncMsg && <span style={{ fontSize: 13, color: "var(--success)" }}>{resyncMsg}</span>}
       </div>
+      <ErrorNotice error={resync.error} />
     </Modal>
   );
 }
