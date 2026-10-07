@@ -11,9 +11,10 @@ only exists once Kavita has seen the series at least once — so a series added
 by mangarr for the first time falls back to a library scan, which is what
 makes Kavita discover the new folder in the first place.
 
-Scans are debounced: importing thirty chapters in a row must queue one scan,
-not thirty. Delivery is fire-and-forget — an unreachable Kavita must never
-block or fail a download.
+Scans are debounced per series: importing thirty chapters in a row must queue
+one scan, not thirty, and a series whose chapters keep trickling in is
+rescanned at most every few minutes. Delivery is fire-and-forget — an
+unreachable Kavita must never block or fail a download.
 """
 
 from __future__ import annotations
@@ -38,6 +39,12 @@ TIMEOUT = 30.0
 # Chapters of one series import one after another; each would otherwise fire
 # its own scan. Collect a burst and scan once when it goes quiet.
 DEBOUNCE_SECONDS = 15.0
+
+# Direct downloads finish a chapter every half minute or so — further apart
+# than the debounce window — so a long queue would still scan once per chapter.
+# A series is therefore rescanned at most this often; chapters that land in
+# between are picked up by that next scan.
+RESCAN_SECONDS = 300.0
 
 
 class KavitaError(RuntimeError):
@@ -307,12 +314,15 @@ async def resolve_library_id(
 class ScanRequest:
     root_folder_id: int | None
     root_path: str
-    titles: tuple[str, ...]  # series title plus alternates/folder name
+    titles: tuple[str, ...]  # series title and folder name
 
 
-_pending: set[ScanRequest] = set()
+# request -> event-loop time its scan is due
+_pending: dict[ScanRequest, float] = {}
 _flush_task: asyncio.Task | None = None
 _flush_values: dict[str, str] = {}
+# request -> event-loop time of its last scan, for the rescan floor
+_last_scanned: dict[ScanRequest, float] = {}
 
 
 def is_configured(values: dict[str, str]) -> bool:
@@ -364,17 +374,27 @@ async def run_scans(values: dict[str, str], requests: set[ScanRequest]) -> None:
 
 async def _flush() -> None:
     global _flush_task
+    loop = asyncio.get_running_loop()
     try:
-        # imports that land while a scan is in flight are picked up by the next
-        # pass rather than waiting for some later import to restart the timer
-        while True:
-            await asyncio.sleep(DEBOUNCE_SECONDS)
-            requests, values = set(_pending), dict(_flush_values)
-            _pending.clear()
+        # imports that land while a scan is in flight stay pending and are
+        # picked up by a later pass rather than waiting for some later import
+        while _pending:
+            now = loop.time()
+            requests = {request for request, due in _pending.items() if due <= now}
             if not requests:
-                return
+                # a series notified meanwhile is due one window from then, so
+                # never sleep longer than a window or it would be scanned late
+                wait = min(_pending.values()) - now
+                await asyncio.sleep(min(wait, DEBOUNCE_SECONDS))
+                continue
+            for request in requests:
+                del _pending[request]
+                _last_scanned[request] = now
+            for request, scanned in list(_last_scanned.items()):
+                if now - scanned >= RESCAN_SECONDS:
+                    del _last_scanned[request]
             try:
-                await run_scans(values, requests)
+                await run_scans(dict(_flush_values), requests)
             except KavitaError as exc:
                 log.warning("Kavita scan request failed: %s", exc)
             except Exception:  # a broken notify must not kill the import path
@@ -393,11 +413,17 @@ def notify_import(
         return
     if not root_path.strip():
         return
-    _pending.add(ScanRequest(
+    request = ScanRequest(
         root_folder_id=root_folder_id,
         root_path=root_path,
         titles=tuple(t for t in titles if t and t.strip()),
-    ))
+    )
+    # each import pushes its series' scan back until the burst goes quiet,
+    # but never to sooner than RESCAN_SECONDS after that series' last scan
+    due = asyncio.get_running_loop().time() + DEBOUNCE_SECONDS
+    if request in _last_scanned:
+        due = max(due, _last_scanned[request] + RESCAN_SECONDS)
+    _pending[request] = due
     _flush_values = dict(values)
     if _flush_task is None or _flush_task.done():
         _flush_task = asyncio.get_running_loop().create_task(_flush())
