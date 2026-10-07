@@ -51,22 +51,36 @@ asyncio.run(main())
 """
 
 
-def test_app_engine_uses_wal_and_a_long_busy_timeout(tmp_path):
+def _probe(tmp_path, **extra_env):
     env = dict(os.environ)
     env["MANGARR_DATA_DIR"] = str(tmp_path / "data")
+    env.update(extra_env)
     env["PYTHONPATH"] = str(Path(mangarr.__file__).resolve().parents[1])
     result = subprocess.run(
         [sys.executable, "-c", _PROBE], cwd=tmp_path, env=env,
         capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stderr
-    pragmas = json.loads(result.stdout.strip().splitlines()[-1])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_app_engine_uses_wal_and_a_long_busy_timeout(tmp_path):
+    pragmas = _probe(tmp_path)
 
     assert pragmas["journal_mode"] == "wal"
     assert pragmas["file_journal_mode"] == "wal"
     # longer than the sqlite3 driver's own 5s default, which the audit's
     # repro showed is not enough
     assert pragmas["busy_timeout"] > 5000
+
+
+def test_wal_can_be_turned_off_for_network_storage(tmp_path):
+    # first start in WAL, then opt out: the file goes back to a rollback journal
+    assert _probe(tmp_path)["file_journal_mode"] == "wal"
+    pragmas = _probe(tmp_path, MANGARR_SQLITE_WAL="false")
+
+    assert pragmas["journal_mode"] == "delete"
+    assert pragmas["file_journal_mode"] == "delete"
 
 
 class FakeSource(DirectSource):

@@ -22,7 +22,9 @@ def _sqlite_pragmas(dbapi_connection, _connection_record) -> None:
     # also waits out a lock instead of failing.
     cursor = dbapi_connection.cursor()
     cursor.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-    cursor.execute("PRAGMA journal_mode=WAL")
+    # MANGARR_SQLITE_WAL=false is the opt-out for network storage; it also
+    # switches a database that is already in WAL back to the rollback journal.
+    cursor.execute(f"PRAGMA journal_mode={'WAL' if config.sqlite_wal else 'DELETE'}")
     cursor.close()
 
 

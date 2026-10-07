@@ -198,6 +198,15 @@ Environment variables (all optional):
 | ------------------- | ------- | ------------------------------------ |
 | `MANGARR_PORT`      | `6996`  | HTTP port                            |
 | `MANGARR_DATA_DIR`  | `data`  | SQLite DB, API key, cached settings  |
+| `MANGARR_SQLITE_WAL`| `true`  | Use SQLite WAL mode (see below)      |
+
+**Database storage.** Mangarr runs SQLite in WAL mode, so next to
+`mangarr.db` you will also see `mangarr.db-wal` and `mangarr.db-shm`. To back
+up, stop the app and copy all three files, or use `sqlite3 mangarr.db ".backup
+copy.db"`. WAL needs the config directory on local storage (a bind mount or
+Docker volume on a local disk). If `/config` is on NFS or SMB, set
+`MANGARR_SQLITE_WAL=false`; the database is then switched back to the
+rollback journal on the next start.
 
 Everything else (sources, credentials, naming templates, qBittorrent,
 monitor interval) lives in the UI under Settings and is stored in the DB.
