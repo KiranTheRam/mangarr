@@ -61,6 +61,24 @@ def test_merged_volume_gets_the_new_file_mode(tmp_path, monkeypatch, file_mode):
     assert mode(dest) == file_mode
 
 
+def test_library_writes_work_under_a_umask_without_owner_write(tmp_path):
+    pages = _loose_pages(tmp_path)
+    chapters = _chapter_archives(tmp_path)
+    src = tmp_path / "payload.cbz"
+    src.write_bytes(b"archive")
+    previous = os.umask(0o227)  # owner may not write newly created files
+    try:
+        importer._pack_images(pages, tmp_path / "packed.cbz")
+        volume_merge.merge_chapter_archives(chapters, tmp_path / "volume.cbz", "Series", 1)
+        importer.place_file(src, tmp_path / "copied.cbz", "copy")
+    finally:
+        os.umask(previous)
+
+    assert mode(tmp_path / "packed.cbz") == NEW_FILE_MODE
+    assert mode(tmp_path / "volume.cbz") == NEW_FILE_MODE
+    assert (tmp_path / "copied.cbz").read_bytes() == b"archive"
+
+
 def test_copy_mode_still_keeps_the_source_files_mode(tmp_path):
     src = tmp_path / "payload.cbz"
     src.write_bytes(b"archive")

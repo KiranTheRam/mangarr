@@ -48,6 +48,7 @@ def merge_chapter_archives(
     ) as handle:
         temporary = Path(handle.name)
     try:
+        temporary.chmod(0o600)  # writable whatever the umask; final mode below
         pages = 0
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as out:
             for index, (_number, path) in enumerate(ordered, start=1):
