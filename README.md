@@ -77,6 +77,8 @@ docker compose up -d
 The default Compose file runs the published `kirantheram/mangarr:latest`
 Docker Hub image and stores configuration and media under `./data`. Open
 <http://localhost:6996> after it starts.
+The image's healthcheck polls `GET /ping` (no API key needed), so
+`docker ps` shows the container as `healthy` once Mangarr is serving.
 
 First-run checklist, in the mangarr UI:
 
