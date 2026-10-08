@@ -110,6 +110,37 @@ to a qBittorrent instance you already run:
    hardlink them into `/media/manga` without duplicating data while the
    torrent continues seeding.
 
+### Running as a non-root user (PUID / PGID / UMASK)
+
+By default the container runs as root, so the files and folders Mangarr
+creates are owned by root (files `0644`, folders `0755`). To have it create
+them as your own user instead, for example so they stay editable over an SMB
+share, set these on the container:
+
+| Variable | Example | Description                                                |
+| -------- | ------- | ---------------------------------------------------------- |
+| `PUID`   | `99`    | User id to run as                                          |
+| `PGID`   | `100`   | Group id to run as                                         |
+| `UMASK`  | `002`   | umask for new files and folders (`002`: `664` / `775`)     |
+
+Set `PUID` and `PGID` together; `UMASK` also works on its own. On unRAID,
+`PUID=99` and `PGID=100` (`nobody:users`) are the usual choice, and
+`UMASK=002` keeps new files group-writable. Leave them unset and nothing
+changes.
+
+On start, Mangarr makes its data directory (`/config`) owned by `PUID:PGID`
+automatically. It never changes your library or download folders, so when
+switching an existing install from root, give the new user those once, e.g.
+on the host:
+
+```bash
+chown -R 99:100 /mnt/user/media/manga /mnt/user/media/torrents
+```
+
+Use your own root folder(s) and qBittorrent's downloads folder. Run
+qBittorrent with the same `PUID`/`PGID` too, so Mangarr can still hardlink
+the files it downloads.
+
 ### Triggering Kavita scans
 
 Kavita only picks up new CBZ files when it scans. To have imports show up in
