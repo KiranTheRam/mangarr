@@ -9,4 +9,9 @@ services:
       # Mount the same media path in your existing qBittorrent container so
       # Mangarr can import completed downloads and hardlink them into the library.
       - ./data/media:/media
+    # Optional: create files as your own user instead of root (see README).
+    # environment:
+    #   - PUID=1000
+    #   - PGID=1000
+    #   - UMASK=002
     restart: unless-stopped
