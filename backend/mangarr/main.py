@@ -65,6 +65,14 @@ async def initialize():
     return {"apiKey": get_api_key(), "version": __version__, "urlBase": ""}
 
 
+@app.get("/ping")
+async def ping():
+    """Liveness probe for the Docker HEALTHCHECK and uptime monitors, like
+    the *arr apps' /ping. Public on purpose (it sits outside /api/v1, so no
+    X-Api-Key) and deliberately cheap: no database, no sources, no secrets."""
+    return {"status": "OK"}
+
+
 # Serve the built frontend if present (production/Docker)
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 if STATIC_DIR.is_dir():
