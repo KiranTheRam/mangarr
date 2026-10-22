@@ -146,6 +146,8 @@ async def download_chapter_to_cbz(
     if any(p is None for p in pages):
         raise RuntimeError("some pages failed to download")
 
+    # the last cancel_cb call before the archive is written; nothing below
+    # awaits, so whatever it checked still holds when write_cbz runs
     await check_cancelled()
 
     complete_pages: list[bytes] = pages  # type: ignore[assignment]

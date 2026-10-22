@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,6 +70,21 @@ BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 # chapter on that source)
 REMOVED_BY_USER = "removed by user"
 
+# error prefix marking a direct download that never reached its source
+# because the library root was unavailable (unmounted, or empty while
+# files are expected) — not a source failure either, so once the library
+# is back the monitor grabs that chapter from that source again
+LIBRARY_UNAVAILABLE = "library unavailable"
+
+# error prefixes of direct downloads the worker failed without asking the
+# source: it was disabled, or the series has no root folder to write to
+SOURCE_DISABLED = "source is disabled"
+NO_ROOT_FOLDER = "series has no root folder configured"
+
+# none of these are the source's fault, so the monitor's failed-grab block
+# leaves them out
+NOT_SOURCE_FAILURES = (LIBRARY_UNAVAILABLE, SOURCE_DISABLED, NO_ROOT_FOLDER)
+
 # upgrades share the single direct queue with new chapters; a series that
 # just had upgrades enabled must not flood it in one pass
 UPGRADES_PER_PASS = 25
@@ -121,6 +137,11 @@ def _note_source_failure(name: str, exc: BaseException) -> None:
 
 class DownloadCancelled(RuntimeError):
     """Raised inside the direct worker when the user removes the queue item."""
+
+
+class LibraryUnavailableError(RuntimeError):
+    """Raised inside the direct worker when the library root has become
+    unavailable since the download started."""
 
 
 async def _raise_if_download_removed(session: AsyncSession, download_id: int) -> None:
@@ -831,13 +852,16 @@ async def scan_all_series() -> None:
 def _notify_kavita(values: dict[str, str], series: Series) -> None:
     """Ask Kavita to scan the library this series' files live in.
 
-    Kavita names a series from what its parser reads on disk, which is usually
-    the folder name — but a scanned-in folder can also carry a localized or
-    alternate title, so every name mangarr knows is offered as a candidate.
+    Kavita names a series from the ComicInfo <Series> mangarr writes (the
+    series title) or else from the folder name, so only those two are offered.
+    Alternate titles are not: a series Kavita has not seen yet matches nothing
+    under its own name, and an alternate such as "Berserk" (for "Berserk of
+    Gluttony") would then pick an unrelated series and scan it instead of the
+    library that holds the new folder.
     """
     if series.root_folder is None:
         return
-    titles = [series.title, series.folder_name, *split_alt_titles(series.alt_titles)]
+    titles = [series.title, series.folder_name]
     kavita.notify_import(values, series.root_folder_id, series.root_folder.path, titles)
 
 
@@ -1102,7 +1126,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         return
     if values.get(f"source_{source_name}_enabled") != "true":
         dl.status = DownloadStatus.FAILED
-        dl.error = "source is disabled; enable it before retrying"
+        dl.error = f"{SOURCE_DISABLED}; enable it before retrying"
         await session.commit()
         return
     series_id = series.id
@@ -1111,16 +1135,28 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     root = series.root_folder.path if series.root_folder else None
     if not root:
         dl.status = DownloadStatus.FAILED
-        dl.error = "series has no root folder configured"
+        dl.error = NO_ROOT_FOLDER
         await session.commit()
         return
     unavailable = await library_root_unavailable(session, series)
     if unavailable:
         # writing now would recreate the series folder on the bare mount point
         dl.status = DownloadStatus.FAILED
-        dl.error = unavailable[:500]
+        dl.error = f"{LIBRARY_UNAVAILABLE}: {unavailable}"[:500]
         await session.commit()
         return
+
+    # the root can also go away while the pages download. It is checked
+    # again with every cancellation check, the last of which runs right
+    # before the archive is written (write_cbz creates missing folders, so it
+    # would recreate the series folder on the bare mount point), and when a
+    # write fails (the library failed then, not the source)
+    expect_content = await root_expects_content(session, series)
+
+    def library_unavailable_now() -> str:
+        from ..library.scanner import root_unavailable
+
+        return root_unavailable(Path(root), expect_content=expect_content)
 
     # page fetches run concurrently and call back into ensure_not_cancelled /
     # on_progress; the shared AsyncSession is not task-safe, so every session
@@ -1144,6 +1180,13 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             )
             if excluded:
                 raise DownloadCancelled("chapter was excluded")
+
+    async def check_still_wanted() -> None:
+        await ensure_not_cancelled(force=True)
+        # last and synchronous: nothing runs between it and the write
+        reason = library_unavailable_now()
+        if reason:
+            raise LibraryUnavailableError(reason)
 
     claimed = await session.execute(
         sa_update(Download)
@@ -1206,7 +1249,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
             progress_cb=on_progress,
-            cancel_cb=lambda: ensure_not_cancelled(force=True),
+            cancel_cb=check_still_wanted,
             web_url="",
         ))
         stall_seconds = DIRECT_STALL_TIMEOUT.total_seconds()
@@ -1269,15 +1312,36 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         log.warning("direct download %d rejected: %s", download_id, duplicate)
         return
     except Exception as exc:
-        log.exception("direct download %d failed", download_id)
+        # a library that went away mid-download is not a source failure: mark
+        # it like the check before the download does, so the monitor grabs
+        # the chapter from this source again once the library is back
+        if isinstance(exc, LibraryUnavailableError):
+            unavailable = str(exc)
+        elif isinstance(exc, OSError):
+            unavailable = library_unavailable_now()
+        else:
+            unavailable = ""
+        if unavailable:
+            log.warning("direct download %d stopped, library unavailable: %s",
+                        download_id, exc)
+        else:
+            log.exception("direct download %d failed", download_id)
         # a progress commit may have been cancelled mid-flight when the page
         # fetches were torn down; reset the session before recording failure
         await session.rollback()
+        if unavailable and dest is not None:
+            partial = dest.with_suffix(".cbz.partial")
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError as os_exc:
+                log.warning("could not remove partial download %s: %s", partial, os_exc)
         dl = await session.get(Download, download_id)
         if dl is None:
             return
         dl.status = DownloadStatus.FAILED
-        dl.error = str(exc)[:500]
+        dl.error = (
+            f"{LIBRARY_UNAVAILABLE}: {unavailable}" if unavailable else str(exc)
+        )[:500]
         session.add(HistoryEvent(
             series_id=series_id, chapter_id=chapter_id, event="failed",
             source_name=source_name, detail=dl.error,
@@ -1341,6 +1405,35 @@ _torrent_missing_counts: dict[int, int] = {}
 IMPORT_PATH_MISSING_LIMIT = 40  # ~5 min at 8s intervals
 _import_path_missing_counts: dict[int, int] = {}
 
+# the torrent downloads sync_qbittorrent tracks; any other status was settled
+# elsewhere (the user removed it from the queue, or a pass finished it)
+SYNCED_TORRENT_STATUSES = (
+    DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+)
+
+
+async def _update_if_still_synced(session: AsyncSession, dl: Download, **values) -> bool:
+    """Write `values` to a torrent download and commit, but only while it is
+    still in SYNCED_TORRENT_STATUSES. Returns whether the row was updated.
+
+    The sync loads its downloads once and then awaits qBittorrent for each
+    one, so the user may remove a download from the queue (in the API's own
+    session) after it was loaded. Writing the status through `dl` would flush
+    its stale value over that removal; this checks and writes in one UPDATE,
+    so a removal that committed first stands."""
+    result = await session.execute(
+        sa_update(Download)
+        .where(Download.id == dl.id, Download.status.in_(SYNCED_TORRENT_STATUSES))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    if result.rowcount != 1:
+        return False
+    # later writes through `dl` are diffed against what it holds
+    await session.refresh(dl, ["status", "error"])
+    return True
+
 
 async def sync_qbittorrent() -> None:
     async with session_scope() as session:
@@ -1350,8 +1443,7 @@ async def sync_qbittorrent() -> None:
         result = await session.execute(
             select(Download).where(
                 Download.kind == DownloadKind.TORRENT,
-                Download.status.in_([DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING,
-                                     DownloadStatus.IMPORTING]),
+                Download.status.in_(SYNCED_TORRENT_STATUSES),
             )
         )
         downloads = result.scalars().all()
@@ -1371,11 +1463,12 @@ async def sync_qbittorrent() -> None:
                     _torrent_missing_counts[dl.id] = misses
                     if misses >= TORRENT_MISSING_LIMIT:
                         _torrent_missing_counts.pop(dl.id, None)
-                        dl.status = DownloadStatus.FAILED
-                        dl.error = "torrent not found in qBittorrent (removed externally?)"
-                        log.warning("torrent download %d (%r) vanished from qBittorrent; "
-                                    "marking failed", dl.id, dl.title)
-                        await session.commit()
+                        if await _update_if_still_synced(
+                            session, dl, status=DownloadStatus.FAILED,
+                            error="torrent not found in qBittorrent (removed externally?)",
+                        ):
+                            log.warning("torrent download %d (%r) vanished from qBittorrent; "
+                                        "marking failed", dl.id, dl.title)
                     continue
                 _torrent_missing_counts.pop(dl.id, None)
                 dl.progress = torrent.progress
@@ -1387,8 +1480,12 @@ async def sync_qbittorrent() -> None:
                     files = [Path(torrent.save_path) / name
                              for name in await client.torrent_files(torrent.hash)
                              ] if torrent.save_path else None
-                    dl.status = DownloadStatus.IMPORTING
-                    await session.commit()
+                    if not await _update_if_still_synced(
+                        session, dl, status=DownloadStatus.IMPORTING,
+                    ):
+                        log.info("torrent download %d left the queue during sync; "
+                                 "not importing it", dl.id)
+                        continue
                     await _import_torrent(session, dl, Path(torrent.content_path), values,
                                           files=files)
                 else:
@@ -1429,14 +1526,44 @@ async def _import_torrent(
             dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
+    # copy mode, a cross-device hardlink fallback and image packing rewrite
+    # every byte (and the duplicate preflight reads every archive); for a
+    # multi-GB payload that would freeze the API, the queue and this sync, so
+    # it runs off the loop. ORM objects aren't thread-safe: the importer gets
+    # plain snapshots, and the chapters it matched are mapped back to this
+    # session's objects for the updates below.
+    candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
     try:
-        imported = import_torrent_payload(
-            content_path, series,
-            [chapter for chapter in series.chapters if not chapter.excluded],
-            Path(series.root_folder.path),
-            values["naming_template"], values["naming_template_no_volume"],
-            import_mode=values.get("import_mode", "hardlink"), files=files,
-        )
+        try:
+            placed = await asyncio.to_thread(
+                import_torrent_payload,
+                content_path,
+                SimpleNamespace(title=series.title, folder_name=series.folder_name),
+                [
+                    SimpleNamespace(id=chapter.id, number=chapter.number,
+                                    volume=chapter.volume, title=chapter.title,
+                                    downloaded=chapter.downloaded, file_path=chapter.file_path)
+                    for chapter in candidates.values()
+                ],
+                Path(series.root_folder.path),
+                values["naming_template"], values["naming_template_no_volume"],
+                import_mode=values.get("import_mode", "hardlink"), files=files,
+            )
+        except Exception:
+            # the queue stays usable while the worker runs, so the user may
+            # have removed this download meanwhile (which also deletes the
+            # payload, failing the import): their removal stands
+            await _raise_if_download_removed(session, dl.id)
+            raise
+        await _raise_if_download_removed(session, dl.id)
+    except DownloadCancelled as cancelled:
+        # `dl` still holds the pre-import status; writing anything here would
+        # undo the removal. Files the import already placed stay in the
+        # library unrecorded, as after any import that stops partway; a
+        # rescan or a later grab of the chapter picks them up.
+        _import_path_missing_counts.pop(dl.id, None)
+        log.info("torrent import %d discarded: %s", dl.id, cancelled)
+        return
     except FileNotFoundError as exc:
         # qBittorrent may finish downloading and then atomically move the
         # payload from its temporary directory to the category directory.
@@ -1464,6 +1591,10 @@ async def _import_torrent(
         await session.commit()
         return
     _import_path_missing_counts.pop(dl.id, None)
+    imported = [
+        (dest, candidates[match.id] if match is not None else None, volume)
+        for dest, match, volume in placed
+    ]
     for dest, chapter, volume in imported:
         if chapter is not None:
             # a destination that already was this chapter's file keeps its
@@ -1478,7 +1609,9 @@ async def _import_torrent(
                 covered = ch.number in content if content is not None else ch.volume == volume
                 if not ch.excluded and covered and not ch.downloaded:
                     ch.downloaded = True
+                    # set after file_path: assigning it resets provenance
                     ch.file_path = str(dest)
+                    ch.file_source = "nyaa"
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
     dl.error = ""
@@ -1507,6 +1640,11 @@ async def grab_missing_chapters(
     source links and chapter list have been created. `only_monitored=False`
     (explicit user-requested search) also grabs unmonitored missing chapters.
     """
+    if series.root_folder is None:
+        # e.g. its root folder was deleted: the worker could only fail every
+        # chapter queued for it
+        log.warning("Not grabbing for %r: it has no root folder", series.title)
+        return 0
     # with the library unmounted every chapter would look missing, and new
     # files would land on the bare mount point
     reason = await library_root_unavailable(session, series)
@@ -1561,7 +1699,8 @@ async def grab_missing_chapters(
 
     # a chapter that recently failed on a source shouldn't be retried there —
     # fall through to the next source instead. Old failures expire (sources
-    # fix broken chapters), and user cancellations don't count as failures.
+    # fix broken chapters), and neither user cancellations nor downloads
+    # stopped before the source was asked (NOT_SOURCE_FAILURES) count.
     retry_cutoff = datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER
     result = await session.execute(
         select(Download.chapter_id, Download.source_name).where(
@@ -1569,6 +1708,7 @@ async def grab_missing_chapters(
             Download.status == DownloadStatus.FAILED,
             Download.chapter_id.isnot(None),
             Download.error != REMOVED_BY_USER,
+            *(~Download.error.startswith(prefix) for prefix in NOT_SOURCE_FAILURES),
             Download.updated_at >= retry_cutoff,
         )
     )
