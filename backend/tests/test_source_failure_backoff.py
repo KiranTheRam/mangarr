@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr.jobs import tasks
-from mangarr.models import Base, Chapter, Download, Series, SeriesSourceLink
+from mangarr.models import Base, Chapter, Download, RootFolder, Series, SeriesSourceLink
 from mangarr.sources.base import DirectSource, SourceChapter
 
 COOLDOWN = 600.0
@@ -87,7 +87,7 @@ class Clock:
 
 
 @pytest.fixture
-async def db_session(monkeypatch):
+async def db_session(monkeypatch, tmp_path):
     from mangarr import settings_service
     monkeypatch.setitem(settings_service.DEFAULTS, "source_fake_enabled", "true")
     engine = create_async_engine("sqlite+aiosqlite://")
@@ -95,6 +95,9 @@ async def db_session(monkeypatch):
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
+        # the monitor only grabs for a series with a root folder
+        (tmp_path / "library").mkdir()
+        session.info["library"] = RootFolder(path=str(tmp_path / "library"))
         yield session
     await engine.dispose()
 
@@ -114,7 +117,8 @@ def _use_source(monkeypatch, source):
 
 
 async def _make_series(session, title, external_id=None):
-    series = Series(title=title, sort_title=title.lower())
+    series = Series(title=title, sort_title=title.lower(),
+                    root_folder=session.info["library"])
     if external_id is not None:
         series.source_links.append(SeriesSourceLink(source_name="fake", external_id=external_id))
     series.chapters.append(Chapter(number=1.0, monitored=True))
