@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import kavita, notifications
@@ -92,6 +92,14 @@ UPGRADES_PER_PASS = 25
 # a failed grab blocks that (chapter, source) pair, but not forever — sources
 # fix broken chapters, so retry after a while (one request per window is cheap)
 FAILED_GRAB_RETRY_AFTER = timedelta(days=7)
+
+# ...unless the failure was transient (the source was down, timing out or
+# rate-limiting us, or the download stalled): the chapter itself is probably
+# fine, so it sits out the next hourly pass (other sources still serve it)
+# and is retried on the one after. A chapter that keeps failing that way is
+# broken on that source after all and gets the long block.
+TRANSIENT_GRAB_RETRY_AFTER = timedelta(hours=2)
+TRANSIENT_GRAB_ATTEMPTS = 3
 
 # metadata (status, chapter/volume totals) goes stale without this; refreshed
 # lazily during monitor passes rather than all at once
@@ -1265,7 +1273,8 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
                     await download_task
                 except BaseException:
                     pass  # the stall, not the cancellation, is the error
-                raise RuntimeError(
+                # a TimeoutError: a hung source is a transient failure
+                raise TimeoutError(
                     f"stalled: no page finished for {stall_seconds / 60:g} minutes; "
                     "download cancelled so the queue can continue"
                 )
@@ -1338,10 +1347,29 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         dl = await session.get(Download, download_id)
         if dl is None:
             return
+        transient = is_transient_error(exc)
+        if transient:
+            # the TRANSIENT_GRAB_ATTEMPTS-th such failure of this chapter on
+            # this source within FAILED_GRAB_RETRY_AFTER gets the long block
+            earlier = await session.scalar(
+                select(func.count()).select_from(Download).where(
+                    Download.id != download_id,
+                    Download.chapter_id == chapter_id,
+                    Download.source_name == source_name,
+                    Download.status == DownloadStatus.FAILED,
+                    Download.error != REMOVED_BY_USER,
+                    Download.transient_error == True,  # noqa: E712
+                    Download.updated_at
+                    >= datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER,
+                )
+            )
+            transient = earlier + 1 < TRANSIENT_GRAB_ATTEMPTS
         dl.status = DownloadStatus.FAILED
         dl.error = (
             f"{LIBRARY_UNAVAILABLE}: {unavailable}" if unavailable else str(exc)
         )[:500]
+        # a library failure never blocks the source (NOT_SOURCE_FAILURES)
+        dl.transient_error = transient and not unavailable
         session.add(HistoryEvent(
             series_id=series_id, chapter_id=chapter_id, event="failed",
             source_name=source_name, detail=dl.error,
@@ -1626,6 +1654,24 @@ async def _import_torrent(
 
 # ------------------------------------------------------------ monitor loop
 
+def failed_grab_blocks(now: datetime):
+    """Filter for FAILED downloads that still keep the monitor from retrying
+    their chapter on their source. The queue keeps these visible too, so a
+    block never outlasts its entry in Activity."""
+    return and_(
+        Download.status == DownloadStatus.FAILED,
+        Download.chapter_id.isnot(None),
+        Download.error != REMOVED_BY_USER,
+        # stopped before the source was asked: not the source's failure
+        *(~Download.error.startswith(prefix) for prefix in NOT_SOURCE_FAILURES),
+        Download.updated_at >= now - FAILED_GRAB_RETRY_AFTER,
+        or_(
+            Download.transient_error == False,  # noqa: E712
+            Download.updated_at >= now - TRANSIENT_GRAB_RETRY_AFTER,
+        ),
+    )
+
+
 async def grab_missing_chapters(
     session: AsyncSession, series: Series, values: dict[str, str],
     only_monitored: bool = True,
@@ -1699,17 +1745,13 @@ async def grab_missing_chapters(
 
     # a chapter that recently failed on a source shouldn't be retried there —
     # fall through to the next source instead. Old failures expire (sources
-    # fix broken chapters), and neither user cancellations nor downloads
-    # stopped before the source was asked (NOT_SOURCE_FAILURES) count.
-    retry_cutoff = datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER
+    # fix broken chapters; transient failures expire within hours), and
+    # neither user cancellations nor downloads stopped before the source was
+    # asked (NOT_SOURCE_FAILURES) count.
     result = await session.execute(
         select(Download.chapter_id, Download.source_name).where(
             Download.series_id == series.id,
-            Download.status == DownloadStatus.FAILED,
-            Download.chapter_id.isnot(None),
-            Download.error != REMOVED_BY_USER,
-            *(~Download.error.startswith(prefix) for prefix in NOT_SOURCE_FAILURES),
-            Download.updated_at >= retry_cutoff,
+            failed_grab_blocks(datetime.now(timezone.utc)),
         )
     )
     failed_pairs = {(cid, name) for cid, name in result.all()}

@@ -231,6 +231,9 @@ class Download(Base):
     torrent_hash: Mapped[str] = mapped_column(String, default="")
     progress: Mapped[float] = mapped_column(Float, default=0.0)  # 0..1
     error: Mapped[str] = mapped_column(Text, default="")
+    # a failure a later attempt can be expected to clear (network, timeout,
+    # 429/5xx, stall): the monitor retries it after hours instead of days
+    transient_error: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
