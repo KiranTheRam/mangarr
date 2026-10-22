@@ -53,6 +53,9 @@ def _atomic_destination(dest: Path, keep_mode: bool = False):
     with NamedTemporaryFile(dir=dest.parent, prefix=".mangarr-", suffix=".partial", delete=False) as handle:
         temporary = Path(handle.name)
     try:
+        # mkstemp's 0600 is masked by the umask too; a umask without owner
+        # write (0227) would leave the file unwritable before anything lands
+        temporary.chmod(0o600)
         yield temporary
         if not keep_mode:
             temporary.chmod(NEW_FILE_MODE)
