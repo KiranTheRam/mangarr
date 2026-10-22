@@ -1414,7 +1414,9 @@ async def _import_torrent(
                 covered = ch.number in content if content is not None else ch.volume == volume
                 if not ch.excluded and covered and not ch.downloaded:
                     ch.downloaded = True
+                    # set after file_path: assigning it resets provenance
                     ch.file_path = str(dest)
+                    ch.file_source = "nyaa"
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
     dl.error = ""
