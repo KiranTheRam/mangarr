@@ -17,6 +17,11 @@ RUN pip install --no-cache-dir .
 
 COPY --from=frontend /build/static ./static
 
+# Optional PUID/PGID/UMASK handling (see README). With none of them set the
+# CMD runs as root, as before.
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/mangarr-entrypoint
+ENTRYPOINT ["/usr/local/bin/mangarr-entrypoint"]
+
 ENV MANGARR_DATA_DIR=/config \
     MANGARR_HOST=0.0.0.0 \
     MANGARR_PORT=6996
