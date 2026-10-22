@@ -112,6 +112,22 @@ async def test_no_subfolder_imports_only_own_files(env, category):
     assert sorted(p.name for p in library.iterdir()) == ["Kagurabachi - Ch. 0003.cbz"]
 
 
+async def test_neighbours_numbering_does_not_fail_the_import(env, tmp_path):
+    session, series, dl, library = env
+    # another torrent's chapter 1 sits beside ours in the shared folder; the
+    # duplicate pre-check must only see this torrent's files, or it reads the
+    # two as one torrent mapping several files to chapter 1
+    shared = tmp_path / "downloads" / "mangarr"
+    make_cbz(shared / "Kagurabachi Ch. 001.cbz")
+    make_cbz(shared / "Berserk Ch. 001.cbz")
+    downloaded = await sync(session, series, dl, content_path=shared, save_path=shared,
+                            files=[("Kagurabachi Ch. 001.cbz", 1)])
+
+    assert dl.status == DownloadStatus.DONE, dl.error
+    assert downloaded == {1.0}
+    assert sorted(p.name for p in library.iterdir()) == ["Kagurabachi - Ch. 0001.cbz"]
+
+
 async def test_no_subfolder_loose_pages_are_not_packed_with_neighbours(env, category):
     session, series, dl, library = env
     pages = category / "Kagurabachi c003"
