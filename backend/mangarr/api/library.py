@@ -491,8 +491,14 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     In-flight torrents survive: they're series-level (no chapter reference),
     qBittorrent keeps transferring them regardless, and their import matches
     files against whatever chapter list exists at completion time — deleting
-    their records would just orphan the transfer."""
-    from sqlalchemy import delete as sa_delete, or_
+    their records would just orphan the transfer.
+
+    Refused (409) while a chapter download is in flight or a torrent is
+    importing: the direct worker doesn't hold the series lock, so deleting its
+    row and chapter mid-download would leave it committing against rows that
+    no longer exist, and an import maps files onto the very chapter list
+    being rebuilt."""
+    from sqlalchemy import delete as sa_delete, func, or_
 
     from ..jobs.tasks import acquire_series_lock, update_chapters
     from ..models import Download, DownloadStatus, HistoryEvent
@@ -503,6 +509,20 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
         series = await _load(session, series_id)
         # the rebuild relies on a rescan to restore downloaded state
         await _require_root_available(session, series)
+        busy = await session.scalar(
+            select(func.count(Download.id)).where(
+                Download.series_id == series_id,
+                Download.status.in_(active),
+                or_(Download.chapter_id.isnot(None),
+                    Download.status == DownloadStatus.IMPORTING),
+            )
+        )
+        if busy:
+            raise HTTPException(
+                409,
+                f"{busy} download(s) for this series are still in progress; wait for "
+                "them to finish or remove them from the queue, then re-sync",
+            )
         preserved_metadata = {
             ch.number: (
                 ch.title, ch.volume, ch.title_source, ch.volume_source,
