@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import Integer, case, cast, func, select
+from sqlalchemy import Integer, case, cast, func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +22,7 @@ from ..automation import RESOLVED_MODES, apply_monitor_mode, order_sources
 from ..db import get_session
 from ..jobs.tasks import (
     REFRESHING,
+    REMOVED_BY_USER,
     _notify_kavita,
     acquire_series_lock,
     merge_complete_volumes,
@@ -29,7 +30,7 @@ from ..jobs.tasks import (
     try_acquire_series_lock,
 )
 from ..library.move import MoveError, anchor_extra_folders, move_series_folder
-from ..models import Chapter, Download, DownloadStatus, RootFolder, Series
+from ..models import Chapter, Download, DownloadKind, DownloadStatus, RootFolder, Series
 from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
     AddSeriesIn,
@@ -313,10 +314,30 @@ async def refresh_series_bulk(
     return SeriesBulkOut(count=len(series_ids))
 
 
+async def _cancel_direct_downloads(session: AsyncSession, series_ids: list[int]) -> None:
+    """Stop a deleted series' direct downloads the way the queue's remove
+    does (REMOVED_BY_USER), so the worker doesn't finish a chapter into a
+    series that no longer exists. Torrents are left alone: whether removing
+    a series should also remove its torrents and their data is a separate
+    decision."""
+    await session.execute(
+        sa_update(Download)
+        .where(
+            Download.series_id.in_(series_ids),
+            Download.kind == DownloadKind.DIRECT,
+            Download.status.in_([
+                DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+            ]),
+        )
+        .values(status=DownloadStatus.FAILED, error=REMOVED_BY_USER)
+    )
+
+
 @router.post("/editor/delete", response_model=SeriesBulkOut)
 async def delete_series_bulk(body: SeriesBulkIn, session: AsyncSession = Depends(get_session)):
     """Remove many series from the library. Files on disk are kept."""
     series_list = await _series_in_order(session, body.series_ids)
+    await _cancel_direct_downloads(session, [series.id for series in series_list])
     for series in series_list:
         await session.delete(series)
     await session.commit()
@@ -395,6 +416,7 @@ async def delete_series(series_id: int, session: AsyncSession = Depends(get_sess
     series = await session.get(Series, series_id)
     if series is None:
         raise HTTPException(404, "Series not found")
+    await _cancel_direct_downloads(session, [series.id])
     await session.delete(series)
     await session.commit()
 

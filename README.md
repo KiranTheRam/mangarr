@@ -65,6 +65,11 @@ design; it is the automation half of your manga stack.
   chapters appear in the reader immediately. Scans the affected series when
   Kavita already knows it, and the whole library when it does not (a series
   mangarr just created).
+- **Webhooks** — optionally POST a small JSON event to a URL of your choice
+  whenever chapters are imported, so a request manager (e.g. NextPanel) sees
+  them right away. Set it up under **Settings → Connect — Webhook**; an
+  optional secret is sent as `X-Webhook-Secret`, and a dead endpoint never
+  fails a download.
 - ***arr-style API** — everything under `/api/v1` with `X-Api-Key` auth.
 
 ## Quick start (Docker)
@@ -77,6 +82,8 @@ docker compose up -d
 The default Compose file runs the published `kirantheram/mangarr:latest`
 Docker Hub image and stores configuration and media under `./data`. Open
 <http://localhost:6996> after it starts.
+The image's healthcheck polls `GET /ping` (no API key needed), so
+`docker ps` shows the container as `healthy` once Mangarr is serving.
 
 First-run checklist, in the mangarr UI:
 
@@ -109,6 +116,37 @@ to a qBittorrent instance you already run:
    Mangarr see the same path, Mangarr can import completed downloads and
    hardlink them into `/media/manga` without duplicating data while the
    torrent continues seeding.
+
+### Running as a non-root user (PUID / PGID / UMASK)
+
+By default the container runs as root, so the files and folders Mangarr
+creates are owned by root (files `0644`, folders `0755`). To have it create
+them as your own user instead, for example so they stay editable over an SMB
+share, set these on the container:
+
+| Variable | Example | Description                                                |
+| -------- | ------- | ---------------------------------------------------------- |
+| `PUID`   | `99`    | User id to run as                                          |
+| `PGID`   | `100`   | Group id to run as                                         |
+| `UMASK`  | `002`   | umask for new files and folders (`002`: `664` / `775`)     |
+
+Set `PUID` and `PGID` together; `UMASK` also works on its own. On unRAID,
+`PUID=99` and `PGID=100` (`nobody:users`) are the usual choice, and
+`UMASK=002` keeps new files group-writable. Leave them unset and nothing
+changes.
+
+On start, Mangarr makes its data directory (`/config`) owned by `PUID:PGID`
+automatically. It never changes your library or download folders, so when
+switching an existing install from root, give the new user those once, e.g.
+on the host:
+
+```bash
+chown -R 99:100 /mnt/user/media/manga /mnt/user/media/torrents
+```
+
+Use your own root folder(s) and qBittorrent's downloads folder. Run
+qBittorrent with the same `PUID`/`PGID` too, so Mangarr can still hardlink
+the files it downloads.
 
 ### Triggering Kavita scans
 
@@ -173,7 +211,7 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/uvicorn mangarr.main:app --port 6996 --reload
 ```
 
-Frontend (Node ≥20):
+Frontend (Node 20.19+ or 22.12+, as required by Vite 8):
 
 ```bash
 cd frontend
@@ -194,11 +232,18 @@ FastAPI app serves when present.
 
 Environment variables (all optional):
 
-| Variable            | Default | Description                          |
-| ------------------- | ------- | ------------------------------------ |
-| `MANGARR_PORT`      | `6996`  | HTTP port                            |
-| `MANGARR_DATA_DIR`  | `data`  | SQLite DB, API key, cached settings  |
-| `MANGARR_SQLITE_WAL`| `true`  | Use SQLite WAL mode (see below)      |
+| Variable             | Default       | Description                                       |
+| -------------------- | ------------- | ------------------------------------------------- |
+| `MANGARR_HOST`       | `0.0.0.0`     | Address to listen on                              |
+| `MANGARR_PORT`       | `6996`        | HTTP port                                         |
+| `MANGARR_DATA_DIR`   | `data`        | SQLite DB, API key, cached settings               |
+| `MANGARR_SQLITE_WAL` | `true`        | Use SQLite WAL mode (see below)                   |
+| `MANGARR_LOG_LEVEL`  | `INFO`        | Log level (uppercase: `DEBUG`, `INFO`, `WARNING`) |
+| `MANGARR_API_KEY`    | *(generated)* | Fixed web UI API key instead of a generated one   |
+
+`MANGARR_HOST` and `MANGARR_PORT` apply when Mangarr is started with
+`python -m mangarr.main`; a `uvicorn` command line like the one under Local
+development uses its own `--host`/`--port` flags instead.
 
 **Database storage.** Mangarr runs SQLite in WAL mode, so next to
 `mangarr.db` you will also see `mangarr.db-wal` and `mangarr.db-shm`. To back
@@ -211,7 +256,8 @@ rollback journal on the next start.
 Everything else (sources, credentials, naming templates, qBittorrent,
 monitor interval) lives in the UI under Settings and is stored in the DB.
 
-The web UI's API key is generated on first start at `<data dir>/api_key` and
+The web UI's API key is generated on first start at `<data dir>/api_key` (or
+taken from `MANGARR_API_KEY` when set, in which case no file is written) and
 handed to the UI via `GET /initialize.json`. To give external clients (e.g.
 NextPanel or scripts) their own keys, create named keys under **Settings → API
 Keys**; any of them authenticates `/api/v1` calls via `X-Api-Key` and can be
@@ -222,7 +268,7 @@ revoked independently.
 1. When you add a series, mangarr links it to each enabled source by title
    (including MangaUpdates associated titles). Links are per-source, so a
    site changing its layout breaks one source, never the app.
-2. The monitor job (default: every 15 min) diffs source chapter lists against
+2. The monitor job (default: every 60 min) diffs source chapter lists against
    the library. New monitored, missing chapters are grabbed from the highest
    priority source that has them (`Settings → Sources → priority`).
 3. Direct grabs download pages with per-source rate limits and pack them into
@@ -239,4 +285,5 @@ legitimate.
 
 - Western comics support (ComicVine metadata + GetComics source) — the
   source/metadata plugin interfaces are already in place.
-- Notifications (Discord/webhooks) on grab/import.
+- Discord notifications, and notifications on grab (a webhook on import
+  already exists — see Features).

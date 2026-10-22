@@ -10,8 +10,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import kavita, notifications
@@ -57,7 +58,7 @@ from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
 from ..titles import plausible_title_match, split_alt_titles, title_queries
 from ..torrent_selection import select_best_torrent
-from ..util import normalize_title
+from ..util import is_transient_error, normalize_title
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,21 @@ BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 # chapter on that source)
 REMOVED_BY_USER = "removed by user"
 
+# error prefix marking a direct download that never reached its source
+# because the library root was unavailable (unmounted, or empty while
+# files are expected) — not a source failure either, so once the library
+# is back the monitor grabs that chapter from that source again
+LIBRARY_UNAVAILABLE = "library unavailable"
+
+# error prefixes of direct downloads the worker failed without asking the
+# source: it was disabled, or the series has no root folder to write to
+SOURCE_DISABLED = "source is disabled"
+NO_ROOT_FOLDER = "series has no root folder configured"
+
+# none of these are the source's fault, so the monitor's failed-grab block
+# leaves them out
+NOT_SOURCE_FAILURES = (LIBRARY_UNAVAILABLE, SOURCE_DISABLED, NO_ROOT_FOLDER)
+
 # upgrades share the single direct queue with new chapters; a series that
 # just had upgrades enabled must not flood it in one pass
 UPGRADES_PER_PASS = 25
@@ -76,6 +92,14 @@ UPGRADES_PER_PASS = 25
 # a failed grab blocks that (chapter, source) pair, but not forever — sources
 # fix broken chapters, so retry after a while (one request per window is cheap)
 FAILED_GRAB_RETRY_AFTER = timedelta(days=7)
+
+# ...unless the failure was transient (the source was down, timing out or
+# rate-limiting us, or the download stalled): the chapter itself is probably
+# fine, so it sits out the next hourly pass (other sources still serve it)
+# and is retried on the one after. A chapter that keeps failing that way is
+# broken on that source after all and gets the long block.
+TRANSIENT_GRAB_RETRY_AFTER = timedelta(hours=2)
+TRANSIENT_GRAB_ATTEMPTS = 3
 
 # metadata (status, chapter/volume totals) goes stale without this; refreshed
 # lazily during monitor passes rather than all at once
@@ -92,9 +116,40 @@ DIRECT_STALL_TIMEOUT = timedelta(minutes=15)
 # it between update_chapters() and grab_missing_chapters()
 ChapterListCache = dict[tuple[str, str], list[SourceChapter]]
 
+# a source that just failed with a transient error (down, timing out,
+# rate-limiting us) is left alone for a few minutes instead of being asked
+# again for every series in the pass: each attempt can sit through
+# rl_request's whole back-off, so a few hundred series on one dead source
+# could make a pass outlast the monitor interval. In-memory, by source name;
+# the first call after the cooldown probes the source again.
+SOURCE_COOLDOWN_SECONDS = 10 * 60.0
+_source_retry_at: dict[str, float] = {}
+
+
+class SourceCoolingDown(RuntimeError):
+    """Raised instead of calling a source that just failed transiently."""
+
+
+def _source_cooling_down(name: str) -> bool:
+    return time.monotonic() < _source_retry_at.get(name, 0.0)
+
+
+def _note_source_failure(name: str, exc: BaseException) -> None:
+    if is_transient_error(exc):
+        if not _source_cooling_down(name):
+            # once per cooldown: the series skipped during it log at debug
+            log.warning("source %s is failing (%s); skipping it for %d min",
+                        name, exc, SOURCE_COOLDOWN_SECONDS // 60)
+        _source_retry_at[name] = time.monotonic() + SOURCE_COOLDOWN_SECONDS
+
 
 class DownloadCancelled(RuntimeError):
     """Raised inside the direct worker when the user removes the queue item."""
+
+
+class LibraryUnavailableError(RuntimeError):
+    """Raised inside the direct worker when the library root has become
+    unavailable since the download started."""
 
 
 async def _raise_if_download_removed(session: AsyncSession, download_id: int) -> None:
@@ -117,12 +172,20 @@ async def _list_chapters_cached(
 ) -> list[SourceChapter]:
     """A source's chapter listing, one release per chapter number: `series`
     applies its scanlation-group preferences (the cache keeps every group's
-    copy, so the selection never leaks between series)."""
+    copy, so the selection never leaks between series). A source that is
+    cooling down is skipped even when its listing is cached: a volume-map or
+    metadata failure later in the pass must keep grabs off it too."""
+    if _source_cooling_down(src.name):
+        raise SourceCoolingDown(f"{src.name} failed moments ago; skipped for now")
     key = (src.name, external_id)
     if cache is not None and key in cache:
         chapters = cache[key]
     else:
-        chapters = await src.list_chapters(external_id)
+        try:
+            chapters = await src.list_chapters(external_id)
+        except Exception as exc:
+            _note_source_failure(src.name, exc)
+            raise
         if cache is not None:
             cache[key] = chapters
     return select_for_series(chapters, series)
@@ -227,7 +290,9 @@ async def link_sources(
     """Auto-match the series on every enabled direct source it isn't linked to.
 
     `respect_backoff=True` (the scheduled monitor) skips sources that recently
-    yielded no match; user-driven refreshes pass False to always retry."""
+    yielded no match; user-driven refreshes pass False to always retry. A
+    source that just failed transiently is skipped either way (see
+    SOURCE_COOLDOWN_SECONDS)."""
     linked = {sl.source_name for sl in series.source_links}
     titles = _titles_of(series)
     # normalized titles that are empty (e.g. a title written only in CJK) must
@@ -240,8 +305,11 @@ async def link_sources(
         backoff_key = (series.id, src.name)
         if respect_backoff and time.monotonic() < _link_retry_at.get(backoff_key, 0.0):
             continue
+        if _source_cooling_down(src.name):
+            continue
         match = None
         searched = False
+        failure: Exception | None = None
         # try each known title variant until the source yields a match
         for query in titles[:4]:
             nq = normalize_title(query)
@@ -251,6 +319,8 @@ async def link_sources(
                 candidates = await src.search_series(query)
             except Exception as exc:
                 log.warning("source %s search failed for %r: %s", src.name, query, exc)
+                _note_source_failure(src.name, exc)
+                failure = exc
                 break
             searched = True
             for cand in candidates:
@@ -267,7 +337,15 @@ async def link_sources(
                     match = top
             if match:
                 break
-        if match is None and searched:
+        if failure is not None:
+            # a failed search is not "no match": try again once a source that
+            # was merely down has cooled off, but give a broken search the
+            # no-match window
+            _link_retry_at[backoff_key] = time.monotonic() + (
+                SOURCE_COOLDOWN_SECONDS if is_transient_error(failure)
+                else LINK_RETRY_AFTER_SECONDS
+            )
+        elif match is None and searched:
             _link_retry_at[backoff_key] = time.monotonic() + LINK_RETRY_AFTER_SECONDS
         if match:
             _link_retry_at.pop(backoff_key, None)
@@ -323,6 +401,9 @@ async def update_chapters(
             source_chapters = await _list_chapters_cached(
                 src, link.external_id, chapter_cache, series
             )
+        except SourceCoolingDown as exc:
+            log.debug("chapter list skipped on %s for %r: %s", src.name, series.title, exc)
+            continue
         except Exception as exc:
             log.warning("chapter list failed on %s for %r: %s", src.name, series.title, exc)
             continue
@@ -390,7 +471,9 @@ async def update_chapters(
         or _has_internal_number_gap(existing)
     )
     if needs_volume_map:
-        _, volume_map, map_sources = await fetch_volume_map(series, values)
+        _, volume_map, map_sources = await fetch_volume_map(
+            series, values, skip_cooling_sources=True
+        )
         added += _add_volume_map_gap_chapters(series, existing, volume_map, map_sources)
         # refine (and its decimal reconciliation) adds inferred entries the
         # sources never claimed — those fall back to the "disk-inferred" label
@@ -408,7 +491,7 @@ async def update_chapters(
     # concurrently; results apply in source order for determinism.
     metadata_sources = [
         (src, links[src.name]) for src in enabled_sources
-        if src.name in links
+        if src.name in links and not _source_cooling_down(src.name)
     ]
     results = await asyncio.gather(
         *(src.get_chapter_metadata(link.external_id) for src, link in metadata_sources),
@@ -417,6 +500,7 @@ async def update_chapters(
     for (src, _), rows in zip(metadata_sources, results):
         if isinstance(rows, BaseException):
             log.warning("chapter metadata failed on %s for %r: %s", src.name, series.title, rows)
+            _note_source_failure(src.name, rows)
             continue
         apply_metadata_rows(
             (chapter for chapter in existing.values() if not chapter.excluded),
@@ -486,21 +570,28 @@ def _add_volume_map_gap_chapters(
 
 
 async def collect_volume_maps(
-    series: Series, values: dict[str, str]
+    series: Series, values: dict[str, str], skip_cooling_sources: bool = False,
 ) -> list[tuple[str, dict[float, int]]]:
     """Every linked source's volume data, labeled by source name, in priority
     order. MangaUpdates' per-release volume tags compete too — usually sparse,
-    but listed last so structured source data (MangaDex aggregate) wins ties."""
+    but listed last so structured source data (MangaDex aggregate) wins ties.
+    `skip_cooling_sources` (the chapter refresh) leaves out a source that just
+    failed transiently instead of asking it again."""
     links = {sl.source_name: sl for sl in series.source_links}
     maps: list[tuple[str, dict[float, int]]] = []
     for src in registry.enabled_direct_sources(values):
         link = links.get(src.name)
         if link is None:
             continue
+        if skip_cooling_sources and _source_cooling_down(src.name):
+            log.debug("volume map skipped on %s for %r: source cooling down",
+                      src.name, series.title)
+            continue
         try:
             volume_map = await src.get_volume_map(link.external_id)
         except Exception as exc:
             log.warning("volume map failed on %s for %r: %s", src.name, series.title, exc)
+            _note_source_failure(src.name, exc)
             continue
         if volume_map:
             maps.append((src.name, volume_map))
@@ -515,14 +606,16 @@ async def collect_volume_maps(
 
 
 async def fetch_volume_map(
-    series: Series, values: dict[str, str]
+    series: Series, values: dict[str, str], skip_cooling_sources: bool = False,
 ) -> tuple[str, dict[float, int], dict[float, str]]:
     """Authority-ranked chapter→volume assignments for a series.
 
     Returns (primary source name, mapping, per-chapter source labels) so
     callers can stamp honest provenance; see :mod:`mangarr.volumes`.
     """
-    return select_labeled_volume_map(await collect_volume_maps(series, values))
+    return select_labeled_volume_map(
+        await collect_volume_maps(series, values, skip_cooling_sources)
+    )
 
 
 def _series_folders(series: Series) -> list[Path]:
@@ -771,13 +864,16 @@ async def scan_all_series() -> None:
 def _notify_kavita(values: dict[str, str], series: Series) -> None:
     """Ask Kavita to scan the library this series' files live in.
 
-    Kavita names a series from what its parser reads on disk, which is usually
-    the folder name — but a scanned-in folder can also carry a localized or
-    alternate title, so every name mangarr knows is offered as a candidate.
+    Kavita names a series from the ComicInfo <Series> mangarr writes (the
+    series title) or else from the folder name, so only those two are offered.
+    Alternate titles are not: a series Kavita has not seen yet matches nothing
+    under its own name, and an alternate such as "Berserk" (for "Berserk of
+    Gluttony") would then pick an unrelated series and scan it instead of the
+    library that holds the new folder.
     """
     if series.root_folder is None:
         return
-    titles = [series.title, series.folder_name, *split_alt_titles(series.alt_titles)]
+    titles = [series.title, series.folder_name]
     kavita.notify_import(values, series.root_folder_id, series.root_folder.path, titles)
 
 
@@ -1042,7 +1138,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         return
     if values.get(f"source_{source_name}_enabled") != "true":
         dl.status = DownloadStatus.FAILED
-        dl.error = "source is disabled; enable it before retrying"
+        dl.error = f"{SOURCE_DISABLED}; enable it before retrying"
         await session.commit()
         return
     series_id = series.id
@@ -1051,16 +1147,28 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     root = series.root_folder.path if series.root_folder else None
     if not root:
         dl.status = DownloadStatus.FAILED
-        dl.error = "series has no root folder configured"
+        dl.error = NO_ROOT_FOLDER
         await session.commit()
         return
     unavailable = await library_root_unavailable(session, series)
     if unavailable:
         # writing now would recreate the series folder on the bare mount point
         dl.status = DownloadStatus.FAILED
-        dl.error = unavailable[:500]
+        dl.error = f"{LIBRARY_UNAVAILABLE}: {unavailable}"[:500]
         await session.commit()
         return
+
+    # the root can also go away while the pages download. It is checked
+    # again with every cancellation check, the last of which runs right
+    # before the archive is written (write_cbz creates missing folders, so it
+    # would recreate the series folder on the bare mount point), and when a
+    # write fails (the library failed then, not the source)
+    expect_content = await root_expects_content(session, series)
+
+    def library_unavailable_now() -> str:
+        from ..library.scanner import root_unavailable
+
+        return root_unavailable(Path(root), expect_content=expect_content)
 
     # page fetches run concurrently and call back into ensure_not_cancelled /
     # on_progress; the shared AsyncSession is not task-safe, so every session
@@ -1084,6 +1192,13 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             )
             if excluded:
                 raise DownloadCancelled("chapter was excluded")
+
+    async def check_still_wanted() -> None:
+        await ensure_not_cancelled(force=True)
+        # last and synchronous: nothing runs between it and the write
+        reason = library_unavailable_now()
+        if reason:
+            raise LibraryUnavailableError(reason)
 
     claimed = await session.execute(
         sa_update(Download)
@@ -1146,7 +1261,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, dest,
             progress_cb=on_progress,
-            cancel_cb=lambda: ensure_not_cancelled(force=True),
+            cancel_cb=check_still_wanted,
             web_url="",
         ))
         stall_seconds = DIRECT_STALL_TIMEOUT.total_seconds()
@@ -1162,7 +1277,8 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
                     await download_task
                 except BaseException:
                     pass  # the stall, not the cancellation, is the error
-                raise RuntimeError(
+                # a TimeoutError: a hung source is a transient failure
+                raise TimeoutError(
                     f"stalled: no page finished for {stall_seconds / 60:g} minutes; "
                     "download cancelled so the queue can continue"
                 )
@@ -1209,15 +1325,55 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         log.warning("direct download %d rejected: %s", download_id, duplicate)
         return
     except Exception as exc:
-        log.exception("direct download %d failed", download_id)
+        # a library that went away mid-download is not a source failure: mark
+        # it like the check before the download does, so the monitor grabs
+        # the chapter from this source again once the library is back
+        if isinstance(exc, LibraryUnavailableError):
+            unavailable = str(exc)
+        elif isinstance(exc, OSError):
+            unavailable = library_unavailable_now()
+        else:
+            unavailable = ""
+        if unavailable:
+            log.warning("direct download %d stopped, library unavailable: %s",
+                        download_id, exc)
+        else:
+            log.exception("direct download %d failed", download_id)
         # a progress commit may have been cancelled mid-flight when the page
         # fetches were torn down; reset the session before recording failure
         await session.rollback()
+        if unavailable and dest is not None:
+            partial = dest.with_suffix(".cbz.partial")
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError as os_exc:
+                log.warning("could not remove partial download %s: %s", partial, os_exc)
         dl = await session.get(Download, download_id)
         if dl is None:
             return
+        transient = is_transient_error(exc)
+        if transient:
+            # the TRANSIENT_GRAB_ATTEMPTS-th such failure of this chapter on
+            # this source within FAILED_GRAB_RETRY_AFTER gets the long block
+            earlier = await session.scalar(
+                select(func.count()).select_from(Download).where(
+                    Download.id != download_id,
+                    Download.chapter_id == chapter_id,
+                    Download.source_name == source_name,
+                    Download.status == DownloadStatus.FAILED,
+                    Download.error != REMOVED_BY_USER,
+                    Download.transient_error == True,  # noqa: E712
+                    Download.updated_at
+                    >= datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER,
+                )
+            )
+            transient = earlier + 1 < TRANSIENT_GRAB_ATTEMPTS
         dl.status = DownloadStatus.FAILED
-        dl.error = str(exc)[:500]
+        dl.error = (
+            f"{LIBRARY_UNAVAILABLE}: {unavailable}" if unavailable else str(exc)
+        )[:500]
+        # a library failure never blocks the source (NOT_SOURCE_FAILURES)
+        dl.transient_error = transient and not unavailable
         session.add(HistoryEvent(
             series_id=series_id, chapter_id=chapter_id, event="failed",
             source_name=source_name, detail=dl.error,
@@ -1281,6 +1437,35 @@ _torrent_missing_counts: dict[int, int] = {}
 IMPORT_PATH_MISSING_LIMIT = 40  # ~5 min at 8s intervals
 _import_path_missing_counts: dict[int, int] = {}
 
+# the torrent downloads sync_qbittorrent tracks; any other status was settled
+# elsewhere (the user removed it from the queue, or a pass finished it)
+SYNCED_TORRENT_STATUSES = (
+    DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+)
+
+
+async def _update_if_still_synced(session: AsyncSession, dl: Download, **values) -> bool:
+    """Write `values` to a torrent download and commit, but only while it is
+    still in SYNCED_TORRENT_STATUSES. Returns whether the row was updated.
+
+    The sync loads its downloads once and then awaits qBittorrent for each
+    one, so the user may remove a download from the queue (in the API's own
+    session) after it was loaded. Writing the status through `dl` would flush
+    its stale value over that removal; this checks and writes in one UPDATE,
+    so a removal that committed first stands."""
+    result = await session.execute(
+        sa_update(Download)
+        .where(Download.id == dl.id, Download.status.in_(SYNCED_TORRENT_STATUSES))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    if result.rowcount != 1:
+        return False
+    # later writes through `dl` are diffed against what it holds
+    await session.refresh(dl, ["status", "error"])
+    return True
+
 
 async def sync_qbittorrent() -> None:
     async with session_scope() as session:
@@ -1290,8 +1475,7 @@ async def sync_qbittorrent() -> None:
         result = await session.execute(
             select(Download).where(
                 Download.kind == DownloadKind.TORRENT,
-                Download.status.in_([DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING,
-                                     DownloadStatus.IMPORTING]),
+                Download.status.in_(SYNCED_TORRENT_STATUSES),
             )
         )
         downloads = result.scalars().all()
@@ -1311,11 +1495,12 @@ async def sync_qbittorrent() -> None:
                     _torrent_missing_counts[dl.id] = misses
                     if misses >= TORRENT_MISSING_LIMIT:
                         _torrent_missing_counts.pop(dl.id, None)
-                        dl.status = DownloadStatus.FAILED
-                        dl.error = "torrent not found in qBittorrent (removed externally?)"
-                        log.warning("torrent download %d (%r) vanished from qBittorrent; "
-                                    "marking failed", dl.id, dl.title)
-                        await session.commit()
+                        if await _update_if_still_synced(
+                            session, dl, status=DownloadStatus.FAILED,
+                            error="torrent not found in qBittorrent (removed externally?)",
+                        ):
+                            log.warning("torrent download %d (%r) vanished from qBittorrent; "
+                                        "marking failed", dl.id, dl.title)
                     continue
                 _torrent_missing_counts.pop(dl.id, None)
                 dl.progress = torrent.progress
@@ -1340,8 +1525,12 @@ async def sync_qbittorrent() -> None:
                         await session.commit()
                         continue
                     try:
-                        dl.status = DownloadStatus.IMPORTING
-                        await session.commit()
+                        if not await _update_if_still_synced(
+                            session, dl, status=DownloadStatus.IMPORTING,
+                        ):
+                            log.info("torrent download %d left the queue during sync; "
+                                     "not importing it", dl.id)
+                            continue
                         await _import_torrent(session, dl, Path(torrent.content_path),
                                               values, files=files)
                     finally:
@@ -1385,14 +1574,44 @@ async def _import_torrent(
             dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
+    # copy mode, a cross-device hardlink fallback and image packing rewrite
+    # every byte (and the duplicate preflight reads every archive); for a
+    # multi-GB payload that would freeze the API, the queue and this sync, so
+    # it runs off the loop. ORM objects aren't thread-safe: the importer gets
+    # plain snapshots, and the chapters it matched are mapped back to this
+    # session's objects for the updates below.
+    candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
     try:
-        imported = import_torrent_payload(
-            content_path, series,
-            [chapter for chapter in series.chapters if not chapter.excluded],
-            Path(series.root_folder.path),
-            values["naming_template"], values["naming_template_no_volume"],
-            import_mode=values.get("import_mode", "hardlink"), files=files,
-        )
+        try:
+            placed = await asyncio.to_thread(
+                import_torrent_payload,
+                content_path,
+                SimpleNamespace(title=series.title, folder_name=series.folder_name),
+                [
+                    SimpleNamespace(id=chapter.id, number=chapter.number,
+                                    volume=chapter.volume, title=chapter.title,
+                                    downloaded=chapter.downloaded, file_path=chapter.file_path)
+                    for chapter in candidates.values()
+                ],
+                Path(series.root_folder.path),
+                values["naming_template"], values["naming_template_no_volume"],
+                import_mode=values.get("import_mode", "hardlink"), files=files,
+            )
+        except Exception:
+            # the queue stays usable while the worker runs, so the user may
+            # have removed this download meanwhile (which also deletes the
+            # payload, failing the import): their removal stands
+            await _raise_if_download_removed(session, dl.id)
+            raise
+        await _raise_if_download_removed(session, dl.id)
+    except DownloadCancelled as cancelled:
+        # `dl` still holds the pre-import status; writing anything here would
+        # undo the removal. Files the import already placed stay in the
+        # library unrecorded, as after any import that stops partway; a
+        # rescan or a later grab of the chapter picks them up.
+        _import_path_missing_counts.pop(dl.id, None)
+        log.info("torrent import %d discarded: %s", dl.id, cancelled)
+        return
     except FileNotFoundError as exc:
         # qBittorrent may finish downloading and then atomically move the
         # payload from its temporary directory to the category directory.
@@ -1420,6 +1639,10 @@ async def _import_torrent(
         await session.commit()
         return
     _import_path_missing_counts.pop(dl.id, None)
+    imported = [
+        (dest, candidates[match.id] if match is not None else None, volume)
+        for dest, match, volume in placed
+    ]
     for dest, chapter, volume in imported:
         if chapter is not None:
             # a destination that already was this chapter's file keeps its
@@ -1434,7 +1657,9 @@ async def _import_torrent(
                 covered = ch.number in content if content is not None else ch.volume == volume
                 if not ch.excluded and covered and not ch.downloaded:
                     ch.downloaded = True
+                    # set after file_path: assigning it resets provenance
                     ch.file_path = str(dest)
+                    ch.file_source = "nyaa"
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
     dl.error = ""
@@ -1448,6 +1673,24 @@ async def _import_torrent(
 
 
 # ------------------------------------------------------------ monitor loop
+
+def failed_grab_blocks(now: datetime):
+    """Filter for FAILED downloads that still keep the monitor from retrying
+    their chapter on their source. The queue keeps these visible too, so a
+    block never outlasts its entry in Activity."""
+    return and_(
+        Download.status == DownloadStatus.FAILED,
+        Download.chapter_id.isnot(None),
+        Download.error != REMOVED_BY_USER,
+        # stopped before the source was asked: not the source's failure
+        *(~Download.error.startswith(prefix) for prefix in NOT_SOURCE_FAILURES),
+        Download.updated_at >= now - FAILED_GRAB_RETRY_AFTER,
+        or_(
+            Download.transient_error == False,  # noqa: E712
+            Download.updated_at >= now - TRANSIENT_GRAB_RETRY_AFTER,
+        ),
+    )
+
 
 async def grab_missing_chapters(
     session: AsyncSession, series: Series, values: dict[str, str],
@@ -1463,6 +1706,11 @@ async def grab_missing_chapters(
     source links and chapter list have been created. `only_monitored=False`
     (explicit user-requested search) also grabs unmonitored missing chapters.
     """
+    if series.root_folder is None:
+        # e.g. its root folder was deleted: the worker could only fail every
+        # chapter queued for it
+        log.warning("Not grabbing for %r: it has no root folder", series.title)
+        return 0
     # with the library unmounted every chapter would look missing, and new
     # files would land on the bare mount point
     reason = await library_root_unavailable(session, series)
@@ -1517,15 +1765,13 @@ async def grab_missing_chapters(
 
     # a chapter that recently failed on a source shouldn't be retried there —
     # fall through to the next source instead. Old failures expire (sources
-    # fix broken chapters), and user cancellations don't count as failures.
-    retry_cutoff = datetime.now(timezone.utc) - FAILED_GRAB_RETRY_AFTER
+    # fix broken chapters; transient failures expire within hours), and
+    # neither user cancellations nor downloads stopped before the source was
+    # asked (NOT_SOURCE_FAILURES) count.
     result = await session.execute(
         select(Download.chapter_id, Download.source_name).where(
             Download.series_id == series.id,
-            Download.status == DownloadStatus.FAILED,
-            Download.chapter_id.isnot(None),
-            Download.error != REMOVED_BY_USER,
-            Download.updated_at >= retry_cutoff,
+            failed_grab_blocks(datetime.now(timezone.utc)),
         )
     )
     failed_pairs = {(cid, name) for cid, name in result.all()}
@@ -1547,6 +1793,9 @@ async def grab_missing_chapters(
             source_chapters = await _list_chapters_cached(
                 src, link.external_id, chapter_cache, series
             )
+        except SourceCoolingDown as exc:
+            log.debug("monitor: %s list skipped for %r: %s", src.name, series.title, exc)
+            continue
         except Exception as exc:
             log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
             continue

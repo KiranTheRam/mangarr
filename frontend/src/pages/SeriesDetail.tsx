@@ -14,6 +14,7 @@ import type {
 } from "../api/types";
 import {
   chapterLabel,
+  ErrorNotice,
   formatBytes,
   Modal,
   Spinner,
@@ -295,6 +296,7 @@ function VolumeResyncModal({
   onPick,
   onApply,
   applying,
+  error,
   onClose,
 }: {
   preview: VolumeResyncPreview;
@@ -302,6 +304,7 @@ function VolumeResyncModal({
   onPick: (source: string) => void;
   onApply: () => void;
   applying: boolean;
+  error: unknown;
   onClose: () => void;
 }) {
   const selected =
@@ -461,6 +464,7 @@ function VolumeResyncModal({
         </>
       )}
 
+      <ErrorNotice error={error} />
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
         <button className="btn" onClick={onClose}>
           Keep current volumes
@@ -661,6 +665,9 @@ export default function SeriesDetail() {
       await api.post(`/series/${seriesId}/refresh?wait=true`);
       return api.get<VolumeResyncPreview>(`/series/${seriesId}/volumes/resync-preview`);
     },
+    // the preview can fail (409 while the library root is unavailable) after
+    // the refresh itself went through, so reload the series either way
+    onError: invalidate,
     onSuccess: (preview) => {
       invalidate();
       // always offer the source options when any exist, so a resync can be
@@ -676,6 +683,7 @@ export default function SeriesDetail() {
 
   const scan = useMutation({
     mutationFn: () => api.post<ScanResult>(`/series/${seriesId}/scan`),
+    onMutate: () => setScanResult(null),
     onSuccess: (res) => {
       setScanResult(res);
       invalidate();
@@ -686,6 +694,7 @@ export default function SeriesDetail() {
   const applyResync = useMutation({
     mutationFn: (source: string) =>
       api.post<VolumeResyncResult>(`/series/${seriesId}/volumes/resync`, { source }),
+    onMutate: () => setVolumeResult(null),
     onSuccess: (res) => {
       setVolumeResult(res);
       setResyncPreview(null);
@@ -824,8 +833,17 @@ export default function SeriesDetail() {
     series?.refreshing
       ? "Setting up — fetching metadata, linking sources, and syncing chapters…" :
     workNotice;
+  // one notice per action, so an older failure can't hide a newer one
+  const actionErrors = [
+    refresh.error,
+    scan.error,
+    toggleMonitor.error,
+    toggleChapter.error,
+    deleteSeries.error,
+  ];
   const hasTopBanners =
-    Boolean(busyNotice || scanResult || volumeResult) || activeDownloads.length > 0;
+    Boolean(busyNotice || scanResult || volumeResult || actionErrors.some(Boolean)) ||
+    activeDownloads.length > 0;
 
   const chapterRows = (chapters: Chapter[]) => (
     <table className="data-table card-table chapter-table">
@@ -1067,6 +1085,9 @@ export default function SeriesDetail() {
             <span>{busyNotice}</span>
           </div>
         )}
+        {actionErrors.map((err, i) => (
+          <ErrorNotice key={i} error={err} />
+        ))}
         {activeDownloads.length > 0 && (
           <div className="activity-banner">
             <span className="mini-spinner" />
@@ -1345,7 +1366,11 @@ export default function SeriesDetail() {
           onPick={setResyncSource}
           onApply={() => applyResync.mutate(resyncSource)}
           applying={applyResync.isPending}
-          onClose={() => setResyncPreview(null)}
+          error={applyResync.error}
+          onClose={() => {
+            applyResync.reset();
+            setResyncPreview(null);
+          }}
         />
       )}
       {showRename && (

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -177,12 +178,75 @@ async def rl_get_limited_bytes(
     raise RuntimeError(f"GET {url} exhausted retries")
 
 
+# statuses that mean the server is busy or broken right now, not that the
+# request is wrong (with any 5xx)
+_TRANSIENT_STATUS = {408, 429}
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True when a failure means the source is down, overloaded or unreachable
+    right now — network errors, timeouts, 408/429/5xx — so a later attempt
+    can be expected to work. False for everything else (no pages, a parse
+    error, a 404): trying again soon would fail the same way. A wrapped error (``raise ... from exc``) is judged by
+    its cause, so "page 3 failed: ConnectTimeout" is transient."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (httpx.TransportError, TimeoutError, ConnectionError)):
+            return True
+        if isinstance(current, httpx.HTTPStatusError):
+            status = current.response.status_code
+            return status in _TRANSIENT_STATUS or status >= 500
+        current = current.__cause__
+    return False
+
+
 ILLEGAL_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# CON, NUL, COM1… can't be created on Windows or an SMB share, even with an
+# extension after them
+WINDOWS_RESERVED_NAME = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?= ?\.|$)", re.I)
+
+# ext4, xfs, btrfs and ZFS allow 255 bytes per path component (NTFS/SMB 255
+# UTF-16 units, which the UTF-8 byte count never undercounts). A title gets
+# 200 of them because names are built around it: a volume template's
+# " - Vol. 03 Ch. 0012.5" (21 bytes) plus ".cbz.partial" (12) while the
+# archive is written still leaves 22 bytes for a custom template.
+NAME_MAX_BYTES = 255
+TITLE_MAX_BYTES = 200
 
 
-def sanitize_filename(name: str) -> str:
-    cleaned = ILLEGAL_PATH_CHARS.sub("", name).strip().rstrip(".")
-    return re.sub(r"\s+", " ", cleaned) or "Unknown"
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    """text cut to at most max_bytes of UTF-8, on a character boundary."""
+    return text.encode()[:max(max_bytes, 0)].decode(errors="ignore")
+
+
+def shorten_utf8(text: str, max_bytes: int) -> str:
+    """text, or if it is longer than max_bytes, its start (cut on a character
+    boundary) plus "~" and 8 digits of a digest of the whole text. Two long
+    titles that start alike ("…Part 1", "…Part 2") still get two names.
+
+    The digest is digits, not hex: the library scanner reads "c" + digits as
+    a chapter number, and the "~" keeps them from joining a preceding "c" or
+    "v". With no room for it (max_bytes of 9 or less) the text is only cut."""
+    if len(text.encode()) <= max_bytes:
+        return text
+    digest = int.from_bytes(hashlib.blake2s(text.encode(), digest_size=8).digest(), "big")
+    tag = f"~{digest % 10**8:08d}"
+    if max_bytes <= len(tag):
+        return truncate_utf8(text, max_bytes).rstrip(" .")
+    return truncate_utf8(text, max_bytes - len(tag)).rstrip(" .") + tag
+
+
+def sanitize_filename(name: str, max_bytes: int = TITLE_MAX_BYTES) -> str:
+    cleaned = re.sub(r"\s+", " ", ILLEGAL_PATH_CHARS.sub("", name))
+    # both ends: a leading dot hides the entry (".hack//Sign"), and Windows/SMB
+    # drop trailing dots and spaces in any order ("Why ...?")
+    cleaned = cleaned.strip(" .")
+    # the "_" goes on before the cut, so it counts toward max_bytes; a cut
+    # can't expose a reserved name, as the "~" after it is not a dot
+    cleaned = WINDOWS_RESERVED_NAME.sub(r"\1_", cleaned)
+    return shorten_utf8(cleaned, max_bytes) or "Unknown"
 
 
 # "c002", "ch 21", "Ch. 21", "Chapter 3", "_Chapter_1" — the lookbehind (no
