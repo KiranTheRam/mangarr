@@ -8,15 +8,13 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from .filename import parse_filename
 from .models import Chapter, Series
 from .sources.base import TorrentIndexer, TorrentRelease
 from .titles import split_alt_titles, title_queries
 from .util import (
-    has_chapter_marker,
     is_special_chapter,
     normalize_title,
-    parse_chapter_number,
-    parse_volume_number,
 )
 
 log = logging.getLogger(__name__)
@@ -24,16 +22,6 @@ log = logging.getLogger(__name__)
 INSPECTION_LIMIT = 20
 MAX_BENCODE_DEPTH = 100
 
-_CHAPTER_RANGE = re.compile(
-    r"(?<![a-z])c(?:h(?:apter)?)?[ ._-]{0,2}(\d+(?:\.\d+)?)\s*[-–—]\s*"
-    r"(?:c(?:h(?:apter)?)?[ ._-]{0,2})?(\d+(?:\.\d+)?)",
-    re.IGNORECASE,
-)
-_VOLUME_RANGE = re.compile(
-    r"(?<![a-z])v(?:ol(?:ume)?)?[ ._-]{0,2}(\d+)\s*[-–—]\s*"
-    r"(?:v(?:ol(?:ume)?)?[ ._-]{0,2})?(\d+)",
-    re.IGNORECASE,
-)
 _ARCHIVE_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z", ".pdf"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 _CANONICAL_INTEGER = re.compile(rb"(?:0|-[1-9]\d*|[1-9]\d*)\Z")
@@ -121,40 +109,17 @@ def torrent_paths(metadata: bytes) -> list[str]:
     return [name] if name else []
 
 
-def _numbers_in_range(low: float, high: float, known: set[float]) -> set[float]:
-    if high < low:
-        low, high = high, low
-    return {number for number in known if low <= number <= high}
-
-
 def coverage_from_text(
     text: str,
     chapters: list[Chapter],
     *,
     allow_bare_chapter: bool = True,
 ) -> set[float]:
-    known = {chapter.number for chapter in chapters}
-    by_volume: dict[int, set[float]] = {}
-    for chapter in chapters:
-        if chapter.volume is not None:
-            by_volume.setdefault(chapter.volume, set()).add(chapter.number)
-    covered: set[float] = set()
-    for match in _CHAPTER_RANGE.finditer(text):
-        covered.update(_numbers_in_range(float(match.group(1)), float(match.group(2)), known))
-    for match in _VOLUME_RANGE.finditer(text):
-        low, high = sorted((int(match.group(1)), int(match.group(2))))
-        for volume in range(low, high + 1):
-            covered.update(by_volume.get(volume, set()))
-    chapter = parse_chapter_number(text)
-    volume = parse_volume_number(text)
-    explicit_chapter = has_chapter_marker(text)
-    if chapter in known and (
-        explicit_chapter or (allow_bare_chapter and volume is None)
-    ):
-        covered.add(float(chapter))
-    elif volume is not None:
-        covered.update(by_volume.get(volume, set()))
-    return covered
+    parsed = parse_filename(text)
+    return {
+        chapter.number for chapter in chapters
+        if parsed.covers(chapter.number, chapter.volume, allow_bare=allow_bare_chapter)
+    }
 
 
 def torrent_coverage(

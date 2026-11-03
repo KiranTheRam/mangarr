@@ -598,7 +598,7 @@ def _run_resync(
 
     Returns (assigned, changed, repointed, cleared, diff) where diff is
     [(chapter number, old volume, new volume), …] sorted by chapter."""
-    from ..util import has_chapter_marker, parse_volume_number
+    from ..filename import parse_filename
 
     changed = 0
     diff: list[tuple[float, int | None, int | None]] = []
@@ -623,9 +623,9 @@ def _run_resync(
             continue
         before[ch.id] = ch.file_path
         stem = Path(ch.file_path).stem
-        file_volume = parse_volume_number(stem)
-        if file_volume is not None and not has_chapter_marker(stem) \
-                and file_volume != ch.volume:
+        coverage = parse_filename(stem)
+        if coverage.volume and not coverage.chapter and not coverage.ambiguous \
+                and not coverage.covers(ch.number, ch.volume):
             ch.downloaded = False
             ch.file_path = ""
     scan_series(

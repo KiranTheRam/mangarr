@@ -13,8 +13,9 @@ from functools import lru_cache
 from pathlib import Path
 from xml.etree import ElementTree
 
+from ..filename import FilenameCoverage, parse_filename
 from ..models import Chapter
-from ..util import has_chapter_marker, parse_chapter_number, parse_volume_number
+from ..util import has_chapter_marker, parse_chapter_number
 
 ARCHIVE_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
@@ -29,6 +30,7 @@ class MediaFile:
     is_dir: bool  # a directory of loose images (one chapter/volume as pages)
     chapter_number: float | None
     volume_number: int | None
+    coverage: FilenameCoverage | None = None
 
     @property
     def label(self) -> str:
@@ -41,7 +43,7 @@ class MatchedFile:
     chapter: Chapter | None  # the single chapter this file is, if any
     volume: int | None  # set when the file is a whole-volume archive
     covered_chapters: list[Chapter] = field(default_factory=list)
-    content_chapters: frozenset[float] | None = None  # authoritative archive labels
+    content_chapters: frozenset[float] | None = None  # explicit page labels or chapter spans
 
 
 @dataclass
@@ -91,13 +93,8 @@ def find_media_files(
 
 def _media_of(path: Path, is_dir: bool) -> MediaFile:
     text = _name_source(path, is_dir)
-    volume = parse_volume_number(text)
-    chapter = parse_chapter_number(text)
-    # a bare volume name ("Volume 01", "v40 (2019)") has no explicit chapter
-    # token, so its trailing number is the volume, not a chapter
-    if volume is not None and chapter is not None and not has_chapter_marker(text):
-        chapter = None
-    return MediaFile(path=path, is_dir=is_dir, chapter_number=chapter, volume_number=volume)
+    parsed = parse_filename(text)
+    return MediaFile(path, is_dir, parsed.chapter_number, parsed.volume_number, parsed)
 
 
 # path -> (mtime, size, title); opening every archive on every scan is far too
@@ -276,7 +273,20 @@ def find_series_media_files(
                 local_volume = media.volume_number - offset
                 if local_volume not in tracked_volumes:
                     continue
-                media = replace(media, volume_number=local_volume)
+                parsed = media.coverage
+                media = replace(
+                    media, volume_number=local_volume,
+                    coverage=replace(parsed, volume=(local_volume, local_volume)) if parsed else None,
+                )
+            elif scoped and media.coverage and media.coverage.volume:
+                low, high = media.coverage.volume
+                local = (low - offset, high - offset)
+                # A pack crossing series boundaries cannot safely be assigned
+                # in its entirety to either part of a shared folder.
+                scoped_volumes = {v for v in tracked_volumes if local[0] <= v <= local[1]}
+                if len(scoped_volumes) != local[1] - local[0] + 1:
+                    continue
+                media = replace(media, coverage=replace(media.coverage, volume=local))
             try:
                 media_key = str(media.path.resolve(strict=False))
             except OSError:
@@ -286,8 +296,7 @@ def find_series_media_files(
 
 
 def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
-    """Match each media file to a chapter (by number) or, for whole-volume
-    archives, to every chapter assigned to that volume."""
+    """Match single chapters and full chapter/volume spans to tracked rows."""
     by_number = {c.number: c for c in chapters}
     chapters_in_volume: dict[int, list[Chapter]] = {}
     for c in chapters:
@@ -297,8 +306,27 @@ def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
     matched: list[MatchedFile] = []
     unmatched: list[MediaFile] = []
     for mf in media:
+        parsed = mf.coverage
+        if parsed is not None and parsed.ambiguous:
+            unmatched.append(mf)
+            continue
+        # A span is never reduced to its first tracked chapter or a single
+        # ComicInfo Number. Explicit page labels still override edition maps.
+        if parsed is not None and parsed.is_range:
+            content = None if mf.is_dir else archive_chapter_numbers(mf.path)
+            covered = [c for c in chapters if (
+                c.number in content if content is not None else parsed.covers(c.number, c.volume)
+            )]
+            matched.append(MatchedFile(
+                media=mf, chapter=None, volume=mf.volume_number,
+                covered_chapters=covered,
+                content_chapters=content if content is not None else (
+                    frozenset(c.number for c in covered) if parsed.chapter else None
+                ),
+            ))
+            continue
         chapter = by_number.get(mf.chapter_number) if mf.chapter_number is not None else None
-        if chapter is None and not mf.is_dir:
+        if chapter is None and mf.volume_number is None and not mf.is_dir:
             embedded_number = comicinfo_number(mf.path)
             embedded_chapter = by_number.get(embedded_number)
             if embedded_chapter is not None:

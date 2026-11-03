@@ -8,6 +8,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..filename import parse_filename
 from ..models import Chapter, Series
 from ..util import has_chapter_marker, parse_volume_number
 from .naming import chapter_filename, series_folder, volume_filename
@@ -69,6 +70,9 @@ def plan_renames(
         # explicit chapter marker) — not by how many chapters happen to map to
         # it, so a "v13" archive that covers a single chapter still gets a
         # volume name rather than a chapter name
+        coverage = parse_filename(stem)
+        if coverage.is_range or coverage.ambiguous:
+            continue
         vol = parse_volume_number(stem)
         if vol is not None and not has_chapter_marker(stem):
             desired = volume_filename(series_folder(series.title), vol, ext)

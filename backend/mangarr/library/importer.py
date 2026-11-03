@@ -14,7 +14,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from ..models import Chapter, Series
-from ..util import NEW_FILE_MODE, natural_key
+from ..util import NAME_MAX_BYTES, NEW_FILE_MODE, natural_key, sanitize_filename
 from .matcher import (
     ARCHIVE_EXTS,
     IMAGE_EXTS,
@@ -210,8 +210,9 @@ def import_torrent_payload(
     files: list[Path] | None = None,
 ) -> list[tuple[Path, Chapter | None, int | None]]:
     """Copies/renames payload files into the library. Returns (dest, matched
-    chapter, volume) triples; chapter is None for volume archives that span
-    chapters — those carry the parsed volume number instead.
+    chapter, volume) triples. Shared archives have no single chapter; only
+    a single named volume carries a volume number. Resolve their complete
+    coverage through the shared matcher.
 
     `files` (the torrent's own files) limits the import to those instead of
     everything under content_path, which may be a folder shared with other
@@ -241,7 +242,12 @@ def import_torrent_payload(
         if not media.is_dir and _inside(media.path, folder):
             return media.path
         ext = _dest_ext(media)
-        if chapter is not None:
+        if media.coverage and (media.coverage.is_range or media.coverage.ambiguous):
+            # Keep the full label: even one tracked chapter does not turn a
+            # multi-chapter/volume archive into a single-chapter file.
+            stem = media.path.name if media.is_dir else media.path.stem
+            dest_name = sanitize_filename(stem, NAME_MAX_BYTES - len(ext)) + ext
+        elif chapter is not None:
             dest_name = Path(
                 chapter_filename(template, template_no_volume, series.title,
                                  chapter.number, chapter.volume, chapter.title)

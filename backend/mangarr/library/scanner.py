@@ -193,7 +193,8 @@ def _add_disk_chapters(
             chapters.append(chapter)
 
     if not known and series.total_volumes == 1 and series.total_chapters:
-        if any(item.volume_number == 1 and item.chapter_number is None for item in media):
+        if any(item.volume_number == 1 and item.chapter_number is None
+               and not (item.coverage and item.coverage.chapter) for item in media):
             for number in range(1, series.total_chapters + 1):
                 chapter = Chapter(
                     series_id=series.id, number=float(number), volume=1,
@@ -261,8 +262,8 @@ def scan_series(
     match = match_files(media, chapters)
     scanned_paths = {str(item.path.resolve(strict=False)) for item in media}
 
-    # Explicit page labels can disprove an old original-edition assignment
-    # to an omnibus even though the recorded file still exists.
+    # Explicit page labels or chapter spans can disprove an old assignment
+    # even though the recorded file still exists.
     known_content = {
         str(m.media.path.resolve()): m.content_chapters
         for m in match.matched if m.content_chapters is not None

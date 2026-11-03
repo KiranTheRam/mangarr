@@ -9,6 +9,8 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
+from .filename import BRACKET_GROUPS, parse_filename
+
 log = logging.getLogger(__name__)
 
 # Reading the umask means setting it, which would race file creation in worker
@@ -254,28 +256,17 @@ def sanitize_filename(name: str, max_bytes: int = TITLE_MAX_BYTES) -> str:
 # \b treats "_" as a word char and would miss "[0001]_Chapter_1"
 CHAPTER_PREFIX_PATTERN = re.compile(r"(?<![a-z])c(?:h(?:apter)?)?[ ._]{0,2}(\d+(?:[.x]\d+)?)", re.I)
 TRAILING_NUMBER_PATTERN = re.compile(r"\b(\d+(?:\.\d+)?)\s*$")
-BRACKET_GROUPS = re.compile(r"\([^)]*\)|\[[^\]]*\]")
 VOLUME_PATTERN = re.compile(r"(?<![a-z])v(?:ol(?:ume)?)?[ ._]{0,2}(\d+)", re.I)
 
 
 def has_chapter_marker(text: str) -> bool:
-    """True when text has an explicit chapter token (c/ch/chapter + number),
-    as opposed to a bare trailing number that might actually be a volume."""
-    return CHAPTER_PREFIX_PATTERN.search(text) is not None
+    """Whether a recognized chapter label (including a span) is present."""
+    return parse_filename(text).explicit_chapter
 
 
 def parse_chapter_number(text: str) -> float | None:
-    m = CHAPTER_PREFIX_PATTERN.search(text)
-    if m:
-        return float(m.group(1).lower().replace("x", "."))
-    # scene-style names bury the chapter before tag groups:
-    # "Kagurabachi 057 (2024) (Digital) (1r0n)" → strip (…)/[…], then the
-    # chapter is the trailing number
-    stripped = BRACKET_GROUPS.sub(" ", text).strip()
-    m = TRAILING_NUMBER_PATTERN.search(stripped)
-    if m:
-        return float(m.group(1))
-    return None
+    """A single chapter only; ranges must use parse_filename's bounds."""
+    return parse_filename(text).chapter_number
 
 
 def is_special_chapter(number: float) -> bool:
@@ -287,13 +278,7 @@ def is_special_chapter(number: float) -> bool:
 
 
 def parse_volume_number(text: str) -> int | None:
-    m = VOLUME_PATTERN.search(text)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            return None
-    return None
+    return parse_filename(text).volume_number
 
 
 def normalize_title(title: str) -> str:

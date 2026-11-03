@@ -73,3 +73,20 @@ def test_dry_run_on_copies_leaves_real_chapters_untouched(tmp_path):
     # the real chapters still carry their pre-resync state
     assert [c.volume for c in chapters] == [1, 1, None]
     assert chapters[1].downloaded and chapters[1].file_path.endswith("v01.cbz")
+
+
+def test_resync_keeps_chapters_in_volume_range_and_clears_those_moved_out(tmp_path):
+    series, chapters = make_series(tmp_path)
+    old = tmp_path / "Dandadan" / "Dandadan v01.cbz"
+    pack = old.with_name("Dandadan v01-02.cbz")
+    old.rename(pack)
+    for chapter in chapters[:2]:
+        chapter.file_path = str(pack)
+    new_map = {1.: 2, 2.: 3, 3.: 2}
+
+    assigned, changed, repointed, cleared, _ = _run_resync(series, chapters, new_map)
+
+    assert (assigned, changed, repointed, cleared) == (3, 3, 0, 1)
+    assert chapters[0].downloaded and chapters[0].file_path == str(pack)
+    assert not chapters[1].downloaded and not chapters[1].file_path
+    assert chapters[2].downloaded and chapters[2].file_path == str(pack)
