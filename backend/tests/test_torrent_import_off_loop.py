@@ -233,3 +233,70 @@ async def test_snapshot_carries_what_the_duplicate_check_reads(db_session, tmp_p
     await db_session.refresh(dl)
     assert dl.status == DownloadStatus.FAILED
     assert "same page images as existing chapter 1" in dl.error
+
+
+@pytest.mark.parametrize("stem,expected", [
+    ("Series c001-010", {1., 2., 2.5, 3., 4., 5., 6., 7., 8., 9., 10.}),
+    ("Series v01-03 (Digital)", {1., 2., 2.5, 3., 4., 5., 6., 7., 8., 9., 10., 11.}),
+    ("Series v02 (c001-006)", {1., 2., 2.5, 3., 4., 5., 6.}),
+    ("Series v01 (2009) (Digital) (c1fi7)", {1., 2., 2.5, 3., 4., 5., 6.}),
+])
+async def test_range_import_records_every_covered_chapter_and_does_not_regrab(
+    db_session, tmp_path, stem, expected
+):
+    import zipfile
+
+    from mangarr.library.scanner import scan_series
+    from mangarr.sources.base import TorrentRelease
+    from mangarr.torrent_selection import select_best_torrent
+    from tests.test_torrent_selection import FakeIndexer, torrent_with
+
+    library = tmp_path / "library"
+    library.mkdir()
+    series = Series(title="Series", sort_title="series", folder_name="Series",
+                    root_folder=RootFolder(path=str(library)))
+    series.chapters = [Chapter(number=n, volume=1 if n <= 6 else 2)
+                       for n in [1., 2., 2.5, 3., 4., 5., 6., 7., 8., 9., 10., 11.]]
+    excluded = Chapter(number=3.5, volume=1, excluded=True)
+    series.chapters.append(excluded)
+    db_session.add(series)
+    await db_session.commit()
+    dl = Download(series_id=series.id, kind=DownloadKind.TORRENT,
+                  status=DownloadStatus.IMPORTING, title=stem)
+    db_session.add(dl)
+    await db_session.commit()
+    source = tmp_path / "payload" / (stem + ".cbz")
+    source.parent.mkdir()
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("001.png", b"first page")
+        archive.writestr("002.png", b"last page")
+        archive.writestr("ComicInfo.xml", "<ComicInfo><Number>1</Number></ComicInfo>")
+
+    await tasks._import_torrent(db_session, dl, source, VALUES)
+    await db_session.refresh(dl)
+    await db_session.refresh(series, ["chapters"])
+    assert dl.status == DownloadStatus.DONE
+    owned = [c for c in series.chapters if c.downloaded]
+    assert {c.number for c in owned} == expected
+    assert len({c.file_path for c in owned}) == 1
+    dest = next((library / "Series").iterdir())
+    assert dest.read_bytes() == source.read_bytes()
+    assert all(c.file_path == str(dest) and c.file_source == "nyaa" for c in owned)
+    assert not excluded.downloaded and not excluded.file_path
+    if "-" in stem or "c001-006" in stem:
+        assert dest.name == source.name
+
+    tracked = [c for c in series.chapters if not c.excluded]
+    scan = scan_series(series, tracked, [dest.parent])
+    assert scan.matched_chapters == 0 and scan.cleared == 0
+    await tasks._import_torrent(db_session, dl, source, VALUES)
+    assert list(dest.parent.iterdir()) == [dest]
+    assert {c.number for c in series.chapters if c.downloaded} == expected
+    assert all(c.file_source == "nyaa" for c in owned)
+
+    release = TorrentRelease(source_name="fake", title=stem, magnet="magnet:range",
+                             torrent_url="https://example.test/range.torrent",
+                             size_bytes=100, seeders=10)
+    indexer = FakeIndexer([release], {release.magnet: torrent_with(dest.name)})
+    assert await select_best_torrent(series, series.chapters, [indexer],
+                                     max_size_bytes=1000, min_seeders=1) is None

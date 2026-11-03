@@ -39,8 +39,9 @@ from ..chapter_metadata import (
 from ..db import session_scope
 from ..download.direct import DuplicateChapterPagesError, download_chapter_to_cbz
 from ..download.qbittorrent import QbtClient
+from ..filename import parse_filename
 from ..library.importer import import_torrent_payload
-from ..library.matcher import archive_chapter_numbers, find_series_media_files
+from ..library.matcher import find_media_files, find_series_media_files, match_files
 from ..library.naming import chapter_path, series_folder, volume_filename
 from ..library.volume_merge import merge_chapter_archives
 from ..metadata.anilist import provider as anilist
@@ -683,7 +684,10 @@ def disk_volume_numbers(series: Series) -> set[int]:
         folders, [chapter for chapter in series.chapters if not chapter.excluded], offsets
     )
     for mf in media:
-        if mf.volume_number is not None and mf.chapter_number is None:
+        if mf.coverage and mf.coverage.is_range and mf.coverage.volume and not mf.coverage.chapter:
+            low, high = mf.coverage.volume
+            volumes.update(range(low, high + 1))
+        elif mf.volume_number is not None and mf.chapter_number is None:
             volumes.add(mf.volume_number)
     return volumes
 
@@ -1542,6 +1546,20 @@ async def sync_qbittorrent() -> None:
             await client.close()
 
 
+def _place_torrent_files(content_path, series, chapters, *args, **kwargs):
+    """Place files and resolve shared-archive ownership off the event loop."""
+    placed = import_torrent_payload(content_path, series, chapters, *args, **kwargs)
+    # Unknown imports retain decorations from the series title. Re-parsing
+    # those names could turn a title such as C3 into invented ownership.
+    shared = [dest for dest, chapter, volume in placed if chapter is None
+              and (volume is not None or parse_filename(dest.stem).is_range)]
+    matches = match_files(
+        [media for dest in shared for media in find_media_files(dest)], chapters
+    )
+    coverage = {str(m.media.path): [c.id for c in m.covered_chapters] for m in matches.matched}
+    return placed, coverage
+
+
 async def _import_torrent(
     session: AsyncSession, dl: Download, content_path: Path, values: dict[str, str],
     files: list[Path] | None = None,
@@ -1583,8 +1601,8 @@ async def _import_torrent(
     candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
     try:
         try:
-            placed = await asyncio.to_thread(
-                import_torrent_payload,
+            placed, coverage = await asyncio.to_thread(
+                _place_torrent_files,
                 content_path,
                 SimpleNamespace(title=series.title, folder_name=series.folder_name),
                 [
@@ -1651,11 +1669,10 @@ async def _import_torrent(
                 chapter.file_path = str(dest)
                 chapter.file_source = "nyaa"
             chapter.downloaded = True
-        elif volume is not None:
-            content = archive_chapter_numbers(dest)
-            for ch in series.chapters:
-                covered = ch.number in content if content is not None else ch.volume == volume
-                if not ch.excluded and covered and not ch.downloaded:
+        else:
+            for chapter_id in coverage.get(str(dest), []):
+                ch = candidates[chapter_id]
+                if not ch.downloaded:
                     ch.downloaded = True
                     # set after file_path: assigning it resets provenance
                     ch.file_path = str(dest)

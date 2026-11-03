@@ -78,8 +78,8 @@ def _chapter_markers(text: str) -> set[float]:
 
 def _provable(mf: MediaFile) -> bool:
     """Whether a file's name pins down what it holds well enough to offer it
-    (or a file it seems to duplicate) for deletion. The filename parser takes
-    the first number it finds, so it can't be trusted when the name:
+    (or a file it seems to duplicate) for deletion. Even with range-aware
+    matching, cleanup stays conservative when the name:
       - spans chapters or volumes ("Ch. 12-15", "v01-03", "001-010");
       - is read as a chapter but also has a volume marker ("v01 (c1fi7)");
       - has chapter numbers that disagree, including one only inside a tag
@@ -88,7 +88,11 @@ def _provable(mf: MediaFile) -> bool:
     the user can still select them."""
     stem = mf.path.name if mf.is_dir else mf.path.stem
     untagged = BRACKET_GROUPS.sub(" ", stem).strip()
+    if mf.coverage and (mf.coverage.is_range or mf.coverage.ambiguous):
+        return False
     if _MARKED_SPAN.search(stem) or _BARE_SPAN.search(untagged):
+        return False
+    if _chapter_markers(stem) != _chapter_markers(untagged):
         return False
     if mf.chapter_number is None:
         return True  # volume archives and unknown files keep their rules
