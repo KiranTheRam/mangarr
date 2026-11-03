@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import settings_service
 from .base import DirectSource, TorrentIndexer
 from .asura import source as asura_source
+from .toonily import source as toonily_source
 from .atsumaru import source as atsumaru_source
 from .mangadex import source as mangadex_source
 from .mangafire import source as mangafire_source
@@ -26,6 +27,7 @@ DIRECT_SOURCES: dict[str, DirectSource] = {
     atsumaru_source.name: atsumaru_source,
     tcbscans_source.name: tcbscans_source,
     asura_source.name: asura_source,
+    toonily_source.name: toonily_source,
     viz_source.name: viz_source,
     wikipedia_source.name: wikipedia_source,
 }

@@ -45,6 +45,14 @@ design; it is the automation half of your manga stack.
     uploads are AVIF images, which Kavita and Komga read natively.
   - **Asura Scans** (API) — Korean/Chinese webtoons and manhwa (not Japanese
     manga). Skips locked early-access (premium) chapters automatically.
+  - **Toonily** (scraper, opt-in) — English manhwa, including mature content.
+    Enable it in Settings → Sources. Uses public chapter pages without cookies
+    or browser automation. Explicit chapter numbers (including decimals) are
+    preserved; independently numbered side stories are omitted rather than
+    mistaken for main chapters. Image downloads support the per-source content
+    proxy and preserve the reader Referer. JPEG URLs explicitly request the
+    CDN's JPEG variant; returned bytes are preserved without recompression.
+    WebP responses are still packaged as WebP even at a `.jpg` URL.
   - **Nyaa.si** (torrents) — Literature/English-translated category, sent to
     qBittorrent; completed downloads are imported automatically (volume packs,
     chapter archives, or loose-image folders). Imports **hardlink** by

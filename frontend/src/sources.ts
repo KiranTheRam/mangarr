@@ -8,6 +8,7 @@ export const SOURCE_LABELS: Record<string, string> = {
   weebcentral: "WeebCentral",
   atsumaru: "Atsumaru",
   asura: "Asura Scans",
+  toonily: "Toonily",
   viz: "VIZ (official metadata)",
   wikipedia: "Wikipedia (metadata)",
   nyaa: "Nyaa (torrents)",

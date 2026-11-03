@@ -166,6 +166,7 @@ const SOURCE_HINTS: Record<string, string> = {
   atsumaru: "Broad archive of manga, manhwa, and manhua; picks the best-rated scanlation of each chapter.",
   viz: "Exact printed-volume mappings for VIZ-licensed series; does not download chapters.",
   wikipedia: "Chapter titles and printed-volume tables for publishers not covered by VIZ.",
+  toonily: "English manhwa archive, including mature content. Disabled by default. Independently numbered side stories are not mapped to main chapters.",
   nyaa: "Sent to the download client below and imported when complete.",
 };
 
@@ -178,6 +179,7 @@ const CONTENT_SOURCES = new Set([
   "atsumaru",
   "tcbscans",
   "asura",
+  "toonily",
 ]);
 
 function orderedSourceNames(form: SettingsType): string[] {
