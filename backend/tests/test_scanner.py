@@ -23,6 +23,50 @@ def make_cbz(path):
 
 
 class TestScanSeries:
+    def test_keeps_recorded_exact_match_and_its_metadata_across_aliases(self, tmp_path):
+        folder = tmp_path / "Dandadan"
+        folder.mkdir()
+        first = folder / "Dandadan ch. 115.0.cbz"
+        recorded = folder / "Dandadan ch. 115.cbz"
+        for path, title in ((first, "Alternate title"), (recorded, "Recorded title")):
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("001.png", PNG + title.encode())
+                archive.writestr("ComicInfo.xml", f"<ComicInfo><Title>{title}</Title></ComicInfo>")
+        chapters = chs((115, 15))
+        chapter = chapters[0]
+        chapter.downloaded, chapter.file_path = True, str(recorded)
+        chapter.file_source, chapter.file_group = "mangadex", "Tracked group"
+        series, _ = series_with(chapters)
+
+        for _ in range(2):
+            scan_series(series, chapters, [folder])
+            assert chapter.file_path == str(recorded)
+            assert (chapter.file_source, chapter.file_group) == ("mangadex", "Tracked group")
+            assert chapter.title == "Recorded title"
+
+        # A vanished recorded file must still fall back to the remaining file
+        # and forget provenance; it must never lend it to different content.
+        recorded.unlink()
+        scan_series(series, chapters, [folder])
+        assert chapter.downloaded and chapter.file_path == str(first)
+        assert (chapter.file_source, chapter.file_group) == ("", "")
+
+    def test_recorded_volume_does_not_override_a_loose_chapter(self, tmp_path):
+        folder = tmp_path / "Dandadan"
+        folder.mkdir()
+        volume = folder / "Dandadan Vol. 15.cbz"
+        loose = folder / "Dandadan Ch. 115.cbz"
+        make_cbz(volume)
+        make_cbz(loose)
+        chapters = chs((115, 15))
+        chapters[0].downloaded, chapters[0].file_path = True, str(volume)
+        chapters[0].file_source = "volume-merge"
+        series, _ = series_with(chapters)
+
+        scan_series(series, chapters, [folder])
+        assert chapters[0].file_path == str(loose)
+        assert chapters[0].file_source == ""
+
     def test_marks_chapter_files_owned_in_place(self, tmp_path):
         folder = tmp_path / "Dandadan"
         folder.mkdir()

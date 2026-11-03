@@ -533,6 +533,132 @@ async def test_merge_complete_volumes_packs_and_repoints(db_session, tmp_path):
     assert automation.upgrade_candidates(series, series.chapters, ["alpha"], ["alpha"]) == {}
 
 
+@pytest.mark.parametrize("manual", [False, True])
+async def test_final_volume_merge_after_scan_keeps_tracked_numeric_alias(
+    db_session, tmp_path, manual,
+):
+    """Issue #79: 115 and 115.0 sort differently but share one DB identity."""
+    from mangarr.api.series import merge_volumes_now
+
+    folder = tmp_path / "Test Series"
+    numbers = [110, 111, 111.1, 111.2, 112, 112.1, 112.2,
+               113, 113.1, 113.2, 114, 114.1, 114.2,
+               115, 115.1, 115.2, 115.3, 115.5, 115.6]
+    chapters, originals = [], {}
+    for number in numbers:
+        path = folder / f"Test Series - Ch. {number:06g}.cbz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("001.png", PNG + f"chapter {number:g}".encode())
+        originals[number] = path
+        chapter = _chapter(number, 15, downloaded=True, file_path=str(path))
+        chapter.file_source = "alpha"
+        chapters.append(chapter)
+    excluded = _chapter(115.4, 15)
+    excluded.excluded = True
+    chapters.append(excluded)
+    alias = folder / "Test Series - Ch. 000115.0.cbz"
+    _cbz(alias, 2)  # different content: never replace or delete this file
+    alias_bytes = alias.read_bytes()
+    series = await _series(
+        db_session, chapters=chapters, merge_volumes=not manual,
+        status=SeriesStatus.FINISHED, total_volumes=15,
+        root_folder=RootFolder(path=str(tmp_path)), folder_name="Test Series",
+    )
+
+    await tasks.scan_series_folder(db_session, series)
+    tracked = next(c for c in series.chapters if c.number == 115)
+    scanned_identity = (tracked.file_path, tracked.file_source)
+    if manual:
+        result = await merge_volumes_now(series.id, db_session)
+        assert result.merged == [15]
+    else:
+        assert await tasks.merge_complete_volumes(db_session, series, {}) == [15]
+    assert scanned_identity == (str(originals[115]), "alpha")
+    dest = folder / "Test Series - Vol. 15.cbz"
+    with zipfile.ZipFile(dest) as archive:
+        assert [archive.read(name) for name in archive.namelist() if name.endswith(".png")] == [
+            PNG + f"chapter {number:g}".encode() for number in numbers
+        ]
+    assert all(not path.exists() for path in originals.values())
+    assert alias.read_bytes() == alias_bytes
+    tombstones = [c for c in series.chapters if c.number == 115.4]
+    assert len(tombstones) == 1 and tombstones[0].excluded
+    assert not tombstones[0].downloaded and not tombstones[0].file_path
+
+
+@pytest.mark.parametrize("excluded,finished,expected", [
+    (True, True, [15]), (False, True, []), (True, False, []),
+])
+async def test_final_fractional_volume_requires_closure_and_all_active_chapters(
+    db_session, tmp_path, monkeypatch, excluded, finished, expected,
+):
+    path = _cbz(tmp_path / "Test Series" / "Test Series Ch. 115.6.cbz", 1)
+    downloaded = _chapter(115.6, 15, downloaded=True, file_path=str(path))
+    downloaded.file_source = "alpha"
+    missing = _chapter(115.4, 15)
+    missing.excluded = excluded
+    series = await _series(
+        db_session, chapters=[downloaded, missing], links=["alpha"],
+        status=SeriesStatus.FINISHED if finished else SeriesStatus.RELEASING,
+        root_folder=RootFolder(path=str(tmp_path)), folder_name="Test Series",
+    )
+    # Refresh continues to advertise the excluded number. The persisted
+    # tombstone must survive both refresh and scan.
+    monkeypatch.setattr(registry, "DIRECT_SOURCES", {
+        "alpha": ListingSource("alpha", {115.4: [""], 115.6: [""]}),
+    })
+    await tasks.update_chapters(db_session, series, _values("alpha"))
+    await tasks.scan_series_folder(db_session, series)
+    assert await tasks.merge_complete_volumes(db_session, series, {}, force=True) == expected
+    series = await _load(db_session, series.id)
+    assert len(series.chapters) == 2
+    tombstone = next(c for c in series.chapters if c.number == 115.4)
+    assert tombstone.excluded == excluded
+    assert not tombstone.downloaded and not tombstone.file_path
+    assert path.exists() == (not expected)
+
+
+@pytest.mark.parametrize("guard", ["existing", "corrupt", "shared", "archived", "busy", "adopted"])
+async def test_merge_guards_preserve_originals(db_session, tmp_path, guard):
+    folder = tmp_path / "Test Series"
+    paths = [_cbz(folder / f"Test Series Ch. {number}.cbz", 1) for number in (1, 2)]
+    chapters = []
+    for number, path in enumerate(paths, start=1):
+        chapter = _chapter(number, 1, downloaded=True, file_path=str(path))
+        chapter.file_source = "alpha"
+        chapters.append(chapter)
+    dest = folder / "Test Series - Vol. 01.cbz"
+    if guard == "existing":
+        _cbz(dest, 3)
+    elif guard == "corrupt":
+        paths[1].write_bytes(b"not a zip archive")
+    elif guard == "shared":
+        chapters[1].file_path = chapters[0].file_path
+        chapters[1].file_source = "alpha"
+    elif guard == "archived":
+        for chapter in chapters:
+            chapter.file_source = automation.MERGED_FILE_SOURCE
+    elif guard == "adopted":
+        chapters[0].file_source = ""
+    series = await _series(
+        db_session, chapters=chapters, status=SeriesStatus.FINISHED,
+        root_folder=RootFolder(path=str(tmp_path)), folder_name="Test Series",
+    )
+    if guard == "busy":
+        db_session.add(Download(series_id=series.id, chapter_id=series.chapters[0].id,
+                                kind=DownloadKind.DIRECT, status=DownloadStatus.QUEUED,
+                                source_name="alpha"))
+        await db_session.commit()
+    before = {path: path.read_bytes() for path in folder.iterdir()}
+    recorded = [(c.file_path, c.file_source) for c in series.chapters]
+
+    assert await tasks.merge_complete_volumes(db_session, series, {}, force=True) == []
+    assert {path: path.read_bytes() for path in folder.iterdir()} == before
+    assert [(c.file_path, c.file_source) for c in series.chapters] == recorded
+    assert not (await db_session.execute(select(HistoryEvent))).scalars().all()
+
+
 # --------------------------------------------------------- finished series
 
 def test_finished_and_complete():
