@@ -53,25 +53,34 @@ class QbtClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def _send(self, method: str, url: str, **kwargs) -> httpx.Response:
+        try:
+            return await self._client.request(method, url, **kwargs)
+        except httpx.HTTPError:
+            # Transport exceptions can include credential-bearing URLs. This
+            # client is also used by background jobs that log error messages.
+            raise QbtError("Cannot reach qBittorrent") from None
+
     async def _login(self) -> None:
-        resp = await self._client.post(
-            f"{self.base_url}/api/v2/auth/login",
+        resp = await self._send(
+            "POST", f"{self.base_url}/api/v2/auth/login",
             data={"username": self.username, "password": self.password},
         )
         # qBittorrent 4.x answers 200 "Ok."/"Fails."; 5.x answers 204 on
         # success and 401 on bad credentials.
         if resp.status_code >= 300 or resp.text.strip() == "Fails.":
-            raise QbtError(f"qBittorrent login failed: HTTP {resp.status_code} {resp.text[:100]}")
+            raise QbtError(f"qBittorrent login failed: HTTP {resp.status_code}")
         self._logged_in = True
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         if not self._logged_in:
             await self._login()
-        resp = await self._client.request(method, f"{self.base_url}/api/v2{path}", **kwargs)
+        resp = await self._send(method, f"{self.base_url}/api/v2{path}", **kwargs)
         if resp.status_code == 403:
             await self._login()
-            resp = await self._client.request(method, f"{self.base_url}/api/v2{path}", **kwargs)
-        resp.raise_for_status()
+            resp = await self._send(method, f"{self.base_url}/api/v2{path}", **kwargs)
+        if not resp.is_success:
+            raise QbtError(f"qBittorrent request failed: HTTP {resp.status_code}")
         return resp
 
     async def version(self) -> str:
@@ -83,7 +92,7 @@ class QbtClient:
         try:
             resp = await self._request("GET", "/app/preferences")
             return (resp.json() or {}).get("save_path", "") or ""
-        except (httpx.HTTPError, ValueError):
+        except (QbtError, ValueError):
             return ""
 
     async def ensure_category(self, name: str, save_path: str | None = None) -> None:
@@ -91,12 +100,12 @@ class QbtClient:
         data = {"category": name}
         if save_path:
             data["savePath"] = save_path
-        resp = await self._client.request(
+        resp = await self._send(
             "POST", f"{self.base_url}/api/v2/torrents/createCategory", data=data
         )
         if resp.status_code == 403:
             await self._login()
-            resp = await self._client.request(
+            resp = await self._send(
                 "POST", f"{self.base_url}/api/v2/torrents/createCategory", data=data
             )
         # 409/Conflict means it already exists — set its path instead
@@ -168,6 +177,6 @@ async def test_connection(base_url: str, username: str, password: str) -> str:
     try:
         return await client.version()
     except httpx.HTTPError as exc:
-        raise QbtError(f"Cannot reach qBittorrent at {base_url}: {exc}") from exc
+        raise QbtError("Cannot reach qBittorrent") from None
     finally:
         await client.close()

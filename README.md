@@ -240,6 +240,9 @@ Environment variables (all optional):
 | `MANGARR_SQLITE_WAL` | `true`        | Use SQLite WAL mode (see below)                   |
 | `MANGARR_LOG_LEVEL`  | `INFO`        | Log level (uppercase: `DEBUG`, `INFO`, `WARNING`) |
 | `MANGARR_API_KEY`    | *(generated)* | Fixed web UI API key instead of a generated one   |
+| `MANGARR_AUTH_USERNAME` | *(empty)* | Optional browser HTTP Basic login username |
+| `MANGARR_AUTH_PASSWORD` | *(empty)* | Browser login password; set together with username |
+| `MANGARR_ALLOWED_HOSTS` | `[]` | Additional exact DNS names as a JSON array (no scheme, port or wildcard) |
 
 `MANGARR_HOST` and `MANGARR_PORT` apply when Mangarr is started with
 `python -m mangarr.main`; a `uvicorn` command line like the one under Local
@@ -262,6 +265,45 @@ handed to the UI via `GET /initialize.json`. To give external clients (e.g.
 NextPanel or scripts) their own keys, create named keys under **Settings → API
 Keys**; any of them authenticates `/api/v1` calls via `X-Api-Key` and can be
 revoked independently.
+
+### Browser access and upgrading
+
+Browser login is opt-in to preserve existing installations: set both
+`MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD`, then restart. The browser
+prompts for credentials before serving the UI or `/initialize.json`. Partial
+configuration fails startup instead of silently disabling login. To recover
+access, change or remove both values in your environment and restart. Use HTTPS
+on a trusted reverse proxy when credentials travel across the network; Basic
+authentication itself does not encrypt them. There is no automatic local-address
+bypass. With login disabled, anyone who can reach the app using an allowed Host
+can still obtain full API access; startup logs warn about this mode.
+
+Host validation is always enabled, including for API clients. IP addresses
+(IPv4 or bracketed IPv6) and `localhost` work by default. **Before upgrading**,
+add every DNS name used by browsers, reverse proxies and integration clients to
+`MANGARR_ALLOWED_HOSTS`, for example `'["mangarr", "manga.example.com"]'`.
+Names match exactly, ignoring case, without a trailing dot; paths, schemes,
+ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
+with configuration instructions; direct IP access remains available for recovery.
+Proxies must preserve an allowed Host or set it explicitly. Forwarded headers
+never establish trust. Host validation limits DNS rebinding; it is not login.
+
+Existing named API keys and `X-Api-Key` clients continue to work without browser
+credentials. Browser credentials alone do not authenticate API calls; API keys
+alone do not unlock browser bootstrap when login is enabled. `/ping` remains
+public and contains no secrets. Bootstrap responses use `Cache-Control: no-store`.
+
+Saved integration secrets are bound to the exact saved URL (including scheme,
+port and path), and qBittorrent passwords also to the username. After changing
+one of those fields, re-enter the secret before **Test** or **Save**. A masked
+or omitted secret cannot be carried to a new destination; even cosmetic URL
+edits require re-entry. Explicitly clearing a secret on Save removes it rather
+than reusing it. Kavita's saved-library lookup can still omit the key at the
+unchanged saved URL. HTTP client request/debug logs are suppressed even at
+`DEBUG`, and connection errors omit remote URLs and response bodies to avoid
+exposing integration credentials. ComicInfo metadata larger than 1 MiB is
+ignored during matching/scanning, as is metadata compressed with methods other
+than ZIP STORED or DEFLATE. The archive's normal filename/page matching continues.
 
 ## How grabbing works
 

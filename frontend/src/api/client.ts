@@ -2,8 +2,15 @@ let apiKey = "";
 let version = "";
 
 export async function initClient(): Promise<void> {
-  const resp = await fetch("/initialize.json");
-  if (!resp.ok) throw new Error("Cannot reach mangarr backend");
+  const resp = await fetch("/initialize.json", { cache: "no-store" });
+  if (!resp.ok) {
+    let message = `Cannot initialize Mangarr (HTTP ${resp.status})`;
+    try {
+      const data = await resp.json();
+      if (typeof data.detail === "string") message = data.detail;
+    } catch { /* response may come from a reverse proxy */ }
+    throw new Error(message);
+  }
   const data = await resp.json();
   apiKey = data.apiKey;
   version = data.version;
