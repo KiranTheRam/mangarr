@@ -280,11 +280,17 @@ def scan_series(
 
     owned_now: set[tuple[str, int]] = set()
 
-    # exact chapter files first — they take precedence over volume coverage
-    for mf in match.matched:
-        if mf.chapter is None:
-            continue
+    # Exact chapter files take precedence over volume coverage. When several
+    # files identify the same chapter (e.g. 115 and 115.0), keep the recorded
+    # file if it still matches. Picking the first filename instead can silently
+    # replace different content and forget the provenance needed for merging.
+    exact = [mf for mf in match.matched if mf.chapter is not None]
+    exact.sort(key=lambda mf: mf.chapter.file_path != str(mf.media.path))
+    for mf in exact:
         chapter = mf.chapter
+        chapter_key = _ownership_key(chapter)
+        if chapter_key in owned_now:
+            continue
         # read ComicInfo lazily, only for files that matched a chapter and
         # only when the title could actually be applied (comicinfo_title
         # caches per file version, so repeat scans just stat)
@@ -293,10 +299,7 @@ def scan_series(
             if title:
                 apply_title(chapter, title, "comicinfo", series.title)
         path_str = str(mf.media.path)
-        chapter_key = _ownership_key(chapter)
-        if chapter_key not in owned_now and (
-            not chapter.downloaded or chapter.file_path != path_str
-        ):
+        if not chapter.downloaded or chapter.file_path != path_str:
             if not chapter.downloaded:
                 result.matched_chapters += 1
             chapter.downloaded = True
