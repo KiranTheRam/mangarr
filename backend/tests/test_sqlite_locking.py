@@ -116,7 +116,7 @@ async def test_progress_between_commits_does_not_hold_the_write_lock(
     release = asyncio.Event()
 
     async def slow_last_page(source, payload, series, chapter, dest,
-                             progress_cb=None, cancel_cb=None, web_url=""):
+                             progress_cb=None, cancel_cb=None, web_url="", optimization=None):
         # the real fetch loop's per-page sequence: cancel check, progress,
         # cancel check — the last check is the SELECT that would autoflush
         await cancel_cb()

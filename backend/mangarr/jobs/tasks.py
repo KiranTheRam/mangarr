@@ -38,6 +38,7 @@ from ..chapter_metadata import (
 )
 from ..db import session_scope
 from ..download.direct import DuplicateChapterPagesError, download_chapter_to_cbz
+from ..download.images import ImageOptimization
 from ..download.qbittorrent import QbtClient
 from ..filename import parse_filename
 from ..library.importer import import_torrent_payload
@@ -1267,6 +1268,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             progress_cb=on_progress,
             cancel_cb=check_still_wanted,
             web_url="",
+            optimization=ImageOptimization.from_settings(values),
         ))
         stall_seconds = DIRECT_STALL_TIMEOUT.total_seconds()
         while True:

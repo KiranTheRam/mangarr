@@ -332,6 +332,53 @@ WeebCentral sends browser-compatible HTML request headers. Neither headers
 nor a proxy guarantee access: HTTP 403 can still depend on site policy and
 network conditions. Mangarr does not solve challenges or bypass access controls.
 
+### Chapter image optimization
+
+In **Settings → Chapter Image Optimization**, opt in to reducing new direct-download
+chapter sizes before CBZ packaging. It is **off by default**: original image bytes
+are preserved. Existing library files and torrent imports are never recompressed.
+Each active download snapshots the saved policy when the worker starts; changes
+apply to subsequent downloads.
+
+- Choose lossy **WebP** (default) or **JPEG**, with quality **1–100** (default **85**).
+  Even quality 100 is lossy. Savings depend on the source; inspect fine text, line
+  art and gradients before choosing a lower quality. Some readers support JPEG
+  more widely than WebP. Pages may retain mixed formats within a CBZ.
+- **Maximum width** is **0** (original dimensions) by default, or **1–10000** pixels.
+  EXIF orientation is applied first; resizing preserves aspect ratio, rounds the
+  height to the nearest pixel, and never enlarges a page.
+- If encoding is larger or equal in size, keep the original. When a supported
+  page exceeds the explicit width limit, the resized output takes precedence
+  over this size fallback, even if it is larger.
+- Static JPEG, PNG and WebP can be optimized using Pillow. Animation (including
+  APNG/WebP), GIF, AVIF, unsupported color modes, decoder/encoder failures, and
+  pages above **32 MiB compressed or 20 megapixels** keep their original bytes.
+  JPEG preserves transparent pages by keeping the original; WebP keeps alpha.
+  ICC profiles are retained; rewritten pages discard other embedded metadata.
+- Very tall pages that cannot fit the selected encoder (WebP: 16383 pixels per
+  side; JPEG: 65500) stay original. Safety and format preservation take priority
+  over the width limit. Skipped transformations are logged; pages are never
+  silently dropped or split.
+
+The packaged image extensions follow their actual bytes; page order and
+ComicInfo metadata are retained. Archives whose page bytes changed include a small
+`MangarrPageProvenance.json` member binding ordered original page CRC/size pairs
+to the archived page identities. This keeps source-alias duplicate detection
+working across format, quality, resize and enabled/disabled policy changes,
+without treating identical lossy output from different originals as duplicates.
+Volume merging carries these original identities forward.
+Older archives continue using their actual page identities. Modified or invalid
+provenance is ignored for duplicate decisions.
+
+Transforms run off the async event loop, with one decoded page at a time and a
+pixel/input-size limit. Cancellation waits for the current bounded transform to
+finish, then prevents archive publication. The existing atomic CBZ publication
+and partial-file cleanup remain in use. The downloader still holds the chapter's
+compressed output page bytes in memory; optimization does not impose a new total
+chapter size limit. WebP/JPEG encoder availability is checked when enabling the feature;
+standard Pillow wheels in the Docker image supply both codecs. Custom Pillow
+builds must provide the selected encoder.
+
 ## How grabbing works
 
 1. When you add a series, mangarr links it to each enabled source by title

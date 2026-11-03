@@ -127,7 +127,7 @@ async def test_direct_download_whose_record_is_deleted_stops_and_cleans_up(
     written = []
 
     async def download_then_lose_record(source, payload, series, chapter, dest,
-                                        progress_cb=None, cancel_cb=None, web_url=""):
+                                        progress_cb=None, cancel_cb=None, web_url="", optimization=None):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"cbz")
         written.append(dest)

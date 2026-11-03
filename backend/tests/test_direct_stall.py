@@ -85,7 +85,7 @@ async def test_stalled_download_fails_visibly_instead_of_hanging(
     cancelled = asyncio.Event()
 
     async def hanging_download(source, payload, series, chapter, dest,
-                               progress_cb=None, cancel_cb=None, web_url=""):
+                               progress_cb=None, cancel_cb=None, web_url="", optimization=None):
         try:
             await asyncio.Event().wait()  # hangs forever
         except asyncio.CancelledError:
@@ -115,7 +115,7 @@ async def test_concurrent_page_callbacks_do_not_break_the_session(
     total = 30
 
     async def concurrent_download(source, payload, series, chapter, dest,
-                                  progress_cb=None, cancel_cb=None, web_url=""):
+                                  progress_cb=None, cancel_cb=None, web_url="", optimization=None):
         async def page(i):
             await cancel_cb()
             await progress_cb(i + 1, total)

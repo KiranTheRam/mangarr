@@ -21,6 +21,11 @@ DEFAULTS: dict[str, str] = {
     # Media management
     "naming_template": "{series} - Ch. {chapter:04.1f}",
     "naming_template_no_volume": "{series} - Ch. {chapter:04.1f}",
+    # Optional lossy optimization of new direct-download pages only.
+    "image_optimization_enabled": "false",
+    "image_optimization_format": "webp",
+    "image_optimization_quality": "85",
+    "image_optimization_max_width": "0",
     # Source priority: comma-separated source names, first = preferred.
     # Official sources first, then fast scanlation sources (tcbscans) ahead
     # of archive sources so new chapters are grabbed as soon as they appear.
@@ -116,6 +121,9 @@ def validate(values: dict[str, str]) -> None:
     template fails every download at rename time, and a non-numeric monitor
     interval would abort scheduler startup. Raises ValueError."""
     from .library.naming import chapter_filename
+    from .download.images import ImageOptimization
+
+    ImageOptimization.from_settings(values)
 
     for key in ("naming_template", "naming_template_no_volume"):
         if key not in values:

@@ -786,6 +786,7 @@ table.data-table {
 
 .form-row input[type="text"],
 .form-row input[type="password"],
+.form-row input[type="number"],
 .form-row select,
 .form-row textarea {
   flex: 1;

@@ -565,6 +565,62 @@ function KavitaSettings({
   );
 }
 
+export function ImageOptimizationSettings({ form, setForm }: {
+  form: SettingsType;
+  setForm: (form: SettingsType) => void;
+}) {
+  const enabled = form.image_optimization_enabled === "true";
+  const change = (key: string) => (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
+    setForm({ ...form, [key]: event.target.value });
+  return (
+    <div className="settings-section">
+      <h3>Chapter Image Optimization</h3>
+      <p className="section-hint">
+        Reduce storage for new direct downloads using lossy compression. Existing files and
+        torrent imports are unchanged. Off keeps the original image bytes. Each download uses
+        the settings saved when it starts.
+      </p>
+      <div className="form-row">
+        <label>Optimize downloaded images</label>
+        <Toggle on={enabled} onChange={(value) => setForm({ ...form,
+          image_optimization_enabled: value ? "true" : "false" })}
+          label="Optimize downloaded images" />
+      </div>
+      <div className="form-row">
+        <label htmlFor="image-format">Output format</label>
+        <select id="image-format" value={form.image_optimization_format ?? "webp"}
+          onChange={change("image_optimization_format")} disabled={!enabled}>
+          <option value="webp">WebP</option>
+          <option value="jpeg">JPEG (wider reader compatibility)</option>
+        </select>
+      </div>
+      <div className="form-row">
+        <label htmlFor="image-quality">Quality (1–100)</label>
+        <input id="image-quality" type="number" min="1" max="100" step="1"
+          value={form.image_optimization_quality ?? "85"} disabled={!enabled}
+          onChange={change("image_optimization_quality")} aria-describedby="image-quality-hint" />
+      </div>
+      <p id="image-quality-hint" className="section-hint">
+        Higher quality usually uses more space. 85 is a starting point; even 100 is lossy.
+        Check small text and line art before choosing lower quality.
+      </p>
+      <div className="form-row">
+        <label htmlFor="image-width">Maximum width (pixels)</label>
+        <input id="image-width" type="number" min="0" max="10000" step="1"
+          value={form.image_optimization_max_width ?? "0"} disabled={!enabled}
+          onChange={change("image_optimization_max_width")} aria-describedby="image-width-hint" />
+      </div>
+      <p id="image-width-hint" className="section-hint">
+        0 keeps the original dimensions. Resizing keeps the aspect ratio and never upscales.
+        Originals are kept when encoding would be larger, unless resizing is required.
+        Animated, unsupported or oversized pages stay original; JPEG also keeps transparent
+        pages original. The width limit applies only to pages that can be safely optimized.
+        See the logs for skipped pages.
+      </p>
+    </div>
+  );
+}
+
 export default function Settings() {
   const queryClient = useQueryClient();
   const { data: saved, isLoading, error: loadError, refetch: retryLoad } = useQuery({
@@ -688,6 +744,8 @@ export default function Settings() {
             Applies once a series is finished or cancelled and every monitored chapter is on disk.
           </p>
         </div>
+
+        <ImageOptimizationSettings form={form} setForm={setForm} />
 
         <div className="settings-section">
           <h3>Sources</h3>
