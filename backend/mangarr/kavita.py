@@ -84,19 +84,19 @@ class KavitaClient:
                 params={"apiKey": self.api_key, "pluginName": PLUGIN_NAME},
             )
         except httpx.HTTPError as exc:
-            raise KavitaError(f"Cannot reach Kavita at {self.base_url}: {exc}") from exc
+            raise KavitaError("Cannot reach Kavita") from None
         if resp.status_code in (400, 401):
             raise KavitaError("Kavita rejected the API key")
         if resp.status_code >= 300:
             raise KavitaError(
-                f"Kavita authentication failed: HTTP {resp.status_code} {resp.text[:100]}"
+                f"Kavita authentication failed: HTTP {resp.status_code}"
             )
         try:
             data = resp.json()
         except ValueError as exc:
             # a reverse proxy or the wrong host answering with an HTML page
             raise KavitaError(
-                f"{self.base_url} did not return a Kavita API response"
+                "Server did not return a Kavita API response"
             ) from exc
         self._token = data.get("token") or ""
         self.version = data.get("kavitaVersion") or ""
@@ -119,7 +119,7 @@ class KavitaClient:
                 )
             resp.raise_for_status()
         except httpx.HTTPError as exc:
-            raise KavitaError(f"Kavita request {method} {path} failed: {exc}") from exc
+            raise KavitaError(f"Kavita request {method} {path} failed") from None
         return resp
 
     async def libraries(self) -> list[KavitaLibrary]:

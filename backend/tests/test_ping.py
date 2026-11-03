@@ -12,7 +12,7 @@ def client(monkeypatch):
     monkeypatch.setattr(config, "api_key", "configured-key")
     monkeypatch.setattr(deps, "_api_key", None)
     # No `with`: the lifespan (DB init, scheduler) must not be needed.
-    return TestClient(app)
+    return TestClient(app, base_url="http://localhost")
 
 
 def test_ping_answers_without_an_api_key(client):

@@ -22,11 +22,11 @@ async def send_webhook(url: str, secret: str, payload: dict) -> bool:
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             resp = await client.post(url, json=payload, headers=headers)
-    except httpx.HTTPError as exc:
-        log.warning("webhook to %s failed: %s", url, exc)
+    except httpx.HTTPError:
+        log.warning("webhook delivery failed")
         return False
     if resp.status_code >= 400:
-        log.warning("webhook to %s returned %d", url, resp.status_code)
+        log.warning("webhook returned HTTP %d", resp.status_code)
         return False
     return True
 

@@ -448,6 +448,7 @@ function KavitaSettings({
         <label>API key</label>
         <input type="password" value={form.kavita_api_key ?? ""} onChange={set("kavita_api_key")} />
       </div>
+      <p className="section-hint">Re-enter the API key after changing the URL, before testing or saving.</p>
       <div className="form-row">
         <label>Scan scope</label>
         <select value={form.kavita_scan_mode ?? "series"} onChange={set("kavita_scan_mode")}>
@@ -697,6 +698,7 @@ export default function Settings() {
           <h3>Download Client — qBittorrent</h3>
           <p className="section-hint">
             Torrent grabs (Nyaa releases) are sent to qBittorrent and imported when complete.
+            Re-enter the password after changing the URL or username, before testing or saving.
           </p>
           <div className="form-row">
             <label>Enabled</label>
@@ -777,6 +779,7 @@ export default function Settings() {
             Notify a request manager (e.g. NextPanel) whenever chapters are imported, so requests
             flip to Available instantly. Point the URL at NextPanel's
             /api/v1/webhooks/mangarr endpoint and paste the same webhook secret configured there.
+            Re-enter the secret after changing the URL, before testing or saving.
           </p>
           <div className="form-row">
             <label>Enabled</label>
