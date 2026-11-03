@@ -64,10 +64,33 @@ class DirectSource(ABC):
     """A site we can search, list chapters on, and pull page images from."""
 
     name: str
-    # Configured at runtime by registry.apply_settings(). Only page/image
-    # bytes use this; source API and metadata clients remain direct.
-    content_proxy_enabled: bool = False
-    content_proxy_url: str = ""
+    # Fallbacks support standalone source instances. Registry settings are
+    # task-local, even though the adapter objects themselves are singletons.
+    _content_proxy_enabled: bool = False
+    _content_proxy_url: str = ""
+
+    @property
+    def content_proxy_enabled(self) -> bool:
+        from .routing import route_for
+
+        route = route_for(self.name)
+        return route.content_enabled if route else self._content_proxy_enabled
+
+    @content_proxy_enabled.setter
+    def content_proxy_enabled(self, value: bool) -> None:
+        self._content_proxy_enabled = value
+
+    @property
+    def content_proxy_url(self) -> str:
+        from .routing import route_for
+
+        route = route_for(self.name)
+        return route.content_url if route else self._content_proxy_url
+
+    @content_proxy_url.setter
+    def content_proxy_url(self, value: str) -> None:
+        self._content_proxy_url = value
+
     # per-source proactive limiter for page-image fetches (separate from the
     # HTML/API limiter so images can be pulled a bit faster). Sources override.
     image_limiter: RateLimiter | None = None

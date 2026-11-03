@@ -202,7 +202,7 @@ function orderedSourceNames(form: SettingsType): string[] {
 
 /** Ordered, toggleable source list — stored as the comma-separated
  * source_priority setting, but never hand-edited as text. */
-function SourcePriority({
+export function SourcePriority({
   form,
   setForm,
 }: {
@@ -245,8 +245,8 @@ function SourcePriority({
               <span className="priority-toggle priority-proxy-toggle" title="Proxy chapter page/image downloads">
                 <span>Proxy</span>
                 <Toggle
-                  on={form[`source_${name}_proxy_enabled`] === "true"}
-                  disabled={!enabled}
+                  on={form[`source_${name}_proxy_mode`] === "all" || form[`source_${name}_proxy_enabled`] === "true"}
+                  disabled={!enabled || form[`source_${name}_proxy_mode`] === "all"}
                   label={`Use proxy for ${SOURCE_LABELS[name] ?? name} content downloads`}
                   onChange={(proxyEnabled) =>
                     setForm({
@@ -278,7 +278,7 @@ function SourcePriority({
   );
 }
 
-function ProxySettings({
+export function ProxySettings({
   form,
   setForm,
   set,
@@ -295,17 +295,18 @@ function ProxySettings({
     <div className="settings-section proxy-settings mobile-proxy-settings">
       <h3>Proxy</h3>
       <p className="section-hint">
-        Optionally route chapter page and image downloads through one HTTP proxy. Discovery,
-        metadata, authentication, and page manifests always connect directly.
+        Route chapter page and image downloads through a shared HTTP(S) proxy. Source requests
+        stay direct unless you explicitly select all requests below.
       </p>
       <div className="form-row">
         <label>Proxy address</label>
         <input
-          type="text"
+          type="password"
+          autoComplete="new-password"
           inputMode="url"
           autoCapitalize="none"
           autoCorrect="off"
-          placeholder="http://192.168.1.28:8888"
+          placeholder="http://proxy.example:8080"
           value={form.download_proxy_url ?? ""}
           onChange={set("download_proxy_url")}
         />
@@ -319,13 +320,16 @@ function ProxySettings({
               <div className="proxy-source-copy">
                 <span className="proxy-source-name">{label}</span>
                 <span className="proxy-source-detail">
-                  {form[`source_${name}_proxy_enabled`] === "true"
-                    ? "Downloads fail closed through the proxy"
+                  {form[`source_${name}_proxy_mode`] === "all"
+                    ? "All requests use the source proxy below"
+                    : form[`source_${name}_proxy_enabled`] === "true"
+                    ? "Downloads fail closed through the shared proxy"
                     : "Downloads connect directly"}
                 </span>
               </div>
               <Toggle
-                on={form[`source_${name}_proxy_enabled`] === "true"}
+                on={form[`source_${name}_proxy_mode`] === "all" || form[`source_${name}_proxy_enabled`] === "true"}
+                disabled={form[`source_${name}_proxy_mode`] === "all"}
                 label={`Use proxy for ${label} content downloads`}
                 onChange={(enabled) =>
                   setForm({
@@ -345,7 +349,57 @@ function ProxySettings({
       </div>
       <p className="section-hint proxy-fail-closed-note">
         Proxied downloads fail closed: if the proxy is unavailable, Mangarr does not retry that
-        content request directly. Turn a source off here to make its downloads connect directly.
+        request directly. The all-requests mode below overrides the content toggle for that source.
+      </p>
+    </div>
+  );
+}
+
+/** Broader routing is deliberately independent of existing content-only settings. */
+export function SourceRequestProxySettings({ form, set }: {
+  form: SettingsType;
+  set: (key: string) => (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
+}) {
+  return (
+    <div className="settings-section">
+      <h3>Source request proxies</h3>
+      <p className="section-hint">
+        MangaFire and WeebCentral can use a separate proxy for all source requests: search,
+        frontend and scripts, signing, chapters, page manifests, and images. Existing content
+        proxy settings apply until you opt in here. A proxy cannot guarantee access to a site.
+        Saved addresses are hidden because they may contain credentials.
+      </p>
+      {["mangafire", "weebcentral"].map((name) => (
+        <div key={name}>
+          <div className="form-row">
+            <label htmlFor={`${name}-proxy-mode`}>{SOURCE_LABELS[name]} routing</label>
+            <select
+              id={`${name}-proxy-mode`}
+              value={form[`source_${name}_proxy_mode`] ?? "inherit"}
+              disabled={form[`source_${name}_enabled`] !== "true"}
+              onChange={set(`source_${name}_proxy_mode`)}
+            >
+              <option value="inherit">Direct source requests; use content toggle for images</option>
+              <option value="all">Proxy all source requests and images</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label htmlFor={`${name}-proxy-url`}>{SOURCE_LABELS[name]} proxy URL</label>
+            <input
+              id={`${name}-proxy-url`} type="password" autoComplete="new-password"
+              autoCapitalize="none" autoCorrect="off" placeholder="http://proxy.example:8080"
+              disabled={form[`source_${name}_enabled`] !== "true"}
+              required={form[`source_${name}_proxy_mode`] === "all" && form[`source_${name}_enabled`] === "true"}
+              value={form[`source_${name}_proxy_url`] ?? ""}
+              onChange={set(`source_${name}_proxy_url`)}
+            />
+          </div>
+        </div>
+      ))}
+      <p className="section-hint">
+        All requests uses only the source URL above, including images, and fails closed if it
+        is missing or unavailable. Saving changes affects new requests and jobs; an active
+        download keeps its original route. Disabled sources retain their settings.
       </p>
     </div>
   );
@@ -645,25 +699,27 @@ export default function Settings() {
             <div className="form-row">
               <label>Content proxy URL</label>
               <input
-                type="text"
+                type="password"
+                autoComplete="new-password"
                 inputMode="url"
                 autoCapitalize="none"
                 autoCorrect="off"
-                placeholder="http://192.168.1.28:8888"
+                placeholder="http://proxy.example:8080"
                 value={form.download_proxy_url ?? ""}
                 onChange={set("download_proxy_url")}
               />
             </div>
             <p className="section-hint">
-              Proxy applies only to chapter page/image downloads for checked sources. Discovery,
-              metadata, authentication, and page manifests remain direct. Checked sources fail
-              closed instead of retrying directly when the proxy is unavailable.
+              The shared proxy applies to chapter page/image downloads for checked sources. Other
+              requests stay direct unless all requests is selected below. Proxy failures never
+              retry directly.
             </p>
           </div>
           <SourcePriority form={form} setForm={setForm} />
         </div>
 
         <ProxySettings form={form} setForm={setForm} set={set} />
+        <SourceRequestProxySettings form={form} set={set} />
 
         <div className="settings-section">
           <h3>MangaDex Account</h3>

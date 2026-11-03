@@ -305,6 +305,33 @@ exposing integration credentials. ComicInfo metadata larger than 1 MiB is
 ignored during matching/scanning, as is metadata compressed with methods other
 than ZIP STORED or DEFLATE. The archive's normal filename/page matching continues.
 
+### Source proxies
+
+The shared **Content proxy URL** and source **Proxy** toggles route only chapter
+image bytes. Search, metadata, and page manifests stay direct by default;
+upgrading preserves these settings and routes.
+
+Under **Settings → Source request proxies**, MangaFire and WeebCentral each
+have an independent HTTP(S) proxy URL and routing selector. Choose **Proxy all
+source requests and images** to explicitly route that source's search, chapter
+metadata, page manifests, and images through its URL. MangaFire's frontend,
+JavaScript retrieval, and token generation use that same route. This mode
+overrides the shared content proxy and toggle for that source. Other sources
+retain their existing content-only proxy support.
+
+Proxy routes fail closed: missing or unreachable proxies produce an error,
+without retrying directly. Disabled sources keep their routing requirements;
+re-enabling a source requires its selected proxy URL. Saved proxy URLs are
+masked because they may contain credentials. To replace a saved URL, enter
+the complete address; to remove it, clear the field and select the default
+routing mode (also clear the content toggle if direct images are wanted).
+Settings changes apply to new requests/jobs. An active download keeps the
+route it started with, including its page manifest and images.
+
+WeebCentral sends browser-compatible HTML request headers. Neither headers
+nor a proxy guarantee access: HTTP 403 can still depend on site policy and
+network conditions. Mangarr does not solve challenges or bypass access controls.
+
 ## How grabbing works
 
 1. When you add a series, mangarr links it to each enabled source by title
@@ -319,7 +346,7 @@ than ZIP STORED or DEFLATE. The archive's normal filename/page matching continue
    seeders, and size. The selected release goes to qBittorrent under the
    `mangarr` category and is imported when complete.
 
-Please be a good citizen: keep the honest User-Agent, don't lower the rate
+Please be a good citizen: respect source access controls, don't lower the rate
 limits, and use a MangaDex account so their team can see the traffic is
 legitimate.
 

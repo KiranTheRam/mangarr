@@ -112,6 +112,7 @@ class MangaFireSigner:
         self._module_url = ""
         self._loaded_at = 0.0
         self._lock = asyncio.Lock()
+        self._sign_lock = asyncio.Lock()
 
     def invalidate(self) -> None:
         """Forget the loaded module (e.g. after the API rejected a token)."""
@@ -121,17 +122,19 @@ class MangaFireSigner:
     async def sign(
         self, client: httpx.AsyncClient, path: str, params: dict | None = None
     ) -> str:
-        context = await self._ensure_loaded(client)
-        expr = f"{TOKEN_FUNCTION}({json.dumps(path)}, {json.dumps(dict(params or {}))})"
-        try:
-            token = await _run(context, expr)
-        except Exception as exc:
-            self.invalidate()
-            raise MangaFireTokenError(f"MangaFire signing failed: {exc}") from exc
-        if not isinstance(token, str) or not token:
-            self.invalidate()
-            raise MangaFireTokenError("MangaFire signing returned no token")
-        return token
+        # A shared isolate must finish one token before evaluating the next.
+        async with self._sign_lock:
+            context = await self._ensure_loaded(client)
+            expr = f"{TOKEN_FUNCTION}({json.dumps(path)}, {json.dumps(dict(params or {}))})"
+            try:
+                token = await _run(context, expr)
+            except Exception as exc:
+                self.invalidate()
+                raise MangaFireTokenError(f"MangaFire signing failed: {exc}") from exc
+            if not isinstance(token, str) or not token:
+                self.invalidate()
+                raise MangaFireTokenError("MangaFire signing returned no token")
+            return token
 
     async def _ensure_loaded(self, client: httpx.AsyncClient) -> MiniRacer:
         async with self._lock:
@@ -146,9 +149,23 @@ class MangaFireSigner:
         try:
             url, source = await self._find_module(client)
         except httpx.HTTPError as exc:
-            raise MangaFireTokenError(
-                f"could not fetch MangaFire's frontend: {exc}"
-            ) from exc
+            detail = (
+                f"HTTP {exc.response.status_code}"
+                if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            )
+            message = (
+                f"could not fetch MangaFire's frontend ({detail}); "
+                "check source routing and site availability"
+            )
+            # Keep retry classification without retaining proxy credentials in
+            # an exception message or the displayed cause chain.
+            if isinstance(exc, httpx.HTTPStatusError):
+                cause = httpx.HTTPStatusError(
+                    message, request=exc.request, response=exc.response
+                )
+            else:
+                cause = httpx.TransportError(message)
+            raise MangaFireTokenError(message) from cause
         context = MiniRacer()
         context.set_hard_memory_limit(MAX_MEMORY_BYTES)
         try:

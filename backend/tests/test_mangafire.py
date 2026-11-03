@@ -55,7 +55,6 @@ async def test_search_series_uses_json_api():
         ("z2ol", "Assassination Classroom")
     ]
     assert results[0].url.endswith("/title/z2ol-assassination-classroom")
-    await source._client.aclose()
 
 
 @respx.mock
@@ -99,7 +98,6 @@ async def test_list_chapters_keeps_decimals_and_prefers_first_edition():
     assert chapters[2].title == ""
     assert chapters[3].title == "Crossover"
     assert route.call_count == 2
-    await source._client.aclose()
 
 
 @respx.mock
@@ -112,7 +110,6 @@ async def test_get_pages_reads_reader_payload():
     )
     source = MangaFireSource(signer=StubSigner())
     assert await source.get_pages("10") == ["https://cdn/1.jpg", "https://cdn/2.jpg"]
-    await source._client.aclose()
 
 
 @respx.mock
@@ -127,7 +124,6 @@ async def test_api_calls_carry_a_vrf_token():
     assert signer.signed == [("/titles", {"keyword": "Berserk"})]
     assert route.calls.last.request.url.params["vrf"] == "vrf-1"
     assert route.calls.last.request.url.params["keyword"] == "Berserk"
-    await source._client.aclose()
 
 
 @respx.mock
@@ -143,7 +139,6 @@ async def test_rejected_token_reloads_signer_and_retries_once():
     assert await source.get_pages("10") == ["https://cdn/1.jpg"]
     assert signer.invalidated == 1
     assert [call.request.url.params["vrf"] for call in route.calls] == ["vrf-1", "vrf-2"]
-    await source._client.aclose()
 
 
 @respx.mock
@@ -157,7 +152,6 @@ async def test_other_403s_are_not_retried():
     with pytest.raises(httpx.HTTPStatusError):
         await source.get_pages("10")
     assert route.call_count == 1 and signer.invalidated == 0
-    await source._client.aclose()
 
 
 # A stand-in for the site's signing module: it depends on the same browser
