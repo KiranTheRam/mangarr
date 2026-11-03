@@ -30,7 +30,7 @@ initClient()
     const message = err instanceof Error ? err.message : String(err);
     ReactDOM.createRoot(rootEl).render(
       <div style={{ padding: 40, fontFamily: "sans-serif", color: "#e1e2e6" }}>
-        <h2>Mangarr backend unreachable</h2>
+        <h2>Mangarr could not start</h2>
         <p>{message}</p>
       </div>,
     );
