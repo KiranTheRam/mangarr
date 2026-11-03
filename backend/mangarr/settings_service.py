@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Setting
+from .sources.routing import SOURCE_PROXY_NAMES, validate_proxy_url
 
 CONTENT_SOURCE_NAMES = (
     "mangaplus",
@@ -70,6 +71,11 @@ DEFAULTS: dict[str, str] = {
     # discovery, metadata, authentication, and page manifests stay direct.
     "download_proxy_url": "",
     **{f"source_{name}_proxy_enabled": "false" for name in CONTENT_SOURCE_NAMES},
+    # Explicit opt-in for broader routing. "inherit" preserves the existing
+    # content-only controls; "all" uses this source's URL for every request,
+    # including signing, discovery, metadata, manifests, and image bytes.
+    **{f"source_{name}_proxy_mode": "inherit" for name in SOURCE_PROXY_NAMES},
+    **{f"source_{name}_proxy_url": "" for name in SOURCE_PROXY_NAMES},
     # Jobs
     "monitor_interval_minutes": "60",
     # Finished series whose monitored chapters are all on disk: "keep"
@@ -100,7 +106,8 @@ DEFAULTS: dict[str, str] = {
 
 SECRET_KEYS = {
     "mangadex_client_secret", "mangadex_password", "qbittorrent_password",
-    "webhook_secret", "kavita_api_key",
+    "webhook_secret", "kavita_api_key", "download_proxy_url",
+    *{f"source_{name}_proxy_url" for name in SOURCE_PROXY_NAMES},
 }
 
 
@@ -109,7 +116,6 @@ def validate(values: dict[str, str]) -> None:
     template fails every download at rename time, and a non-numeric monitor
     interval would abort scheduler startup. Raises ValueError."""
     from .library.naming import chapter_filename
-    from urllib.parse import urlsplit
 
     for key in ("naming_template", "naming_template_no_volume"):
         if key not in values:
@@ -155,12 +161,20 @@ def validate(values: dict[str, str]) -> None:
                 "finished_series_mode must be one of " + ", ".join(FINISHED_SERIES_MODES)
             )
 
-    if "download_proxy_url" in values and values["download_proxy_url"]:
-        parsed = urlsplit(values["download_proxy_url"])
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError(
-                "download_proxy_url must be a valid http:// or https:// proxy URL"
-            )
+    for key in ("download_proxy_url", *(f"source_{name}_proxy_url" for name in SOURCE_PROXY_NAMES)):
+        if values.get(key):
+            validate_proxy_url(values[key], key)
+    for name in SOURCE_PROXY_NAMES:
+        mode_key = f"source_{name}_proxy_mode"
+        mode = values.get(mode_key, "inherit")
+        if mode not in {"inherit", "all"}:
+            raise ValueError(f"{mode_key} must be inherit or all")
+        if (
+            mode == "all"
+            and values.get(f"source_{name}_enabled", DEFAULTS[f"source_{name}_enabled"]) == "true"
+            and not values.get(f"source_{name}_proxy_url")
+        ):
+            raise ValueError(f"source_{name}_proxy_url is required for all source requests")
 
     proxy_enabled = any(
         values.get(
@@ -168,6 +182,7 @@ def validate(values: dict[str, str]) -> None:
             DEFAULTS[f"source_{name}_enabled"],
         ) == "true"
         and values.get(f"source_{name}_proxy_enabled") == "true"
+        and values.get(f"source_{name}_proxy_mode", "inherit") != "all"
         for name in CONTENT_SOURCE_NAMES
     )
     if proxy_enabled and not values.get("download_proxy_url"):

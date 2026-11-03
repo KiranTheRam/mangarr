@@ -12,6 +12,7 @@ from .. import USER_AGENT
 from ..library.matcher import archive_page_signature, page_bytes_signature
 from ..models import Chapter, Series
 from ..sources.base import DirectSource
+from ..sources.routing import validate_proxy_url
 from .cbz import build_comicinfo, guess_extension, write_cbz
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,9 @@ async def download_chapter_to_cbz(
         # can only happen if the database was edited outside the settings API.
         raise RuntimeError(f"{source.name} content proxy is enabled but has no URL")
 
+    if proxy_enabled:
+        validate_proxy_url(proxy_url, f"{source.name} content proxy")
+
     page_urls = await source.get_pages(chapter_external_id)
     if not page_urls:
         raise RuntimeError(f"{source.name} returned no pages for chapter {chapter.number}")
@@ -124,6 +128,24 @@ async def download_chapter_to_cbz(
                         break
                     except Exception as exc:
                         if attempt == 2:
+                            if proxy_enabled and isinstance(exc, httpx.HTTPError):
+                                # Proxy errors can include the address and userinfo.
+                                detail = (
+                                    f"HTTP {exc.response.status_code}"
+                                    if isinstance(exc, httpx.HTTPStatusError)
+                                    else type(exc).__name__
+                                )
+                                message = (
+                                    f"page {i + 1} failed through configured proxy "
+                                    f"({detail}); no direct fallback"
+                                )
+                                if isinstance(exc, httpx.HTTPStatusError):
+                                    cause = httpx.HTTPStatusError(
+                                        message, request=exc.request, response=exc.response
+                                    )
+                                else:
+                                    cause = httpx.TransportError(message)
+                                raise RuntimeError(message) from cause
                             raise RuntimeError(f"page {i + 1} failed: {exc}") from exc
                         await asyncio.sleep(2 * (attempt + 1))
             done += 1

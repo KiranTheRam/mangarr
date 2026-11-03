@@ -17,6 +17,7 @@ from .. import USER_AGENT
 from ..util import RateLimiter, rl_request
 from ._mangafire_vrf import MangaFireSigner
 from .base import DirectSource, SourceChapter, SourceSeries
+from .routing import route_for, source_client
 
 BASE_URL = "https://mangafire.to"
 API_URL = f"{BASE_URL}/api"
@@ -74,33 +75,40 @@ class MangaFireSource(DirectSource):
         signer: MangaFireSigner | None = None,
     ) -> None:
         self._signer = signer or MangaFireSigner(BASE_URL)
-        self._client = client or httpx.AsyncClient(
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{BASE_URL}/",
-            },
-            timeout=60,
-            trust_env=False,
-            follow_redirects=True,
-        )
+        self._signer_route = (False, "")
+        self._client = client
+        self._headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{BASE_URL}/",
+        }
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        response = await self._signed_get(path, params)
-        if _token_rejected(response):
-            # the site shipped a new build (new signing keys) since the
-            # module was loaded; reload it and try once more
-            self._signer.invalidate()
-            response = await self._signed_get(path, params)
-        response.raise_for_status()
-        return response.json()
+        route = route_for(self.name)
+        key = (True, route.proxy_url) if route and route.all_requests else (False, "")
+        if key != self._signer_route:
+            # Keep only the current cache. In-flight calls hold their own signer,
+            # so changing route neither invalidates them nor reuses old keys.
+            self._signer = MangaFireSigner(BASE_URL)
+            self._signer_route = key
+        signer = self._signer
+        async with source_client(self.name, self._headers, self._client) as client:
+            response = await self._signed_get(client, signer, path, params)
+            if _token_rejected(response):
+                signer.invalidate()
+                response = await self._signed_get(client, signer, path, params)
+            response.raise_for_status()
+            return response.json()
 
-    async def _signed_get(self, path: str, params: dict | None) -> httpx.Response:
+    async def _signed_get(
+        self, client: httpx.AsyncClient, signer: MangaFireSigner,
+        path: str, params: dict | None,
+    ) -> httpx.Response:
         query = dict(params or {})
-        query["vrf"] = await self._signer.sign(self._client, path, params)
+        query["vrf"] = await signer.sign(client, path, params)
         return await rl_request(
-            self._client, "GET", f"{API_URL}{path}", limiter=_limiter, params=query
+            client, "GET", f"{API_URL}{path}", limiter=_limiter, params=query
         )
 
     def image_headers(self) -> dict:

@@ -9,9 +9,9 @@ import re
 import httpx
 from bs4 import BeautifulSoup
 
-from .. import USER_AGENT
 from ..util import RateLimiter, parse_chapter_number, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
+from .routing import source_client
 
 BASE_URL = "https://weebcentral.com"
 SERIES_URL_RE = re.compile(r"/series/([A-Z0-9]+)")
@@ -30,19 +30,25 @@ class WeebCentralSource(DirectSource):
     image_limiter = _image_limiter
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        self._client = client or httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT, "Referer": f"{BASE_URL}/"},
-            timeout=60,
-            trust_env=False,
-            follow_redirects=True,
-        )
+        self._client = client
+        self._headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{BASE_URL}/",
+        }
 
     def image_headers(self) -> dict:
         return {"Referer": f"{BASE_URL}/"}
 
     async def _get_html(self, url: str, params: dict | None = None) -> BeautifulSoup:
-        resp = await rl_request(self._client, "GET", url, limiter=_limiter, params=params)
-        resp.raise_for_status()
+        async with source_client(self.name, self._headers, self._client) as client:
+            resp = await rl_request(client, "GET", url, limiter=_limiter, params=params)
+            resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
 
     async def search_series(self, query: str) -> list[SourceSeries]:
