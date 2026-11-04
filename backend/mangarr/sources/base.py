@@ -14,6 +14,8 @@ class SourceSeries:
     title: str
     url: str = ""
     alt_titles: list[str] = field(default_factory=list)
+    cover_url: str = ""
+    description: str = ""
 
 
 @dataclass
@@ -100,6 +102,10 @@ class DirectSource(ABC):
 
     @abstractmethod
     async def search_series(self, query: str) -> list[SourceSeries]: ...
+
+    async def get_series_details(self, external_id: str) -> SourceSeries | None:
+        """Optional series metadata supplied by a download source."""
+        return None
 
     @abstractmethod
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:

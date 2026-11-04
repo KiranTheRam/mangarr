@@ -296,6 +296,8 @@ export interface SourceCandidate {
   title: string;
   url: string;
   alt_titles: string[];
+  cover_url: string;
+  description: string;
 }
 
 export interface SeriesFolder {

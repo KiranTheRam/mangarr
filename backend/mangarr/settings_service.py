@@ -13,6 +13,7 @@ CONTENT_SOURCE_NAMES = (
     "mangafire",
     "weebcentral",
     "atsumaru",
+    "fanfox",
     "tcbscans",
     "asura",
 )
@@ -29,7 +30,7 @@ DEFAULTS: dict[str, str] = {
     # Source priority: comma-separated source names, first = preferred.
     # Official sources first, then fast scanlation sources (tcbscans) ahead
     # of archive sources so new chapters are grabbed as soon as they appear.
-    "source_priority": "mangaplus,webtoons,tcbscans,mangadex,mangafire,weebcentral,atsumaru,asura,viz,wikipedia,nyaa",
+    "source_priority": "mangaplus,webtoons,tcbscans,mangadex,mangafire,weebcentral,atsumaru,asura,fanfox,viz,wikipedia,nyaa",
     # MangaDex credentials (personal API client)
     "mangadex_client_id": "",
     "mangadex_client_secret": "",
@@ -60,6 +61,7 @@ DEFAULTS: dict[str, str] = {
     "source_mangafire_enabled": "true",
     "source_weebcentral_enabled": "true",
     "source_atsumaru_enabled": "true",
+    "source_fanfox_enabled": "false",
     # Official WEBTOON Originals; only currently-free episodes are listed
     "source_webtoons_enabled": "true",
     "source_tcbscans_enabled": "true",

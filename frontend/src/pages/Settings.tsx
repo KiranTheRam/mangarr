@@ -164,6 +164,7 @@ const SOURCE_HINTS: Record<string, string> = {
   mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
   webtoons: "Official WEBTOON Originals. Only episodes that are currently free (no coins) are listed.",
   mangafire: "Broad English archive coverage, including many bonus and decimal chapters.",
+  fanfox: "Public English chapters, including numbered extras. Some listings are unavailable in the reader.",
   atsumaru: "Broad archive of manga, manhwa, and manhua; picks the best-rated scanlation of each chapter.",
   viz: "Exact printed-volume mappings for VIZ-licensed series; does not download chapters.",
   wikipedia: "Chapter titles and printed-volume tables for publishers not covered by VIZ.",
@@ -177,6 +178,7 @@ const CONTENT_SOURCES = new Set([
   "mangafire",
   "weebcentral",
   "atsumaru",
+  "fanfox",
   "tcbscans",
   "asura",
 ]);

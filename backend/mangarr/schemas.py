@@ -476,6 +476,8 @@ class SourceCandidateOut(BaseModel):
     title: str
     url: str = ""
     alt_titles: list[str] = []
+    cover_url: str = ""
+    description: str = ""
 
 
 class SourceLinkIn(BaseModel):
