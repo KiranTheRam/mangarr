@@ -340,6 +340,15 @@ are preserved. Existing library files and torrent imports are never recompressed
 Each active download snapshots the saved policy when the worker starts; changes
 apply to subsequent downloads.
 
+The live sample preview compares the original image with output from the same
+encoder used by downloads. Drag the quality slider or change format/width to see
+updated image bytes, dimensions and file-size savings without saving settings or
+starting a download. Use **View at actual size (100%)** and scroll each image to
+inspect fine text and artwork. The built-in sample is generated locally and
+contains text, line art, halftones and color gradients; it never fetches external
+images or modifies library files. With optimization off, both views show the
+original image. Savings on the sample do not predict every chapter's savings.
+
 - Choose lossy **WebP** (default) or **JPEG**, with quality **1–100** (default **85**).
   Even quality 100 is lossy. Savings depend on the source; inspect fine text, line
   art and gradients before choosing a lower quality. Some readers support JPEG

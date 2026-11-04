@@ -17,6 +17,10 @@ test("optimization is off with disabled controls for existing installations", ()
     assert.match(tag(html, id), /disabled=""/);
   assert.match(tag(html, "image-quality"), /value="85"/);
   assert.match(tag(html, "image-width"), /value="0"/);
+  assert.match(html, /Original quality is the default/);
+  assert.match(html, /Original quality \(default\)/);
+  assert.match(html, /Optimization is off/);
+  assert.match(html, /aria-label="Quality slider"[^>]*disabled=""/);
 });
 
 test("enabled controls expose limits, saved policy and resize precedence", () => {
@@ -28,4 +32,8 @@ test("enabled controls expose limits, saved policy and resize precedence", () =>
   assert.match(html, /unless resizing is required/);
   assert.match(html, /settings saved when it starts/);
   assert.match(html, /even 100 is lossy/);
+  assert.match(html, /Live quality preview/);
+  assert.match(html, /View at actual size \(100%\)/);
+  assert.match(html, /Changes update automatically without saving/);
+  assert.doesNotMatch(html.match(/<input[^>]*aria-label="Quality slider"[^>]*>/)?.[0] ?? "", /disabled=/);
 });

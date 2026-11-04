@@ -3,9 +3,11 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 from weakref import WeakKeyDictionary
+from typing import TypeVar
 
 from PIL import Image, ImageOps, features
 
@@ -17,6 +19,7 @@ MAX_PIXELS = 20_000_000
 MAX_INPUT_BYTES = 32 * 1024 * 1024
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="page-optimizer")
 _slots: WeakKeyDictionary = WeakKeyDictionary()
+_Result = TypeVar("_Result")
 
 
 @dataclass(frozen=True)
@@ -121,10 +124,15 @@ def optimize_page(data: bytes, policy: ImageOptimization) -> bytes:
 async def optimize_page_async(data: bytes, policy: ImageOptimization) -> bytes:
     if not policy.enabled:
         return data
+    return await run_image_work(optimize_page, data, policy)
+
+
+async def run_image_work(function: Callable[..., _Result], *args) -> _Result:
+    """Share the bounded image worker with the Settings sample renderer."""
     loop = asyncio.get_running_loop()
     slot = _slots.setdefault(loop, asyncio.Semaphore(1))
     async with slot:
-        future = loop.run_in_executor(_executor, optimize_page, data, policy)
+        future = loop.run_in_executor(_executor, function, *args)
         # Cancelling a Future cannot stop a running codec. Keep the slot until
         # it exits, so repeated cancellations cannot accumulate decoded pages.
         try:

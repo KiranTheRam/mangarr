@@ -7,6 +7,7 @@ import type {
   RootFolder,
   Settings as SettingsType,
 } from "../api/types";
+import { ImageOptimizationPreview } from "../components/ImageOptimizationPreview";
 import { FolderBrowser } from "../components/FolderBrowser";
 import { ErrorNotice, Spinner, Toggle, Toolbar } from "../components/common";
 import { SOURCE_LABELS } from "../sources";
@@ -576,9 +577,9 @@ export function ImageOptimizationSettings({ form, setForm }: {
     <div className="settings-section">
       <h3>Chapter Image Optimization</h3>
       <p className="section-hint">
-        Reduce storage for new direct downloads using lossy compression. Existing files and
-        torrent imports are unchanged. Off keeps the original image bytes. Each download uses
-        the settings saved when it starts.
+        Original quality is the default. Turn on optimization to reduce storage for new direct
+        downloads using lossy compression. Existing files and torrent imports are unchanged.
+        Off keeps the original image bytes. Each download uses the settings saved when it starts.
       </p>
       <div className="form-row">
         <label>Optimize downloaded images</label>
@@ -596,9 +597,14 @@ export function ImageOptimizationSettings({ form, setForm }: {
       </div>
       <div className="form-row">
         <label htmlFor="image-quality">Quality (1–100)</label>
-        <input id="image-quality" type="number" min="1" max="100" step="1"
-          value={form.image_optimization_quality ?? "85"} disabled={!enabled}
-          onChange={change("image_optimization_quality")} aria-describedby="image-quality-hint" />
+        <div className="image-quality-controls">
+          <input aria-label="Quality slider" type="range" min="1" max="100" step="1"
+            value={form.image_optimization_quality || "85"} disabled={!enabled}
+            onChange={change("image_optimization_quality")} aria-describedby="image-quality-hint" />
+          <input id="image-quality" type="number" min="1" max="100" step="1"
+            value={form.image_optimization_quality ?? "85"} disabled={!enabled}
+            onChange={change("image_optimization_quality")} aria-describedby="image-quality-hint" />
+        </div>
       </div>
       <p id="image-quality-hint" className="section-hint">
         Higher quality usually uses more space. 85 is a starting point; even 100 is lossy.
@@ -617,6 +623,7 @@ export function ImageOptimizationSettings({ form, setForm }: {
         pages original. The width limit applies only to pages that can be safely optimized.
         See the logs for skipped pages.
       </p>
+      <ImageOptimizationPreview form={form} />
     </div>
   );
 }
