@@ -941,7 +941,7 @@ export default function SeriesDetail() {
                   Downloaded
                 </span>
               ) : ch.available_sources === null ? (
-                <span className="pill gray" title="Direct-source availability has not been refreshed yet">
+                <span className="pill gray" title="Direct-source availability has not been confirmed">
                   Missing
                 </span>
               ) : ch.available_sources ? (

@@ -136,6 +136,13 @@ async def remove_many_from_queue(
     return QueueRemoveOut(removed=await _remove_downloads(session, body.ids))
 
 
+async def _verify_direct_availability(source_name: str, external_id: str) -> None:
+    source = registry.DIRECT_SOURCES.get(source_name)
+    if getattr(source, "requires_chapter_verification", False):
+        if external_id not in await source.verify_chapters([external_id]):
+            raise HTTPException(409, f"{source_name} could not verify that this chapter is available")
+
+
 @router.post("/queue/{download_id}/retry", response_model=QueueItemOut)
 async def retry_failed_download(
     download_id: int, session: AsyncSession = Depends(get_session)
@@ -161,6 +168,10 @@ async def retry_failed_download(
             raise HTTPException(502, f"qBittorrent error: {exc}") from exc
         dl.status = DownloadStatus.DOWNLOADING
     else:
+        source = registry.DIRECT_SOURCES.get(dl.source_name)
+        if getattr(source, "requires_chapter_verification", False):
+            await registry.apply_settings(session)
+            await _verify_direct_availability(dl.source_name, dl.payload)
         dl.status = DownloadStatus.QUEUED
 
     dl.progress = 0.0
@@ -190,6 +201,7 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
         if chapter is None or chapter.excluded:
             raise HTTPException(404, "Chapter not found")
         series = await session.get(Series, chapter.series_id)
+        await _verify_direct_availability(body.source_name, body.external_id)
         dl = await enqueue_direct(
             session, series, chapter, body.source_name, body.external_id, group=body.group
         )

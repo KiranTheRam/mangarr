@@ -112,6 +112,16 @@ class DirectSource(ABC):
         """Chapters the source serves. May hold several copies of one chapter
         number (one per scanlation group), best first."""
 
+    # Catalog-only chapter lists need an explicit reader check before they
+    # can be advertised as downloadable.
+    requires_chapter_verification: bool = False
+
+    async def verify_chapters(
+        self, external_ids: list[str], *, max_checks: int | None = 60,
+    ) -> set[str]:
+        """Return the chapter IDs that can be offered as direct releases."""
+        return set(external_ids)
+
     @abstractmethod
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         """Returns ordered page image URLs."""

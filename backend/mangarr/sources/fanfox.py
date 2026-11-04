@@ -1,15 +1,19 @@
 """FanFox's public mobile catalog and HTML reader."""
 
+import logging
 import re
+import time
+from collections import OrderedDict
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
 
 from .. import USER_AGENT
+from ..download.cbz import guess_extension
 from ..util import RateLimiter, normalize_title, rl_request
 from .base import DirectSource, SourceChapter, SourceSeries
-from .routing import source_client
+from .routing import source_client, validate_proxy_url
 
 BASE_URL = "https://m.fanfox.net"
 SLUG = r"[a-z0-9_][a-z0-9_-]{0,199}"
@@ -21,6 +25,11 @@ CHAPTER_ID = re.compile(
 CHAPTER_LABEL = re.compile(r"Ch\s+([0-9]+(?:\.[0-9]+)?)(?:\s+(.*))?")
 READER_IDS = re.compile(r"\bvar\s+(chapter_id|series_page)\s*=\s*([0-9]+)\s*;")
 MAX_PAGES = 300
+AVAILABLE_TTL = 120
+UNAVAILABLE_TTL = 6 * 60 * 60
+AVAILABILITY_CACHE_SIZE = 4096
+
+log = logging.getLogger(__name__)
 
 _limiter = RateLimiter(rate=2)
 _image_limiter = RateLimiter(rate=3)
@@ -49,18 +58,23 @@ def _cdn_url(src: str, host: str) -> str:
 class FanFoxSource(DirectSource):
     name = "fanfox"
     image_limiter = _image_limiter
+    requires_chapter_verification = True
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client
+        self._availability: OrderedDict[tuple[str, str | None], tuple[float, bool]] = OrderedDict()
 
     def image_headers(self) -> dict:
         # The browser sends the mobile reader origin to the cross-origin CDN.
         return {"Referer": f"{BASE_URL}/"}
 
-    async def _get_html(self, client: httpx.AsyncClient, path: str, params: dict | None = None) -> BeautifulSoup:
+    async def _get_html(
+        self, client: httpx.AsyncClient, path: str, params: dict | None = None,
+        *, retries: int = 4, timeout: float = 60,
+    ) -> BeautifulSoup:
         resp = await rl_request(
             client, "GET", f"{BASE_URL}{path}", limiter=_limiter,
-            params=params, follow_redirects=False,
+            params=params, follow_redirects=False, retries=retries, timeout=timeout,
         )
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
@@ -169,6 +183,98 @@ class FanFoxSource(DirectSource):
             raise ValueError(f"FanFox reader returned the wrong page for page {page}")
         return ids["chapter_id"], image_url
 
+    @staticmethod
+    def _page_paths(first: BeautifulSoup, root: str) -> list[str]:
+        manifest = first.select("select.mangaread-page option")
+        paths = [_site_path(option.get("value", "")) for option in manifest]
+        if (
+            not 1 <= len(paths) <= MAX_PAGES
+            or any(path != f"{root}{i}.html" for i, path in enumerate(paths, 1))
+        ):
+            raise ValueError("FanFox reader returned an invalid page list")
+        return paths
+
+    async def _probe_chapter(
+        self, reader: httpx.AsyncClient, images: httpx.AsyncClient, external_id: str,
+    ) -> bool | None:
+        root = f"/manga/{external_id}/"
+        try:
+            first = await self._get_html(reader, f"{root}1.html", retries=0, timeout=8)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (404, 410):
+                return False
+            raise
+        if "licensed and not available" in first.get_text(" ", strip=True).casefold():
+            return False
+        try:
+            _, image = self._reader_page(first, 1)
+            self._page_paths(first, root)
+        except ValueError:
+            # Unexpected HTML or an invalid manifest can be temporary.
+            return None
+
+        if self.image_limiter is not None:
+            await self.image_limiter.acquire()
+        headers = {**self.image_headers(), "Range": "bytes=0-31"}
+        async with images.stream("GET", image, headers=headers) as response:
+            if response.status_code == 429 or response.status_code >= 500:
+                response.raise_for_status()
+            if response.status_code not in (200, 206):
+                return None
+            prefix = await anext(response.aiter_bytes(chunk_size=32), b"")
+        return True if guess_extension(prefix, fallback="") else None
+
+    async def verify_chapters(
+        self, external_ids: list[str], *, max_checks: int | None = 60,
+    ) -> set[str]:
+        if not external_ids:
+            return set()
+        proxy = None
+        if self.content_proxy_enabled:
+            proxy = self.content_proxy_url
+            try:
+                validate_proxy_url(proxy, "FanFox content proxy")
+            except ValueError:
+                log.warning("Cannot verify FanFox chapters: invalid content proxy")
+                return set()
+
+        available = set()
+        pending = []
+        now = time.monotonic()
+        for external_id in dict.fromkeys(external_ids):
+            key = (external_id, proxy)
+            cached = self._availability.get(key)
+            if cached and cached[0] > now:
+                self._availability.move_to_end(key)
+                if cached[1]:
+                    available.add(external_id)
+            elif CHAPTER_ID.fullmatch(external_id):
+                pending.append(key)
+        if not pending:
+            return available
+
+        async with self._client_context() as reader, httpx.AsyncClient(
+            headers={"User-Agent": USER_AGENT}, timeout=8, trust_env=False, proxy=proxy,
+        ) as images:
+            for key in pending[:max_checks]:
+                try:
+                    result = await self._probe_chapter(reader, images, key[0])
+                except httpx.HTTPError as exc:
+                    # Stop this batch on transport failures or rate limits.
+                    # Unverified releases stay hidden and can be checked again.
+                    log.warning("FanFox availability check failed (%s)", type(exc).__name__)
+                    break
+                if result is None:
+                    continue
+                ttl = AVAILABLE_TTL if result else UNAVAILABLE_TTL
+                self._availability[key] = (time.monotonic() + ttl, result)
+                self._availability.move_to_end(key)
+                if len(self._availability) > AVAILABILITY_CACHE_SIZE:
+                    self._availability.popitem(last=False)
+                if result:
+                    available.add(key[0])
+        return available
+
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         if not CHAPTER_ID.fullmatch(chapter_external_id):
             raise ValueError("Invalid FanFox chapter ID")
@@ -176,14 +282,7 @@ class FanFoxSource(DirectSource):
         async with self._client_context() as client:
             first = await self._get_html(client, f"{root}1.html")
             chapter_id, image = self._reader_page(first, 1)
-            manifest = first.select("select.mangaread-page option")
-            paths = [_site_path(option.get("value", "")) for option in manifest]
-            if (
-                not 1 <= len(paths) <= MAX_PAGES
-                or any(path != f"{root}{i}.html" for i, path in enumerate(paths, 1))
-            ):
-                raise ValueError("FanFox reader returned an invalid page list")
-
+            paths = self._page_paths(first, root)
             images = [image]
             for page, path in enumerate(paths[1:], 2):
                 soup = await self._get_html(client, path)

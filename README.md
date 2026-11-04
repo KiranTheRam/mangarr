@@ -40,7 +40,7 @@ design; it is the automation half of your manga stack.
   - **MangaFire** (API) — broad English archive and an additional direct source
     for decimal-numbered bonus and special chapters.
   - **FanFox** (scraper, opt-in) — public mobile reader, including numbered extras.
-    Some listed chapters are unavailable in the reader.
+    Mangarr checks the public reader and its first image before offering a release.
   - **WeebCentral** (scraper) — broad catalog, no account needed.
   - **Atsumaru** (API) — broad archive of manga, manhwa, and manhua. Where
     several groups translated a chapter, the best-rated one is used. Recent

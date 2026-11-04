@@ -197,7 +197,7 @@ async def search_releases(
                 # the open-ended search shows the release a grab would take;
                 # a scoped one lists every group's copy to choose from
                 source_chapters = select_for_series(source_chapters, series)
-            added_for_source = 0
+            candidates = []
             for sc in source_chapters:
                 if (src.name, sc.external_id) in direct_seen:
                     continue
@@ -211,6 +211,20 @@ async def search_releases(
                     local_chapter = local_chapters.get(sc.number)
                     if local_chapter is None or local_chapter.downloaded:
                         continue
+                candidates.append((sc, local_chapter))
+            verified = None
+            if getattr(src, "requires_chapter_verification", False):
+                verified = await src.verify_chapters(
+                    [sc.external_id for sc, _ in candidates],
+                    max_checks=60 if selected is None else None,
+                )
+            added_for_source = 0
+            for sc, local_chapter in candidates:
+                if (
+                    (src.name, sc.external_id) in direct_seen
+                    or (verified is not None and sc.external_id not in verified)
+                ):
+                    continue
                 direct_seen.add((src.name, sc.external_id))
                 out.append(
                     ReleaseOut(

@@ -156,3 +156,25 @@ async def test_search_without_a_target_is_rejected(db_session, fake_sources):
         await search.search_releases(session=db_session)
 
     assert exc.value.status_code == 422
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_release_search_omits_unverified_chapters(
+    db_session, fake_sources, monkeypatch, scoped,
+):
+    series = await _series(db_session, downloaded_numbers=(4.0,))
+    checked = []
+
+    async def verify(ids, *, max_checks):
+        checked.extend(ids)
+        return {"c2"}
+
+    monkeypatch.setattr(fake_sources, "requires_chapter_verification", True, raising=False)
+    monkeypatch.setattr(fake_sources, "verify_chapters", verify, raising=False)
+    requested = [c.id for c in series.chapters if c.number in (2, 3)] if scoped else []
+    releases = await search.search_releases(
+        series_id=series.id, chapter_id=requested, session=db_session,
+    )
+
+    assert checked == (["c2", "c3"] if scoped else ["c1", "c2", "c3"])
+    assert _numbers(releases) == [2.0]
