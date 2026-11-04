@@ -84,8 +84,7 @@ docker compose up -d
 The default Compose file runs the published `kirantheram/mangarr:latest`
 Docker Hub image and stores configuration and media under `./data`. Open
 <http://localhost:6996> after it starts.
-Follow the setup screen to create a browser login. To get the one-time code,
-run `docker compose exec mangarr cat /config/browser_setup_code`.
+Follow the setup screen to create a browser login.
 The image's healthcheck polls `GET /ping` (no API key needed), so
 `docker ps` shows the container as `healthy` once Mangarr is serving.
 
@@ -274,15 +273,15 @@ revoked independently.
 ### Browser access and upgrading
 
 If Mangarr has no browser login, the first visit after installing or upgrading
-opens a setup screen. Read the one-time code from `browser_setup_code` in the
-data directory and enter it in the form with your chosen username and password.
-In Docker Compose, run `docker compose exec mangarr cat /config/browser_setup_code`.
-On Unraid, run `cat /config/browser_setup_code` in the Mangarr container console.
-Mangarr stores the password hash in `browser_login.json` in the data directory
-and removes the setup code after use. Sign in with your new login when prompted.
-To reset a login created in the setup screen, stop Mangarr, remove
-`browser_login.json` and any remaining `browser_setup_code` from the data
-directory, then start Mangarr and follow setup again.
+opens a setup screen. Choose a username and password and sign in when prompted.
+Complete this step on a trusted local network before exposing Mangarr through
+a public reverse proxy or port forward. The first person who submits the form
+creates the login. The library UI and browser API key stay behind the login
+boundary during setup. Existing API-key integrations continue to work.
+
+Mangarr stores the password hash in `browser_login.json` in the data directory.
+To reset a login created in the setup screen, stop Mangarr, remove that file
+from the data directory, then start Mangarr and follow setup again.
 
 Existing `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` settings still
 take precedence when both are set. Setting only one fails startup. Use HTTPS
@@ -301,8 +300,9 @@ add every DNS name used by browsers, reverse proxies and integration clients to
 Names match exactly, ignoring case, without a trailing dot; paths, schemes,
 ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
 with configuration instructions; direct IP access remains available for recovery.
-Proxies must preserve an allowed Host or set it explicitly. Forwarded headers
-never establish trust. Host validation limits DNS rebinding; it is not login.
+During browser setup, reverse proxies must preserve the browser's Host header.
+For other requests, proxies can preserve an allowed Host or set it explicitly.
+Forwarded headers never establish trust. Host validation limits DNS rebinding.
 
 Existing named API keys and `X-Api-Key` clients continue to work without browser
 credentials. Browser credentials alone do not authenticate API calls; API keys

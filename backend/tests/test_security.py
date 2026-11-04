@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import stat
 from unittest.mock import AsyncMock
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr import kavita, notifications, settings_service
 from mangarr.api import deps
-from mangarr.browser_setup import LOGIN_FILE, SETUP_CODE_FILE, prepare_browser_setup
+from mangarr.browser_setup import LOGIN_FILE
 from mangarr.config import AppConfig, config
 from mangarr.db import get_session
 from mangarr.main import api, app
@@ -115,44 +116,40 @@ async def test_mount_path_cannot_bypass_browser_login(client, monkeypatch):
         assert (await mounted.get("/api/v1/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
 
 
-async def test_browser_setup_keeps_existing_api_and_requires_owner_code(client, tmp_path, monkeypatch):
-    assert prepare_browser_setup()
-    code_file = tmp_path / SETUP_CODE_FILE
-    assert stat.S_IMODE(code_file.stat().st_mode) == 0o600
-    code = code_file.read_text().strip()
-    assert prepare_browser_setup()
-    assert code_file.read_text().strip() == code
-
+async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tmp_path, monkeypatch):
     page = await client.get("/", follow_redirects=True)
     assert page.url.path == "/setup"
     assert "Set up your Mangarr login" in page.text
     assert page.headers["cache-control"] == "no-store"
-    assert code not in page.text
+    assert 'name="code"' not in page.text
     assert (await client.get("/initialize.json")).status_code == 403
     assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
     password = "correct horse battery staple"
-    data = {"code": "wrong", "username": "reader", "password": password, "confirmation": password}
+    data = {"username": "reader", "password": password, "confirmation": password}
+    headers = {"Origin": "http://localhost"}
     assert (await client.post("/setup", data=data)).status_code == 403
+    assert (await client.post("/setup", data=data, headers={"Origin": "https://other.example"})).status_code == 403
+    assert (await client.post("/setup", data=data, headers={**headers, "Sec-Fetch-Site": "cross-site"})).status_code == 403
     login_file = tmp_path / LOGIN_FILE
     assert not login_file.exists()
-    data["code"] = code
-    assert (await client.post("/setup", data={**data, "confirmation": "mismatch"})).status_code == 400
-    assert (await client.post("/setup", data={**data, "password": "x" * 4096})).status_code == 413
-    response = await client.post("/setup", data=data)
-    assert response.status_code == 303
-    assert response.headers["location"] == "/"
-    assert not code_file.exists()
+    assert (await client.post("/setup", data={**data, "confirmation": "mismatch"}, headers=headers)).status_code == 400
+    assert (await client.post("/setup", data={**data, "password": "x" * 4096}, headers=headers)).status_code == 413
+    responses = await asyncio.gather(
+        client.post("/setup", data=data, headers=headers),
+        client.post("/setup", data={**data, "username": "other"}, headers=headers),
+    )
+    assert any(r.status_code == 303 and r.headers["location"] == "/" for r in responses)
     assert stat.S_IMODE(login_file.stat().st_mode) == 0o600
     assert password not in login_file.read_text()
-    assert not prepare_browser_setup()
 
     monkeypatch.setattr(config, "allow_unauthenticated_browser", True)
     assert (await client.get("/initialize.json")).status_code == 401
     assert (await client.get("/initialize.json", auth=("reader", "wrong"))).status_code == 401
-    response = await client.get("/initialize.json", auth=("reader", password))
-    assert response.json()["apiKey"] == "bootstrap"
-    assert response.headers["cache-control"] == "no-store"
-    assert (await client.post("/setup", data={**data, "username": "attacker"})).status_code == 303
+    logins = [await client.get("/initialize.json", auth=(name, password)) for name in ("reader", "other")]
+    assert sorted(r.status_code for r in logins) == [200, 401]
+    response = next(r for r in logins if r.status_code == 200)
+    assert response.json()["apiKey"] == "bootstrap" and response.headers["cache-control"] == "no-store"
+    assert (await client.post("/setup", data={**data, "username": "attacker"}, headers=headers)).status_code == 303
     assert (await client.get("/initialize.json", auth=("attacker", password))).status_code == 401
 
 

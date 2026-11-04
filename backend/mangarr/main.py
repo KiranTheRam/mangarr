@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,7 +20,7 @@ from .api import (
     system,
 )
 from .api.deps import get_api_key, require_api_key
-from .browser_setup import SETUP_CODE_FILE, load_browser_login, prepare_browser_setup
+from .browser_setup import load_browser_login
 from .config import config
 from .db import init_db
 from .jobs import scheduler
@@ -40,10 +39,11 @@ log = logging.getLogger("mangarr")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if await asyncio.to_thread(prepare_browser_setup):
-        log.info("Browser login setup required. Read %s from the Mangarr data directory.", SETUP_CODE_FILE)
-    elif not config.auth_username and config.allow_unauthenticated_browser and load_browser_login() is None:
-        log.warning("Browser login is disabled; reachable clients can obtain API access. Set MANGARR_AUTH_USERNAME and MANGARR_AUTH_PASSWORD to enable login.")
+    if not config.auth_username and load_browser_login() is None:
+        if config.allow_unauthenticated_browser:
+            log.warning("Browser login is disabled; reachable clients can obtain API access. Set MANGARR_AUTH_USERNAME and MANGARR_AUTH_PASSWORD to enable login.")
+        else:
+            log.info("Open Mangarr on a trusted network to create the browser login.")
     await init_db()
     await scheduler.start()
     log.info("Mangarr %s ready on %s:%d", __version__, config.host, config.port)
