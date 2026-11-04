@@ -6,6 +6,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select, text
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 from mangarr import automation, db as db_module
+from mangarr.api.search import search_releases
 from mangarr.api.series import update_series
 from mangarr.jobs import tasks
 from mangarr.library.rename import RenameItem, apply_renames
@@ -30,7 +32,7 @@ from mangarr.models import (
     SeriesStatus,
 )
 from mangarr.schemas import SeriesUpdateIn
-from mangarr.sources import registry
+from mangarr.sources import asura, registry
 from mangarr.sources.base import DirectSource, SourceChapter
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
@@ -272,6 +274,89 @@ async def test_grab_follows_series_order_and_skips_blocked_source(db_session, mo
     )
     await tasks.grab_missing_chapters(db_session, series, _values("alpha", "beta", "gamma"))
     assert [source for _, source, _, _ in await _queued(db_session)] == ["beta", "beta", "beta"]
+
+
+async def test_asura_unlock_on_refresh_and_alternate_source(db_session, monkeypatch):
+    unlock_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    class Clock(datetime):
+        current = unlock_at - timedelta(minutes=1)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz)
+
+    def asura_response(request):
+        assert request.url.path == "/api/series/x/chapters"
+        return httpx.Response(200, json={"data": [
+            {"number": 105, "page_count": 28, "is_premium": True,
+             "early_access_until": unlock_at.isoformat()},
+            {"number": 104, "page_count": 28, "is_premium": True,
+             "early_access_until": unlock_at.isoformat()},
+            {"number": 103, "page_count": 23, "is_premium": False,
+             "early_access_until": unlock_at.isoformat()},
+            {"number": 102, "page_count": 26, "is_premium": False},
+        ]})
+
+    monkeypatch.setattr(asura, "datetime", Clock, raising=False)
+    values = _values("asura", "beta")
+
+    async def apply_settings(session):
+        return values
+
+    monkeypatch.setattr(registry, "apply_settings", apply_settings)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(asura_response)) as client:
+        monkeypatch.setattr(registry, "DIRECT_SOURCES", {
+            "asura": asura.AsuraSource(client=client),
+            "beta": ListingSource("beta", {104: [""]}),
+        })
+        previously_failed = _chapter(103, available_sources="asura")
+        series = await _series(db_session, chapters=[previously_failed], links=["asura", "beta"])
+        db_session.add(Download(
+            series_id=series.id, chapter_id=previously_failed.id, kind=DownloadKind.DIRECT,
+            status=DownloadStatus.FAILED, source_name="asura", payload="x|103",
+            error="asura returned no pages for chapter 103.0", updated_at=Clock.current,
+        ))
+        await db_session.commit()
+
+        chapter_cache = {}
+        await tasks.update_chapters(db_session, series, values, chapter_cache)
+        assert {ch.number: ch.available_sources for ch in series.chapters} == {
+            102: "asura", 103: "", 104: "beta",
+        }
+        releases = await search_releases(
+            series_id=series.id, include_torrents=False, session=db_session,
+        )
+        assert {(r.chapter_number, r.source_name) for r in releases} == {
+            (102, "asura"), (104, "beta"),
+        }
+        assert await tasks.grab_missing_chapters(
+            db_session, series, values, chapter_cache=chapter_cache,
+        ) == 2
+
+        Clock.current = unlock_at
+        chapter_cache = {}
+        await tasks.update_chapters(db_session, series, values, chapter_cache)
+        assert {ch.number: ch.available_sources for ch in series.chapters} == {
+            102: "asura", 103: "asura", 104: "asura,beta", 105: "asura",
+        }
+        assert await tasks.grab_missing_chapters(
+            db_session, series, values, chapter_cache=chapter_cache,
+        ) == 2
+        queued = (await db_session.scalars(
+            select(Download).where(Download.status == DownloadStatus.QUEUED)
+        )).all()
+        assert {(dl.source_name, dl.payload) for dl in queued} == {
+            ("asura", "x|102"), ("asura", "x|103"), ("beta", "beta-104-"), ("asura", "x|105"),
+        }
+
+        # A failure at or after the unlock still gets the normal cooldown.
+        retried = next(dl for dl in queued if dl.payload == "x|103")
+        retried.status = DownloadStatus.FAILED
+        retried.error = "asura returned no pages for chapter 103.0"
+        retried.updated_at = unlock_at
+        await db_session.commit()
+        assert await tasks.grab_missing_chapters(db_session, series, values) == 0
 
 
 # ---------------------------------------------------- scanlation groups

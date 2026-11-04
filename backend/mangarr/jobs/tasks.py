@@ -7,6 +7,7 @@ import binascii
 import logging
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1788,12 +1789,32 @@ async def grab_missing_chapters(
     # neither user cancellations nor downloads stopped before the source was
     # asked (NOT_SOURCE_FAILURES) count.
     result = await session.execute(
-        select(Download.chapter_id, Download.source_name).where(
+        select(Download).where(
             Download.series_id == series.id,
             failed_grab_blocks(datetime.now(timezone.utc)),
         )
     )
-    failed_pairs = {(cid, name) for cid, name in result.all()}
+    failed_grabs = defaultdict(list)
+    for failure in result.scalars():
+        failed_grabs[failure.chapter_id, failure.source_name].append(failure)
+
+    def has_blocking_failure(ch: Chapter, release: SourceChapter) -> bool:
+        for failure in failed_grabs.get((ch.id, release.source_name), ()):
+            # An empty reader response before public access should not make a
+            # newly unlocked release wait out the normal failure cooldown.
+            failed_at = failure.updated_at
+            if failed_at.tzinfo is None:
+                failed_at = failed_at.replace(tzinfo=timezone.utc)
+            if (
+                release.public_since is not None
+                and failed_at < release.public_since
+                and failure.kind == DownloadKind.DIRECT
+                and failure.payload == release.external_id
+                and failure.error == f"{release.source_name} returned no pages for chapter {ch.number}"
+            ):
+                continue
+            return True
+        return False
 
     queued = 0
     upgrades_queued = 0
@@ -1821,7 +1842,7 @@ async def grab_missing_chapters(
         for sc in source_chapters:
             ch = remaining.get(sc.number)
             if ch is not None:
-                if (ch.id, src.name) in failed_pairs:
+                if has_blocking_failure(ch, sc):
                     continue
                 remaining.pop(sc.number, None)
                 await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url,
@@ -1832,7 +1853,7 @@ async def grab_missing_chapters(
             if (
                 ch is None
                 or upgrades_queued >= UPGRADES_PER_PASS
-                or (ch.id, src.name) in failed_pairs
+                or has_blocking_failure(ch, sc)
                 or not is_upgrade(ch, src.name, source_order, blocked_groups)
             ):
                 continue

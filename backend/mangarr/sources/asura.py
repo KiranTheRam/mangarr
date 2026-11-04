@@ -6,6 +6,8 @@ the API for search, chapter list, and page images, and skip premium chapters
 whose early-access window hasn't opened yet.
 """
 
+from datetime import datetime, timezone
+
 import httpx
 
 from .. import USER_AGENT
@@ -79,12 +81,23 @@ class AsuraSource(DirectSource):
         rows = data.get("data") if isinstance(data.get("data"), list) else data
         if not isinstance(rows, list):
             rows = []
+        now = datetime.now(timezone.utc)
         chapters: dict[float, SourceChapter] = {}
         for row in rows:
             if not isinstance(row, dict) or "number" not in row:
                 continue
-            # premium chapters are locked until early_access_until passes;
-            # get_pages returns nothing for them, so skip to avoid empty grabs
+            # Asura's list can report pages even while the reader is locked.
+            # Its public chapter list uses this deadline for early access.
+            public_since = None
+            deadline = row.get("early_access_until")
+            if deadline not in (None, ""):
+                try:
+                    public_since = datetime.fromisoformat(deadline)
+                except (TypeError, ValueError):
+                    continue
+                if public_since.tzinfo is None or public_since > now:
+                    continue
+            # Retain the fallback for premium rows without downloadable pages.
             if row.get("is_premium") and (row.get("page_count") or 0) == 0:
                 continue
             number = parse_chapter_number(str(row.get("number")))
@@ -98,6 +111,7 @@ class AsuraSource(DirectSource):
                     number=number,
                     title=row.get("title") or "",
                     url=f"{SITE_URL}/comics/{external_id}/chapter/{row['number']}",
+                    public_since=public_since,
                 )
         return sorted(chapters.values(), key=lambda c: c.number)
 
@@ -105,7 +119,10 @@ class AsuraSource(DirectSource):
         # chapter_external_id is "<series_slug>|<chapter_number>"
         series_slug, _, number = chapter_external_id.rpartition("|")
         data = await self._get(f"/api/series/{series_slug}/chapters/{number}")
-        chapter = (data.get("data") or {}).get("chapter") or {}
+        details = data.get("data") or {}
+        if details.get("is_locked") is True:
+            return []
+        chapter = details.get("chapter") or {}
         pages = chapter.get("pages") or []
         urls = []
         for page in pages:
