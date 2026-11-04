@@ -5,8 +5,9 @@ services:
     ports:
       - "6996:6996"
     environment:
-      MANGARR_AUTH_USERNAME: ${MANGARR_AUTH_USERNAME:?Set MANGARR_AUTH_USERNAME}
-      MANGARR_AUTH_PASSWORD: ${MANGARR_AUTH_PASSWORD:?Set MANGARR_AUTH_PASSWORD}
+      # Keep existing environment-managed logins. New installs use browser setup.
+      MANGARR_AUTH_USERNAME: ${MANGARR_AUTH_USERNAME:-}
+      MANGARR_AUTH_PASSWORD: ${MANGARR_AUTH_PASSWORD:-}
       # Optional file ownership and permissions for new files.
       # PUID: "1000"
       # PGID: "1000"

@@ -7,8 +7,9 @@ import secrets
 from urllib.parse import urlsplit
 
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
+from .browser_setup import BrowserLogin, load_browser_login, setup_page, submit_browser_setup
 from .config import config
 
 
@@ -35,7 +36,7 @@ def allowed_host(request: Request) -> bool:
         return False
 
 
-def browser_authenticated(request: Request) -> bool:
+async def browser_authenticated(request: Request, login: BrowserLogin | None) -> bool:
     try:
         scheme, encoded = request.headers.get("authorization", "").split(" ", 1)
         if scheme.lower() != "basic":
@@ -43,6 +44,8 @@ def browser_authenticated(request: Request) -> bool:
         username, password = base64.b64decode(encoded, validate=True).split(b":", 1)
     except (ValueError, binascii.Error):
         return False
+    if login is not None:
+        return await login.verify(username, password)
     # Compare bytes so non-ASCII credentials are supported, without short-circuit.
     user_ok = secrets.compare_digest(username, config.auth_username.encode())
     password_ok = secrets.compare_digest(password, config.auth_password.get_secret_value().encode())
@@ -65,13 +68,26 @@ async def access_boundary(request: Request, call_next):
     # headers nor browser credentials bypass that dependency.
     is_api = path == "/api/v1" or path.startswith("/api/v1/")
     if path != "/ping" and not is_api:
-        if not config.auth_username and not config.allow_unauthenticated_browser:
+        login = None if config.auth_username else load_browser_login()
+        needs_setup = not config.auth_username and login is None and not config.allow_unauthenticated_browser
+        home = f"/{root_path.strip('/')}".rstrip("/") + "/"
+        if path == "/setup":
+            if not needs_setup:
+                return RedirectResponse(home, status_code=303, headers={"Cache-Control": "no-store"})
+            if request.method == "POST":
+                return await submit_browser_setup(request, home)
+            if request.method == "GET":
+                return setup_page()
+            return JSONResponse({"detail": "Method not allowed"}, status_code=405, headers={"Allow": "GET, POST"})
+        if needs_setup:
+            if request.method == "GET" and path != "/initialize.json":
+                return RedirectResponse(f"{home}setup", headers={"Cache-Control": "no-store"})
             return JSONResponse(
-                {"detail": "Set MANGARR_AUTH_USERNAME and MANGARR_AUTH_PASSWORD to enable browser access."},
+                {"detail": "Set up your Mangarr login at /setup first."},
                 status_code=403,
                 headers={"Cache-Control": "no-store"},
             )
-        if config.auth_username and not browser_authenticated(request):
+        if (config.auth_username or login is not None) and not await browser_authenticated(request, login):
             return JSONResponse(
                 {"detail": "Browser login required"}, status_code=401,
                 headers={"WWW-Authenticate": 'Basic realm="Mangarr", charset="UTF-8"',

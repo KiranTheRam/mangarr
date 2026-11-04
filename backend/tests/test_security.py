@@ -1,4 +1,5 @@
 import logging
+import stat
 from unittest.mock import AsyncMock
 
 import httpx
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr import kavita, notifications, settings_service
 from mangarr.api import deps
+from mangarr.browser_setup import LOGIN_FILE, SETUP_CODE_FILE, prepare_browser_setup
 from mangarr.config import AppConfig, config
 from mangarr.db import get_session
 from mangarr.main import api, app
@@ -26,7 +28,8 @@ async def session(tmp_path):
 
 
 @pytest.fixture
-async def client(session, monkeypatch):
+async def client(session, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "data_dir", tmp_path)
     monkeypatch.setattr(config, "auth_username", "")
     monkeypatch.setattr(config, "auth_password", SecretStr(""))
     monkeypatch.setattr(config, "allow_unauthenticated_browser", False)
@@ -102,6 +105,7 @@ async def test_mount_path_cannot_bypass_browser_login(client, monkeypatch):
     transport = httpx.ASGITransport(app=app, root_path="/api/v1")
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as mounted:
         assert (await mounted.get("/api/v1/ping")).status_code == 200
+        assert (await mounted.get("/api/v1/")).headers["location"] == "/api/v1/setup"
         assert (await mounted.get("/api/v1/initialize.json")).status_code == 403
         enable_login(monkeypatch)
         assert (await mounted.get("/api/v1/initialize.json")).status_code == 401
@@ -109,6 +113,47 @@ async def test_mount_path_cannot_bypass_browser_login(client, monkeypatch):
         assert response.json()["apiKey"] == "bootstrap"
         assert response.headers["cache-control"] == "no-store"
         assert (await mounted.get("/api/v1/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
+
+
+async def test_browser_setup_keeps_existing_api_and_requires_owner_code(client, tmp_path, monkeypatch):
+    assert prepare_browser_setup()
+    code_file = tmp_path / SETUP_CODE_FILE
+    assert stat.S_IMODE(code_file.stat().st_mode) == 0o600
+    code = code_file.read_text().strip()
+    assert prepare_browser_setup()
+    assert code_file.read_text().strip() == code
+
+    page = await client.get("/", follow_redirects=True)
+    assert page.url.path == "/setup"
+    assert "Set up your Mangarr login" in page.text
+    assert page.headers["cache-control"] == "no-store"
+    assert code not in page.text
+    assert (await client.get("/initialize.json")).status_code == 403
+    assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
+    password = "correct horse battery staple"
+    data = {"code": "wrong", "username": "reader", "password": password, "confirmation": password}
+    assert (await client.post("/setup", data=data)).status_code == 403
+    login_file = tmp_path / LOGIN_FILE
+    assert not login_file.exists()
+    data["code"] = code
+    assert (await client.post("/setup", data={**data, "confirmation": "mismatch"})).status_code == 400
+    assert (await client.post("/setup", data={**data, "password": "x" * 4096})).status_code == 413
+    response = await client.post("/setup", data=data)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert not code_file.exists()
+    assert stat.S_IMODE(login_file.stat().st_mode) == 0o600
+    assert password not in login_file.read_text()
+    assert not prepare_browser_setup()
+
+    monkeypatch.setattr(config, "allow_unauthenticated_browser", True)
+    assert (await client.get("/initialize.json")).status_code == 401
+    assert (await client.get("/initialize.json", auth=("reader", "wrong"))).status_code == 401
+    response = await client.get("/initialize.json", auth=("reader", password))
+    assert response.json()["apiKey"] == "bootstrap"
+    assert response.headers["cache-control"] == "no-store"
+    assert (await client.post("/setup", data={**data, "username": "attacker"})).status_code == 303
+    assert (await client.get("/initialize.json", auth=("attacker", password))).status_code == 401
 
 
 def test_partial_auth_configuration_fails_without_printing_password():

@@ -78,14 +78,14 @@ design; it is the automation half of your manga stack.
 
 ```bash
 git clone <this repo> mangarr && cd mangarr
-# Set MANGARR_AUTH_USERNAME and MANGARR_AUTH_PASSWORD in a private .env
-# file or export them in your shell before starting Compose.
 docker compose up -d
 ```
 
 The default Compose file runs the published `kirantheram/mangarr:latest`
 Docker Hub image and stores configuration and media under `./data`. Open
 <http://localhost:6996> after it starts.
+Follow the setup screen to create a browser login. To get the one-time code,
+run `docker compose exec mangarr cat /config/browser_setup_code`.
 The image's healthcheck polls `GET /ping` (no API key needed), so
 `docker ps` shows the container as `healthy` once Mangarr is serving.
 
@@ -273,15 +273,23 @@ revoked independently.
 
 ### Browser access and upgrading
 
-Set both `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` before starting or
-upgrading. The supplied Compose file requires them. The browser prompts for
-credentials before serving the UI or `/initialize.json`. With neither value
-set, browser access is denied by default. Setting only one value fails startup.
-To recover access, change both values in your environment and restart. Use HTTPS
+If Mangarr has no browser login, the first visit after installing or upgrading
+opens a setup screen. Read the one-time code from `browser_setup_code` in the
+data directory and enter it in the form with your chosen username and password.
+In Docker Compose, run `docker compose exec mangarr cat /config/browser_setup_code`.
+On Unraid, run `cat /config/browser_setup_code` in the Mangarr container console.
+Mangarr stores the password hash in `browser_login.json` in the data directory
+and removes the setup code after use. Sign in with your new login when prompted.
+To reset a login created in the setup screen, stop Mangarr, remove
+`browser_login.json` and any remaining `browser_setup_code` from the data
+directory, then start Mangarr and follow setup again.
+
+Existing `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` settings still
+take precedence when both are set. Setting only one fails startup. Use HTTPS
 on a trusted reverse proxy when credentials travel across the network.
 
 Custom deployments can explicitly set `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true`
-with both credentials unset, for example when an authenticated reverse proxy
+before creating a login and with both credential variables unset, for example when an authenticated reverse proxy
 is the only route to Mangarr. In this mode any client with direct access to
 Mangarr can obtain full API access. If an existing instance was accessible to
 untrusted clients before upgrading, rotate its bootstrap and named API keys.
