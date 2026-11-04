@@ -384,9 +384,12 @@ async def update_chapters(
     # a source this series blocks still contributes chapter numbers and
     # metadata, but it never serves a grab, so it claims no availability
     blocked = set(split_names(series.blocked_sources))
-    claimable_sources = {
-        src.name for src in enabled_sources if src.name in links and src.name not in blocked
+    linked_sources = {src.name for src in enabled_sources if src.name in links} - blocked
+    unverified_sources = {
+        src.name for src in enabled_sources if getattr(src, "requires_chapter_verification", False)
     }
+    claimable_sources = linked_sources - unverified_sources
+    unverified_numbers: set[float] = set()
     availability = {
         number: {
             name
@@ -437,6 +440,8 @@ async def update_chapters(
                 apply_title(ch, sc.title, sc.source_name, series.title)
             if src.name in claimable_sources:
                 availability.setdefault(sc.number, set()).add(src.name)
+            elif src.name in linked_sources:
+                unverified_numbers.add(sc.number)
 
     # MangaUpdates tracks releases even when no direct source serves them
     # yet (or ever) — add those chapters so Wanted reflects reality
@@ -515,6 +520,8 @@ async def update_chapters(
         if chapter.excluded:
             continue
         current = ",".join(sorted(availability.get(number, set())))
+        if not current and number in unverified_numbers:
+            current = None
         if chapter.available_sources != current:
             chapter.available_sources = current
 
@@ -1839,6 +1846,16 @@ async def grab_missing_chapters(
         except Exception as exc:
             log.warning("monitor: %s list failed for %r: %s", src.name, series.title, exc)
             continue
+        if getattr(src, "requires_chapter_verification", False):
+            candidates = []
+            for sc in reversed(source_chapters):
+                ch = remaining.get(sc.number) or upgrades.get(sc.number)
+                if ch is None or has_blocking_failure(ch, sc):
+                    continue
+                if sc.number in remaining or is_upgrade(ch, src.name, source_order, blocked_groups):
+                    candidates.append(sc.external_id)
+            verified = await src.verify_chapters(candidates)
+            source_chapters = [sc for sc in source_chapters if sc.external_id in verified]
         for sc in source_chapters:
             ch = remaining.get(sc.number)
             if ch is not None:

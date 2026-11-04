@@ -482,3 +482,30 @@ async def test_duplicate_direct_download_excludes_phantom_chapter(
     assert "duplicate pages rejected" in dl.error
     assert chapter.excluded is True
     assert chapter.monitored is False
+
+
+async def test_catalog_only_source_does_not_claim_availability_or_queue_unverified_chapters(
+    db_session, monkeypatch,
+):
+    series = await _make_series(db_session, [1])
+    series.chapters[0].available_sources = "fake"
+    await db_session.commit()
+    source = FakeSource([1, 2])
+    source.requires_chapter_verification = True
+    checked = []
+
+    async def verify(ids):
+        checked.extend(ids)
+        return {"c2"}
+
+    monkeypatch.setattr(source, "verify_chapters", verify)
+    _use_source(monkeypatch, source)
+    cache = {}
+    await update_chapters(db_session, series, {}, cache)
+    assert all(ch.available_sources is None for ch in series.chapters)
+    assert not checked
+
+    assert await grab_missing_chapters(db_session, series, {}, chapter_cache=cache) == 1
+    assert set(checked) == {"c1", "c2"}
+    queued = (await db_session.execute(select(Download))).scalar_one()
+    assert queued.payload == "c2"

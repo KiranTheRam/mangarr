@@ -14,6 +14,8 @@ class SourceSeries:
     title: str
     url: str = ""
     alt_titles: list[str] = field(default_factory=list)
+    cover_url: str = ""
+    description: str = ""
 
 
 @dataclass
@@ -101,10 +103,24 @@ class DirectSource(ABC):
     @abstractmethod
     async def search_series(self, query: str) -> list[SourceSeries]: ...
 
+    async def get_series_details(self, external_id: str) -> SourceSeries | None:
+        """Optional series metadata supplied by a download source."""
+        return None
+
     @abstractmethod
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:
         """Chapters the source serves. May hold several copies of one chapter
         number (one per scanlation group), best first."""
+
+    # Catalog-only chapter lists need an explicit reader check before they
+    # can be advertised as downloadable.
+    requires_chapter_verification: bool = False
+
+    async def verify_chapters(
+        self, external_ids: list[str], *, max_checks: int | None = 60,
+    ) -> set[str]:
+        """Return the chapter IDs that can be offered as direct releases."""
+        return set(external_ids)
 
     @abstractmethod
     async def get_pages(self, chapter_external_id: str) -> list[str]:

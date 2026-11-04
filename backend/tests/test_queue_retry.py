@@ -1,11 +1,14 @@
 """Retry behavior for failed Activity downloads."""
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr.api import queue
+from mangarr.schemas import GrabIn
 from mangarr.models import (
     Base,
     Chapter,
@@ -188,3 +191,27 @@ async def test_bulk_removal_only_stops_active_torrents(db_session, monkeypatch):
 
     client.delete_torrents.assert_awaited_once_with(["a" * 40])
     assert await queue.get_queue(db_session) == []
+
+@pytest.mark.parametrize("retry", [False, True])
+async def test_unverified_direct_release_is_neither_grabbed_nor_retried(
+    db_session, monkeypatch, retry,
+):
+    dl = await _failed_direct(db_session)
+
+    async def verify(ids):
+        assert ids == [dl.payload]
+        return set()
+
+    monkeypatch.setitem(queue.registry.DIRECT_SOURCES, dl.source_name, SimpleNamespace(
+        requires_chapter_verification=True, verify_chapters=verify,
+    ))
+
+    with pytest.raises(HTTPException) as exc:
+        if retry:
+            await queue.retry_failed_download(dl.id, db_session)
+        else:
+            await queue.grab(GrabIn(
+                chapter_id=dl.chapter_id, source_name=dl.source_name, external_id=dl.payload,
+            ), db_session)
+    assert exc.value.status_code == 409
+    assert (await db_session.execute(select(Download))).scalar_one().status == DownloadStatus.FAILED

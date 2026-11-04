@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type {
   Chapter,
@@ -13,6 +13,7 @@ import type {
 } from "../api/types";
 import { ErrorNotice, Modal, Spinner, chapterLabel, formatBytes } from "./common";
 import { FolderBrowser } from "./FolderBrowser";
+import { sourceLabel } from "../sources";
 
 /** Lists the folders a series spans (primary + extras) with add/remove and a
  *  way to change the primary. Supports libraries where a series is split
@@ -122,6 +123,17 @@ export function SourcesModal({
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SourceCandidate[] | null>(null);
   const [resyncMsg, setResyncMsg] = useState("");
+  const [preview, setPreview] = useState<SourceCandidate | null>(null);
+  const details = useQuery({
+    queryKey: ["source-details", seriesId, preview?.source_name, preview?.external_id],
+    queryFn: preview ? () => {
+      const params = new URLSearchParams({
+        source_name: preview.source_name,
+        external_id: preview.external_id,
+      });
+      return api.get<SourceCandidate>(`/series/${seriesId}/sources/details?${params}`);
+    } : skipToken,
+  });
 
   const { data: sources } = useQuery({
     queryKey: ["sources"],
@@ -137,7 +149,10 @@ export function SourcesModal({
       api.get<SourceCandidate[]>(
         `/series/${seriesId}/sources/search?source_name=${source}&query=${encodeURIComponent(query)}`,
       ),
-    onSuccess: setResults,
+    onSuccess: (matches) => {
+      setResults(matches);
+      setPreview(null);
+    },
   });
   const setLink = useMutation({
     mutationFn: (c: SourceCandidate) =>
@@ -149,6 +164,7 @@ export function SourcesModal({
       }),
     onSuccess: () => {
       setResults(null);
+      setPreview(null);
       setQuery("");
       invalidate();
     },
@@ -178,7 +194,7 @@ export function SourcesModal({
           )}
           {links.map((l) => (
             <tr key={l.id}>
-              <td><span className="pill blue">{l.source_name}</span></td>
+              <td><span className="pill blue">{sourceLabel(l.source_name)}</span></td>
               <td>{l.external_title || l.external_id}</td>
               <td style={{ width: 40 }}>
                 <button className="btn sm" title="Remove" onClick={() => remove.mutate(l.id)}>
@@ -195,7 +211,7 @@ export function SourcesModal({
       <div className="form-row">
         <select value={source} onChange={(e) => setSource(e.target.value)}>
           <option value="">Source…</option>
-          {sources?.map((s) => <option key={s} value={s}>{s}</option>)}
+          {sources?.map((s) => <option key={s} value={s}>{sourceLabel(s)}</option>)}
         </select>
         <input
           placeholder="Search title…"
@@ -216,7 +232,12 @@ export function SourcesModal({
             {results.length === 0 && <tr><td className="muted">No matches.</td></tr>}
             {results.map((c) => (
               <tr key={c.external_id}>
-                <td>{c.title}</td>
+                <td>
+                  {c.title}
+                  {c.source_name === "fanfox" && (
+                    <button className="btn sm" style={{ marginLeft: 8 }} onClick={() => setPreview(c)}>Details</button>
+                  )}
+                </td>
                 <td style={{ width: 70 }}>
                   <button className="btn sm primary" onClick={() => setLink.mutate(c)}>
                     Use
@@ -226,6 +247,17 @@ export function SourcesModal({
             ))}
           </tbody>
         </table>
+      )}
+      {preview && (
+        <div>
+          <h4>{details.data?.title ?? preview.title}</h4>
+          {(details.data?.cover_url || preview.cover_url) && (
+            <img src={details.data?.cover_url || preview.cover_url} alt="" width={80} referrerPolicy="no-referrer" />
+          )}
+          {details.isFetching && <Spinner />}
+          <ErrorNotice error={details.error} />
+          {details.data?.description && <p>{details.data.description}</p>}
+        </div>
       )}
       <ErrorNotice error={setLink.error} />
 
