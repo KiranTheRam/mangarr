@@ -17,12 +17,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from .config import config
 from .db import engine
+from .sign_in_throttle import SignInThrottle
 
 LOGIN_FILE = "browser_login.json"
 MAX_FORM_BYTES = 8192
 SESSION_COOKIE = "mangarr_session"
 SESSION_SECONDS = 7 * 24 * 60 * 60
 _password_workers = CapacityLimiter(2)
+_sign_in_throttle = SignInThrottle()
 
 
 def _write_private_file(path: Path, value: str, *, replace: bool = False) -> None:
@@ -101,8 +103,9 @@ def setup_page(message: str = "", status_code: int = 200, *, sign_in: bool = Fal
             "and existing API clients stay available.</p><p>Complete setup on a trusted local network. "
             "The first person to submit this form creates the login.</p>"
         )
+    # HTML counts UTF-16 code units. Allow 128 characters even when each takes two units.
     confirmation = "" if sign_in else (
-        '<label>Confirm password<input name="confirmation" type="password" required maxlength="128" '
+        '<label>Confirm password<input name="confirmation" type="password" required maxlength="256" '
         'autocomplete="new-password"></label>'
     )
     autocomplete = "current-password" if sign_in else "new-password"
@@ -128,7 +131,7 @@ button {{ margin-top: 1.25rem; cursor: pointer }}
   {error}
   <form method="post">
     <label>Username<input name="username" required maxlength="64" autocomplete="username"></label>
-    <label>Password<input name="password" type="password" required maxlength="128" autocomplete="{autocomplete}"></label>
+    <label>Password<input name="password" type="password" required maxlength="256" autocomplete="{autocomplete}"></label>
     {confirmation}
     <button>{button}</button>
   </form>
@@ -209,16 +212,43 @@ async def submit_sign_in(request: Request, login: BrowserLogin, home: str) -> Re
         username, password = await read_form(request, "username", "password")
     except FormError as exc:
         return setup_page(str(exc), exc.status, sign_in=True)
-    if not await login.verify(username.encode(), password.encode()):
-        return setup_page("The username or password is incorrect.", 401, sign_in=True)
+    # The form can arrive after a password reset. Use the current revision
+    # for throttling so attempts against the old login cannot lock out the new one.
     if load_browser_login() != login:
         return setup_page("The login changed. Please try again.", 409, sign_in=True)
+    host = request.client.host if request.client else None
+    attempt = _sign_in_throttle.reserve(host, login.salt)
+    if isinstance(attempt, int):
+        response = setup_page("Too many sign-in attempts. Wait a moment and try again.", 429, sign_in=True)
+        response.headers["Retry-After"] = str(attempt)
+        return response
+    signed_in = False
+    try:
+        if not await login.verify(username.encode(), password.encode()):
+            return setup_page("The username or password is incorrect.", 401, sign_in=True)
+        if load_browser_login() != login:
+            return setup_page("The login changed. Please try again.", 409, sign_in=True)
+        signed_in = True
+    finally:
+        _sign_in_throttle.finish(host, attempt, success=signed_in)
     response = RedirectResponse(home, status_code=303, headers={"Cache-Control": "no-store"})
     response.set_cookie(
         SESSION_COOKIE, login.session_token(), max_age=SESSION_SECONDS, path=home,
         httponly=True, samesite="lax", secure=request.headers["origin"].startswith("https://"),
     )
     return response
+
+
+async def replace_browser_password(login: BrowserLogin, password: str) -> bool:
+    data = await encode_login(login.username, password)
+    # Serialize the compare-and-replace across server and CLI processes using
+    # the SQLite writer lock. The login file remains the credential store.
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if load_browser_login() != login:
+            return False
+        _write_private_file(config.data_dir / LOGIN_FILE, data, replace=True)
+    return True
 
 
 async def change_password(request: Request, login: BrowserLogin) -> Response:
@@ -230,14 +260,8 @@ async def change_password(request: Request, login: BrowserLogin) -> Response:
             raise FormError("Choose a different password.", 400)
         if not await login.verify(login.username.encode(), current.encode()):
             raise FormError("The current password is incorrect.", 400)
-        data = await encode_login(login.username, password)
-        # Serialize the compare-and-replace across workers using the existing
-        # SQLite writer lock. The login file remains the credential store.
-        async with engine.begin() as connection:
-            await connection.exec_driver_sql("BEGIN IMMEDIATE")
-            if load_browser_login() != login:
-                raise FormError("The login changed. Sign in again before retrying.", 409)
-            _write_private_file(config.data_dir / LOGIN_FILE, data, replace=True)
+        if not await replace_browser_password(login, password):
+            raise FormError("The login changed. Sign in again before retrying.", 409)
     except FormError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=exc.status, headers={"Cache-Control": "no-store"})
     return Response(status_code=204, headers={"Cache-Control": "no-store"})

@@ -284,12 +284,35 @@ A password change requires the current password and signs out all browser
 sessions. API keys continue to work. Browser sessions expire after seven days.
 
 Mangarr stores the password hash in `browser_login.json` in the data directory.
-If you forget the password, stop Mangarr, remove that file, then restart and
-complete setup again on a trusted network.
+If you forget the password, run the local reset command from an interactive
+terminal. With Docker Compose, run this while the container is running:
+
+```bash
+docker compose exec mangarr mangarr-entrypoint python -m mangarr.reset_password
+```
+
+On Unraid, open the Mangarr container console and run
+`mangarr-entrypoint python -m mangarr.reset_password`.
+
+For a direct Python install, run `python -m mangarr.reset_password` as the
+service user with the same working directory, Python environment and
+`MANGARR_DATA_DIR` as the server. Enter and confirm your new password at the
+hidden prompts. The reset keeps your username, signs out all browser sessions,
+and leaves API keys available throughout. Mangarr applies the change immediately.
+
+For the Mangarr-managed login, after five failed sign-ins from the same client
+in a one-minute window, the next attempt in that window returns HTTP 429 with
+a `Retry-After` header. A successful sign-in clears the client's count. The
+limit is per server process and groups IPv6 clients by their /64 prefix.
+Clients behind a reverse proxy share its limit by default. To use the original
+client addresses, set `FORWARDED_ALLOW_IPS` to the addresses of trusted proxies
+that sanitize forwarding headers. If you launch Uvicorn directly, configure
+`--forwarded-allow-ips` explicitly (`''` to trust no proxies).
 
 Existing `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` settings still
-take precedence when both are set. Setting only one fails startup. Use HTTPS
-on a trusted reverse proxy when credentials travel across the network.
+take precedence when both are set. Update `MANGARR_AUTH_PASSWORD` and restart
+Mangarr to reset an environment-managed login. Setting only one fails startup.
+Use HTTPS on a trusted reverse proxy when credentials travel across the network.
 
 Custom deployments can explicitly set `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true`
 before creating a login and with both credential variables unset, for example when an authenticated reverse proxy

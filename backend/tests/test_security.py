@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import stat
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from mangarr import browser_setup, kavita, notifications, settings_service
+from mangarr import browser_setup, kavita, notifications, reset_password, settings_service, sign_in_throttle
 from mangarr.api import deps
 from mangarr.browser_setup import LOGIN_FILE
 from mangarr.config import AppConfig, config
@@ -36,6 +36,7 @@ async def client(session, monkeypatch, tmp_path):
     monkeypatch.setattr(config, "allow_unauthenticated_browser", False)
     monkeypatch.setattr(config, "allowed_hosts", ["reader.example"])
     monkeypatch.setattr(deps, "_api_key", "bootstrap")
+    monkeypatch.setattr(browser_setup, "_sign_in_throttle", sign_in_throttle.SignInThrottle())
 
     async def override():
         yield session
@@ -122,6 +123,7 @@ async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tm
     assert "Set up your Mangarr login" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert 'name="code"' not in page.text
+    assert page.text.count('type="password" required maxlength="256"') == 2
     assert (await client.get("/initialize.json")).status_code == 403
     assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
     password = "correct horse battery staple"
@@ -188,6 +190,77 @@ async def test_password_change_and_logout_preserve_api_keys(client, session, mon
     assert (await client.get("/api/v1/settings")).status_code == 200
     assert (await client.post("/auth/logout", headers=headers)).status_code == 204
     assert (await client.get("/api/v1/settings")).status_code == 401
+
+
+async def test_sign_in_throttle_checks_peer_before_password_verification(client, monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(sign_in_throttle, "monotonic", lambda: now)
+    password = "fixture password"
+    headers = {"Origin": "http://localhost"}
+    login = {"username": "reader", "password": password}
+    assert (await client.post("/setup", data={**login, "confirmation": password}, headers=headers)).status_code == 303
+
+    async def failed(index):
+        # Changing the username, claimed address or peer port cannot bypass the limit.
+        transport = httpx.ASGITransport(app=app, client=("192.0.2.5", 1500 + index))
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as peer:
+            return await peer.post("/login", data={"username": f"wrong-{index}", "password": "wrong"},
+                                   headers={**headers, "X-Forwarded-For": f"198.51.100.{index + 1}"})
+
+    failures = await asyncio.gather(*(failed(index) for index in range(sign_in_throttle.ATTEMPTS + 1)))
+    assert sorted(response.status_code for response in failures) == [401] * sign_in_throttle.ATTEMPTS + [429]
+    blocked = next(response for response in failures if response.status_code == 429)
+    assert blocked.headers["retry-after"] == str(sign_in_throttle.WINDOW_SECONDS)
+    assert blocked.headers["cache-control"] == "no-store"
+    assert (await client.get("/ping")).status_code == 200
+    assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
+    assert (await client.post("/login", data=login, headers=headers)).status_code == 303
+    now += sign_in_throttle.WINDOW_SECONDS
+    assert (await failed(0)).status_code == 401
+
+
+async def test_local_reset_preserves_username_and_recovers_throttled_peer(client, session, monkeypatch, tmp_path):
+    monkeypatch.setattr(browser_setup, "engine", session.bind)
+    headers = {"Origin": "http://localhost"}
+    old = "old fixture password"
+    new = "\U0001f680" * 128
+    login = {"username": "reader", "password": old}
+    assert (await client.post("/setup", data={**login, "confirmation": old}, headers=headers)).status_code == 303
+    assert (await client.post("/login", data=login, headers=headers)).status_code == 303
+    cookie = client.cookies.get(browser_setup.SESSION_COOKIE)
+    client.cookies.clear()
+    for _ in range(sign_in_throttle.ATTEMPTS):
+        assert (await client.post("/login", data={**login, "username": "wrong"}, headers=headers)).status_code == 401
+    assert (await client.post("/login", data=login, headers=headers)).status_code == 429
+
+    monkeypatch.setattr(reset_password.sys, "stdin", Mock(isatty=Mock(return_value=True)))
+    monkeypatch.setattr(reset_password, "getpass", Mock(side_effect=[new, new]))
+    assert await asyncio.to_thread(reset_password.main, []) == 0
+
+    assert stat.S_IMODE((tmp_path / LOGIN_FILE).stat().st_mode) == 0o600
+    assert (await client.get("/")).headers["location"] == "/login"
+    assert 'type="password" required maxlength="256"' in (await client.get("/login")).text
+    assert (await client.get("/api/v1/settings", headers={"Cookie": f"{browser_setup.SESSION_COOKIE}={cookie}"})).status_code == 401
+    assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
+    assert (await client.post("/login", data=login, headers=headers)).status_code == 401
+    assert (await client.post("/login", data={**login, "password": new}, headers=headers)).status_code == 303
+    assert (await client.post("/auth/password", data={"current": new, "password": old, "confirmation": old},
+                              headers=headers)).status_code == 204
+
+
+def test_local_reset_requires_existing_managed_login(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "data_dir", tmp_path)
+    monkeypatch.setattr(config, "auth_username", "")
+    prompt = Mock()
+    monkeypatch.setattr(reset_password, "getpass", prompt)
+    assert reset_password.main([]) == 1
+    assert "There is no browser login" in capsys.readouterr().err
+    assert not (tmp_path / LOGIN_FILE).exists()
+
+    enable_login(monkeypatch)
+    assert reset_password.main([]) == 1
+    assert "MANGARR_AUTH_PASSWORD" in capsys.readouterr().err
+    prompt.assert_not_called()
 
 
 def test_partial_auth_configuration_fails_without_printing_password():

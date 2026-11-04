@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -108,7 +109,10 @@ else:
 def run() -> None:
     import uvicorn
 
-    uvicorn.run("mangarr.main:app", host=config.host, port=config.port, log_level="info")
+    uvicorn.run(
+        "mangarr.main:app", host=config.host, port=config.port, log_level="info",
+        forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", ""),
+    )
 
 
 if __name__ == "__main__":
