@@ -11,6 +11,19 @@ interface PreviewImage {
   original_kept: boolean;
 }
 
+// Keep one sample request across remounts (including development StrictMode).
+// The sample is fixed, local artwork; failures remain retryable.
+let sampleRequest: Promise<PreviewImage> | null = null;
+function loadSample(): Promise<PreviewImage> {
+  if (!sampleRequest) {
+    sampleRequest = api.get<PreviewImage>("/settings/image-optimization/sample").catch((reason) => {
+      sampleRequest = null;
+      throw reason;
+    });
+  }
+  return sampleRequest;
+}
+
 export function ImageOptimizationPreview({ form }: { form: Settings }) {
   const enabled = form.image_optimization_enabled === "true";
   const format = form.image_optimization_format ?? "webp";
@@ -33,7 +46,7 @@ export function ImageOptimizationPreview({ form }: { form: Settings }) {
     if (sample) return;
     let active = true;
     setSampleError("");
-    api.get<PreviewImage>("/settings/image-optimization/sample")
+    loadSample()
       .then((image) => { if (active) setSample(image); })
       .catch((reason: Error) => { if (active) setSampleError(reason.message); });
     return () => { active = false; };
