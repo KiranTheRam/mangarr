@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from mangarr import kavita, notifications, settings_service
+from mangarr import browser_setup, kavita, notifications, settings_service
 from mangarr.api import deps
 from mangarr.browser_setup import LOGIN_FILE
 from mangarr.config import AppConfig, config
@@ -133,7 +133,7 @@ async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tm
     login_file = tmp_path / LOGIN_FILE
     assert not login_file.exists()
     assert (await client.post("/setup", data={**data, "confirmation": "mismatch"}, headers=headers)).status_code == 400
-    assert (await client.post("/setup", data={**data, "password": "x" * 4096}, headers=headers)).status_code == 413
+    assert (await client.post("/setup", data={**data, "password": "x" * 8192}, headers=headers)).status_code == 413
     responses = await asyncio.gather(
         client.post("/setup", data=data, headers=headers),
         client.post("/setup", data={**data, "username": "other"}, headers=headers),
@@ -144,13 +144,50 @@ async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tm
 
     monkeypatch.setattr(config, "allow_unauthenticated_browser", True)
     assert (await client.get("/initialize.json")).status_code == 401
-    assert (await client.get("/initialize.json", auth=("reader", "wrong"))).status_code == 401
-    logins = [await client.get("/initialize.json", auth=(name, password)) for name in ("reader", "other")]
-    assert sorted(r.status_code for r in logins) == [200, 401]
-    response = next(r for r in logins if r.status_code == 200)
-    assert response.json()["apiKey"] == "bootstrap" and response.headers["cache-control"] == "no-store"
+    assert (await client.get("/", follow_redirects=True)).url.path == "/login"
+    for name in ("reader", "other"):
+        response = await client.post("/login", data={"username": name, "password": password}, headers=headers)
+        if response.status_code == 303:
+            assert "HttpOnly" in response.headers["set-cookie"]
+            break
+        assert response.status_code == 401
+    else:
+        pytest.fail("Neither claimant could sign in")
+    rival = "other" if name == "reader" else "reader"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as anonymous:
+        assert (await anonymous.post("/login", data={"username": rival, "password": password}, headers=headers)).status_code == 401
+    response = await client.get("/initialize.json")
+    assert response.json()["apiKey"] == "" and response.json()["authMode"] == "managed"
+    assert response.headers["cache-control"] == "no-store"
+    assert (await client.get("/api/v1/settings")).status_code == 200
+    assert (await client.put("/api/v1/settings", json={}, headers={"Origin": "http://evil.example"})).status_code == 403
+    assert (await client.put("/api/v1/settings", json={}, headers=headers)).status_code == 200
     assert (await client.post("/setup", data={**data, "username": "attacker"}, headers=headers)).status_code == 303
-    assert (await client.get("/initialize.json", auth=("attacker", password))).status_code == 401
+
+
+async def test_password_change_and_logout_preserve_api_keys(client, session, monkeypatch):
+    monkeypatch.setattr(browser_setup, "engine", session.bind)
+    headers = {"Origin": "http://localhost"}
+    password = "old fixture password"
+    new = "new fixture password"
+    assert (await client.post("/setup", data={"username": "reader", "password": password, "confirmation": password}, headers=headers)).status_code == 303
+    payload = {"current": password, "password": new, "confirmation": new}
+    assert (await client.post("/auth/password", data=payload, headers={**headers, "X-Api-Key": "bootstrap"})).status_code == 401
+    assert (await client.post("/login", data={"username": "reader", "password": password}, headers=headers)).status_code == 303
+    cookie = client.cookies.get(browser_setup.SESSION_COOKIE)
+    assert (await client.post("/auth/password", data=payload, headers={"Origin": "http://evil.example"})).status_code == 403
+    assert (await client.post("/auth/password", data={**payload, "current": "wrong"}, headers=headers)).status_code == 400
+    assert (await client.post("/auth/password", data={**payload, "confirmation": "wrong"}, headers=headers)).status_code == 400
+    assert (await client.post("/auth/password", data=payload, headers=headers)).status_code == 204
+    assert client.cookies.get(browser_setup.SESSION_COOKIE) is None
+    assert (await client.get("/api/v1/settings", headers={"Cookie": f"{browser_setup.SESSION_COOKIE}={cookie}"})).status_code == 401
+    assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
+    assert (await client.post("/login", data={"username": "reader", "password": password}, headers=headers)).status_code == 401
+    assert (await client.post("/login", data={"username": "reader", "password": new}, headers=headers)).status_code == 303
+    assert (await client.get("/api/v1/settings")).status_code == 200
+    assert (await client.post("/auth/logout", headers=headers)).status_code == 204
+    assert (await client.get("/api/v1/settings")).status_code == 401
 
 
 def test_partial_auth_configuration_fails_without_printing_password():

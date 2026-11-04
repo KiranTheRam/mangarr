@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -19,7 +19,7 @@ from .api import (
     settings,
     system,
 )
-from .api.deps import get_api_key, require_api_key
+from .api.deps import get_api_key, require_api_access
 from .browser_setup import load_browser_login
 from .config import config
 from .db import init_db
@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Mangarr", version=__version__, lifespan=lifespan)
 app.middleware("http")(access_boundary)
 
-api = FastAPI(dependencies=[Depends(require_api_key)])
+api = FastAPI(dependencies=[Depends(require_api_access)])
 api.include_router(series.router)
 api.include_router(library_import.router)
 api.include_router(library.router)
@@ -69,9 +69,11 @@ app.mount("/api/v1", api)
 
 
 @app.get("/initialize.json")
-async def initialize():
+async def initialize(request: Request):
     """Browser bootstrap, protected by the browser access boundary."""
-    return {"apiKey": get_api_key(), "version": __version__, "urlBase": ""}
+    mode = "managed" if request.state.browser_session else "environment" if config.auth_username else "external"
+    return {"apiKey": "" if mode == "managed" else get_api_key(), "authMode": mode,
+            "version": __version__, "urlBase": ""}
 
 
 @app.get("/ping")

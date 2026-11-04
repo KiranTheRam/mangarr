@@ -279,9 +279,13 @@ a public reverse proxy or port forward. The first person who submits the form
 creates the login. The library UI and browser API key stay behind the login
 boundary during setup. Existing API-key integrations continue to work.
 
+Use **Settings → Browser Security** to change your password or sign out.
+A password change requires the current password and signs out all browser
+sessions. API keys continue to work. Browser sessions expire after seven days.
+
 Mangarr stores the password hash in `browser_login.json` in the data directory.
-To reset a login created in the setup screen, stop Mangarr, remove that file
-from the data directory, then start Mangarr and follow setup again.
+If you forget the password, stop Mangarr, remove that file, then restart and
+complete setup again on a trusted network.
 
 Existing `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` settings still
 take precedence when both are set. Setting only one fails startup. Use HTTPS
@@ -300,14 +304,15 @@ add every DNS name used by browsers, reverse proxies and integration clients to
 Names match exactly, ignoring case, without a trailing dot; paths, schemes,
 ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
 with configuration instructions; direct IP access remains available for recovery.
-During browser setup, reverse proxies must preserve the browser's Host header.
+For browser setup, sign-in, and requests that change state, reverse proxies
+must preserve the browser's Host header.
 For other requests, proxies can preserve an allowed Host or set it explicitly.
 Forwarded headers never establish trust. Host validation limits DNS rebinding.
 
-Existing named API keys and `X-Api-Key` clients continue to work without browser
-credentials. Browser credentials alone do not authenticate API calls; API keys
-alone do not unlock browser bootstrap when login is enabled. `/ping` remains
-public and contains no secrets. Bootstrap responses use `Cache-Control: no-store`.
+Existing named API keys and `X-Api-Key` clients continue to work independently
+of browser sessions. When Mangarr manages the login, the browser uses a
+session cookie for UI and API requests. API keys alone do not unlock browser
+bootstrap when login is enabled. `/ping` remains public and contains no secrets.
 
 Saved integration secrets are bound to the exact saved URL (including scheme,
 port and path), and qBittorrent passwords also to the username. After changing
