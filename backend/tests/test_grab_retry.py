@@ -397,7 +397,7 @@ async def test_active_direct_download_removed_by_user_is_not_completed(
     monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource([1]))
 
     async def fake_download(source, payload, series, chapter, dest, progress_cb=None,
-                            cancel_cb=None, web_url=""):
+                            cancel_cb=None, web_url="", optimization=None):
         dl.status = DownloadStatus.FAILED
         dl.error = REMOVED_BY_USER
         await db_session.commit()

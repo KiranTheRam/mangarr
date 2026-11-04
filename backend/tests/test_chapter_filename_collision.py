@@ -120,7 +120,7 @@ async def test_download_refuses_to_overwrite_another_chapters_file(
     written = []
 
     async def fake_download(source, payload, series, chapter, dest,
-                            progress_cb=None, cancel_cb=None, web_url=""):
+                            progress_cb=None, cancel_cb=None, web_url="", optimization=None):
         written.append(dest)
         dest.write_bytes(b"chapter 12.24")
 

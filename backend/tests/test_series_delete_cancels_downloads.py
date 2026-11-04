@@ -125,7 +125,7 @@ async def test_running_download_stops_when_its_series_is_deleted(
     written = []
 
     async def download_while_series_is_deleted(source, payload, series, chapter, dest,
-                                               progress_cb=None, cancel_cb=None, web_url=""):
+                                               progress_cb=None, cancel_cb=None, web_url="", optimization=None):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"cbz")
         written.append(dest)

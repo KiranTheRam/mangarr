@@ -5,6 +5,7 @@ chapter labels on every page use those labels instead of assuming the release's
 volume number matches the metadata edition. Archive directories and ComicInfo
 titles are cached per file version; page images are never read or written."""
 
+import json
 import zipfile
 import zlib
 from collections.abc import Iterable
@@ -254,6 +255,58 @@ def _archive_page_signature(path: str, mtime_ns: int, size: int) -> PageSignatur
     except (OSError, zipfile.BadZipFile):
         return None
     return signature or None
+
+
+# Optional provenance binds original identities to the actual archived pages.
+# Keep archive_page_signature's byte identity contract unchanged for its callers.
+PAGE_PROVENANCE_NAME = "MangarrPageProvenance.json"
+
+
+def archive_source_page_signature(path: Path) -> PageSignature | None:
+    if path.suffix.lower() not in {".cbz", ".zip"}:
+        return None
+    try:
+        stat = path.stat()
+        return _archive_source_page_signature(str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=1024)
+def _archive_source_page_signature(path: str, mtime_ns: int, size: int) -> PageSignature | None:
+    stored = _archive_page_signature(path, mtime_ns, size)
+    if not stored:
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = [m for m in archive.infolist() if m.filename == PAGE_PROVENANCE_NAME]
+            if not members:
+                return stored  # archives created before optimization or with it off
+            if len(members) != 1:
+                return None
+            member = members[0]
+            if (member.file_size > MAX_COMICINFO_BYTES or member.compress_type not in
+                    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
+                return None
+            with archive.open(member) as stream:
+                data = stream.read(MAX_COMICINFO_BYTES + 1)
+            if len(data) > MAX_COMICINFO_BYTES:
+                return None
+            payload = json.loads(data)
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return None
+            original = payload.get("original")
+            if (payload.get("archived") != [list(pair) for pair in stored]
+                    or not isinstance(original, list) or len(original) != len(stored)):
+                return None
+            if not all(isinstance(pair, list) and len(pair) == 2
+                       and all(type(v) is int for v in pair)
+                       and 0 <= pair[0] <= 0xFFFFFFFF and pair[1] > 0 for pair in original):
+                return None
+            return tuple(tuple(pair) for pair in original)
+    except (OSError, KeyError, ValueError, RuntimeError, EOFError, RecursionError,
+            zipfile.BadZipFile, zlib.error):
+        return None
 
 
 def find_series_media_files(

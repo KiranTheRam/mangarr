@@ -1,11 +1,14 @@
 """CBZ packaging with ComicInfo.xml (Anansi/ComicRack schema, as read by
 Komga and Kavita)."""
 
+import json
 import re
 import zipfile
 from pathlib import Path
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
+
+from ..library.matcher import PAGE_PROVENANCE_NAME, PageSignature, page_bytes_signature
 
 EXT_BY_SIGNATURE = {
     b"\xff\xd8\xff": ".jpg",
@@ -64,7 +67,10 @@ def build_comicinfo(
     return minidom.parseString(rough).toprettyxml(indent="  ")
 
 
-def write_cbz(dest: Path, pages: list[bytes], comicinfo_xml: str) -> Path:
+def write_cbz(
+    dest: Path, pages: list[bytes], comicinfo_xml: str,
+    *, original_signature: PageSignature | None = None,
+) -> Path:
     """Writes ordered page images + ComicInfo.xml into a .cbz at dest."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".cbz.partial")
@@ -72,6 +78,11 @@ def write_cbz(dest: Path, pages: list[bytes], comicinfo_xml: str) -> Path:
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
             zf.writestr("ComicInfo.xml", comicinfo_xml)
+            if original_signature is not None:
+                zf.writestr(PAGE_PROVENANCE_NAME, json.dumps({
+                    "version": 1, "original": original_signature,
+                    "archived": page_bytes_signature(pages),
+                }, separators=(",", ":")))
             for i, data in enumerate(pages, start=1):
                 zf.writestr(f"{i:0{width}d}{guess_extension(data)}", data)
         tmp.rename(dest)

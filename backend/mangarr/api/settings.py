@@ -113,3 +113,32 @@ async def qbt_test(body: QbtTestIn, session: AsyncSession = Depends(get_session)
     except QbtError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"ok": True, "version": version}
+
+
+@router.get("/image-optimization/sample")
+async def image_optimization_sample():
+    return await _image_preview({})
+
+
+@router.post("/image-optimization/preview")
+async def image_optimization_preview(body: dict[str, str]):
+    allowed = {"image_optimization_enabled", "image_optimization_format",
+               "image_optimization_quality", "image_optimization_max_width"}
+    if set(body) - allowed:
+        raise HTTPException(422, "Only image optimization settings are accepted")
+    return await _image_preview(body)
+
+
+async def _image_preview(values: dict[str, str]):
+    from ..download.image_preview import PreviewBusyError, preview_image
+    from ..download.images import ImageOptimization
+
+    try:
+        policy = ImageOptimization.from_settings(values)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        return await preview_image(policy)
+    except PreviewBusyError as exc:
+        raise HTTPException(429, "Another preview is being generated; try again shortly",
+                            headers={"Retry-After": "1"}) from exc
