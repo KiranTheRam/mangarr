@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 
@@ -28,6 +29,8 @@ class SourceChapter:
     # that carry several groups' copies of a chapter list every copy, in
     # their own preference order; automation.select_group_variants picks one.
     group: str = ""
+    # When this release's early-access window ended, if the source says.
+    public_since: datetime | None = None
 
 
 @dataclass
