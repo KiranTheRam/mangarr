@@ -11,9 +11,11 @@ RUN npm run build -- --outDir /build/static
 FROM python:3.12-slim
 WORKDIR /app
 
-COPY backend/pyproject.toml ./
+COPY backend/pyproject.toml backend/VERSION ./
 COPY backend/mangarr ./mangarr
-RUN pip install --no-cache-dir .
+ARG MANGARR_BUILD_VERSION
+RUN if [ -n "$MANGARR_BUILD_VERSION" ]; then printf '%s\n' "$MANGARR_BUILD_VERSION" > VERSION; fi \
+    && pip install --no-cache-dir .
 
 COPY --from=frontend /build/static ./static
 
