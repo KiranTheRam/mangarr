@@ -15,7 +15,8 @@ COPY backend/pyproject.toml backend/VERSION ./
 COPY backend/mangarr ./mangarr
 ARG MANGARR_BUILD_VERSION
 RUN if [ -n "$MANGARR_BUILD_VERSION" ]; then printf '%s\n' "$MANGARR_BUILD_VERSION" > VERSION; fi \
-    && pip install --no-cache-dir .
+    && python -m pip install --no-cache-dir --upgrade 'pip>=26.2.0' \
+    && python -m pip install --no-cache-dir .
 
 COPY --from=frontend /build/static ./static
 

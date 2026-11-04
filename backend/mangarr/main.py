@@ -38,7 +38,7 @@ log = logging.getLogger("mangarr")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not config.auth_username:
+    if not config.auth_username and config.allow_unauthenticated_browser:
         log.warning("Browser login is disabled; reachable clients can obtain API access. Set MANGARR_AUTH_USERNAME and MANGARR_AUTH_PASSWORD to enable login.")
     await init_db()
     await scheduler.start()
@@ -66,7 +66,7 @@ app.mount("/api/v1", api)
 
 @app.get("/initialize.json")
 async def initialize():
-    """Browser bootstrap, protected by the optional browser login and Host check."""
+    """Browser bootstrap, protected by the browser access boundary."""
     return {"apiKey": get_api_key(), "version": __version__, "urlBase": ""}
 
 

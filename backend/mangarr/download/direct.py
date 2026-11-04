@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,9 @@ from .images import ImageOptimization, optimize_page_async
 log = logging.getLogger(__name__)
 
 PAGE_CONCURRENCY = 3
+MAX_CHAPTER_PAGES = 1_200
+MAX_PAGE_BYTES = 32 * 1024 * 1024
+MAX_CHAPTER_BYTES = 128 * 1024 * 1024
 
 ProgressCallback = Callable[[int, int], None | Awaitable[None]]
 CancelCallback = Callable[[], None | Awaitable[None]]
@@ -35,6 +39,46 @@ class DuplicateChapterPagesError(RuntimeError):
             f"chapter {chapter_number:g} has the same ordered page images as "
             f"chapter {existing_number:g} ({existing_path})"
         )
+
+
+class DownloadLimitError(ValueError):
+    """A provider response exceeds a download safety limit."""
+
+
+class _BoundedPageStream(httpx.AsyncByteStream):
+    def __init__(self, stream: httpx.AsyncByteStream, *, discard: bool,
+                 account_bytes: Callable[[int], None]) -> None:
+        self.stream = stream
+        self.discard = discard
+        self.account_bytes = account_bytes
+
+    async def __aiter__(self):
+        if self.discard:
+            return
+        size = 0
+        async for chunk in self.stream:
+            self.account_bytes(len(chunk))
+            size += len(chunk)
+            if size > MAX_PAGE_BYTES:
+                raise DownloadLimitError("page exceeds the download byte limit")
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self.stream.aclose()
+
+
+async def _bound_page_response(response: httpx.Response, *, account_bytes: Callable[[int], None]) -> None:
+    # HTTPX can buffer redirect bodies before it returns the final response.
+    # Discard them and reject encodings that could inflate before a size check.
+    discard = not response.is_success
+    if not discard:
+        encoding = response.headers.get("Content-Encoding", "identity")
+        if encoding.strip().lower() != "identity":
+            raise DownloadLimitError("unsupported page content encoding")
+        length = response.headers.get("Content-Length", "")
+        if length.isdecimal() and int(length) > MAX_PAGE_BYTES:
+            raise DownloadLimitError("page exceeds the download byte limit")
+    response.stream = _BoundedPageStream(response.stream, discard=discard, account_bytes=account_bytes)
 
 
 def _reject_duplicate_pages(
@@ -87,6 +131,8 @@ async def download_chapter_to_cbz(
     page_urls = await source.get_pages(chapter_external_id)
     if not page_urls:
         raise RuntimeError(f"{source.name} returned no pages for chapter {chapter.number}")
+    if len(page_urls) > MAX_CHAPTER_PAGES:
+        raise DownloadLimitError("chapter exceeds the page count limit")
 
     async def check_cancelled() -> None:
         if cancel_cb is None:
@@ -100,10 +146,20 @@ async def download_chapter_to_cbz(
     pages: list[bytes | None] = [None] * len(page_urls)
     original_identities: list[tuple[int, int] | None] = [None] * len(page_urls)
     done = 0
+    downloaded_bytes = 0
+    retained_bytes = 0
+    transferred_bytes = 0
     sem = asyncio.Semaphore(PAGE_CONCURRENCY)
 
+    def account_bytes(size: int) -> None:
+        nonlocal transferred_bytes
+        transferred_bytes += size
+        if transferred_bytes > MAX_CHAPTER_BYTES:
+            raise DownloadLimitError("chapter exceeds the download byte limit")
+
     client_options = {
-        "headers": {"User-Agent": USER_AGENT},
+        "headers": {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+        "event_hooks": {"response": [partial(_bound_page_response, account_bytes=account_bytes)]},
         "timeout": 120,
         "follow_redirects": True,
         # Unchecked means direct even if the container inherits HTTP_PROXY.
@@ -115,7 +171,7 @@ async def download_chapter_to_cbz(
     async with httpx.AsyncClient(**client_options) as client:
 
         async def fetch(i: int, url: str) -> None:
-            nonlocal done
+            nonlocal done, downloaded_bytes, retained_bytes
             async with sem:
                 # retry any per-page error, not just httpx's: source
                 # download_page overrides can fail in their own ways
@@ -127,6 +183,8 @@ async def download_chapter_to_cbz(
                         if not guess_extension(content, fallback=""):
                             raise ValueError("response is not a supported image")
                         break
+                    except DownloadLimitError:
+                        raise
                     except Exception as exc:
                         if attempt == 2:
                             if proxy_enabled and isinstance(exc, httpx.HTTPError):
@@ -149,13 +207,22 @@ async def download_chapter_to_cbz(
                                 raise RuntimeError(message) from cause
                             raise RuntimeError(f"page {i + 1} failed: {exc}") from exc
                         await asyncio.sleep(2 * (attempt + 1))
+                if len(content) > MAX_PAGE_BYTES:
+                    raise DownloadLimitError("page exceeds the download byte limit")
+                downloaded_bytes += len(content)
+                if downloaded_bytes > MAX_CHAPTER_BYTES:
+                    raise DownloadLimitError("chapter exceeds the download byte limit")
                 original_identities[i] = page_bytes_signature([content])[0]
                 # Transform while this fetch owns its bounded page slot. Only
                 # compressed output is retained for the rest of the chapter;
                 # progress counts optimized pages, keeping the stall watchdog
                 # alive even for long chapters. Codec work has a global slot.
                 await check_cancelled()
-                pages[i] = await optimize_page_async(content, optimization)
+                optimized = await optimize_page_async(content, optimization)
+                retained_bytes += len(optimized)
+                if retained_bytes > MAX_CHAPTER_BYTES:
+                    raise DownloadLimitError("chapter exceeds the archive byte limit")
+                pages[i] = optimized
                 del content
             done += 1
             await check_cancelled()

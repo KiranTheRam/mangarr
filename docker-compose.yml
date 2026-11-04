@@ -4,14 +4,16 @@ services:
     container_name: mangarr
     ports:
       - "6996:6996"
+    environment:
+      MANGARR_AUTH_USERNAME: ${MANGARR_AUTH_USERNAME:?Set MANGARR_AUTH_USERNAME}
+      MANGARR_AUTH_PASSWORD: ${MANGARR_AUTH_PASSWORD:?Set MANGARR_AUTH_PASSWORD}
+      # Optional file ownership and permissions for new files.
+      # PUID: "1000"
+      # PGID: "1000"
+      # UMASK: "002"
     volumes:
       - ./data/mangarr-config:/config
       # Mount the same media path in your existing qBittorrent container so
       # Mangarr can import completed downloads and hardlink them into the library.
       - ./data/media:/media
-    # Optional: create files as your own user instead of root (see README).
-    # environment:
-    #   - PUID=1000
-    #   - PGID=1000
-    #   - UMASK=002
     restart: unless-stopped

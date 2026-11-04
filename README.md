@@ -78,6 +78,8 @@ design; it is the automation half of your manga stack.
 
 ```bash
 git clone <this repo> mangarr && cd mangarr
+# Set MANGARR_AUTH_USERNAME and MANGARR_AUTH_PASSWORD in a private .env
+# file or export them in your shell before starting Compose.
 docker compose up -d
 ```
 
@@ -210,7 +212,7 @@ Backend (Python ≥3.11):
 ```bash
 cd backend
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/uvicorn mangarr.main:app --port 6996 --reload
+MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true .venv/bin/uvicorn mangarr.main:app --port 6996 --reload
 ```
 
 Frontend (Node 20.19+ or 22.12+, as required by Vite 8):
@@ -242,8 +244,9 @@ Environment variables (all optional):
 | `MANGARR_SQLITE_WAL` | `true`        | Use SQLite WAL mode (see below)                   |
 | `MANGARR_LOG_LEVEL`  | `INFO`        | Log level (uppercase: `DEBUG`, `INFO`, `WARNING`) |
 | `MANGARR_API_KEY`    | *(generated)* | Fixed web UI API key instead of a generated one   |
-| `MANGARR_AUTH_USERNAME` | *(empty)* | Optional browser HTTP Basic login username |
+| `MANGARR_AUTH_USERNAME` | *(empty)* | Browser HTTP Basic login username |
 | `MANGARR_AUTH_PASSWORD` | *(empty)* | Browser login password; set together with username |
+| `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER` | `false` | Allow browser access without built-in login on an explicitly trusted deployment |
 | `MANGARR_ALLOWED_HOSTS` | `[]` | Additional exact DNS names as a JSON array (no scheme, port or wildcard) |
 
 `MANGARR_HOST` and `MANGARR_PORT` apply when Mangarr is started with
@@ -270,15 +273,18 @@ revoked independently.
 
 ### Browser access and upgrading
 
-Browser login is opt-in to preserve existing installations: set both
-`MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD`, then restart. The browser
-prompts for credentials before serving the UI or `/initialize.json`. Partial
-configuration fails startup instead of silently disabling login. To recover
-access, change or remove both values in your environment and restart. Use HTTPS
-on a trusted reverse proxy when credentials travel across the network; Basic
-authentication itself does not encrypt them. There is no automatic local-address
-bypass. With login disabled, anyone who can reach the app using an allowed Host
-can still obtain full API access; startup logs warn about this mode.
+Set both `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` before starting or
+upgrading. The supplied Compose file requires them. The browser prompts for
+credentials before serving the UI or `/initialize.json`. With neither value
+set, browser access is denied by default. Setting only one value fails startup.
+To recover access, change both values in your environment and restart. Use HTTPS
+on a trusted reverse proxy when credentials travel across the network.
+
+Custom deployments can explicitly set `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true`
+with both credentials unset, for example when an authenticated reverse proxy
+is the only route to Mangarr. In this mode any client with direct access to
+Mangarr can obtain full API access. If an existing instance was accessible to
+untrusted clients before upgrading, rotate its bootstrap and named API keys.
 
 Host validation is always enabled, including for API clients. IP addresses
 (IPv4 or bracketed IPv6) and `localhost` work by default. **Before upgrading**,

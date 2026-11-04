@@ -29,6 +29,7 @@ async def session(tmp_path):
 async def client(session, monkeypatch):
     monkeypatch.setattr(config, "auth_username", "")
     monkeypatch.setattr(config, "auth_password", SecretStr(""))
+    monkeypatch.setattr(config, "allow_unauthenticated_browser", False)
     monkeypatch.setattr(config, "allowed_hosts", ["reader.example"])
     monkeypatch.setattr(deps, "_api_key", "bootstrap")
 
@@ -48,6 +49,12 @@ def enable_login(monkeypatch):
 
 
 async def test_browser_bootstrap_and_independent_api_auth(client, session, monkeypatch):
+    response = await client.get("/initialize.json", headers={"X-Forwarded-For": "127.0.0.1"})
+    assert response.status_code == 403
+    assert "bootstrap" not in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
+    monkeypatch.setattr(config, "allow_unauthenticated_browser", True)
     assert (await client.get("/initialize.json")).json()["apiKey"] == "bootstrap"
     enable_login(monkeypatch)
     for path in ("/", "/initialize.json", "/docs", "/openapi.json", "/assets/missing", "/api/v1-other"):
@@ -89,6 +96,19 @@ async def test_duplicate_and_missing_host(client):
     request = client.build_request("GET", "/ping")
     del request.headers["host"]
     assert (await client.send(request)).status_code == 400
+
+
+async def test_mount_path_cannot_bypass_browser_login(client, monkeypatch):
+    transport = httpx.ASGITransport(app=app, root_path="/api/v1")
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as mounted:
+        assert (await mounted.get("/api/v1/ping")).status_code == 200
+        assert (await mounted.get("/api/v1/initialize.json")).status_code == 403
+        enable_login(monkeypatch)
+        assert (await mounted.get("/api/v1/initialize.json")).status_code == 401
+        response = await mounted.get("/api/v1/initialize.json", auth=("reader", "password"))
+        assert response.json()["apiKey"] == "bootstrap"
+        assert response.headers["cache-control"] == "no-store"
+        assert (await mounted.get("/api/v1/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
 
 
 def test_partial_auth_configuration_fails_without_printing_password():
