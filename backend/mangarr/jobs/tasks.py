@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import kavita, notifications
+from .. import kavita, notifications, settings_service
 from ..automation import (
     FINISHED_SERIES_MODES,
     MERGED_FILE_SOURCE,
@@ -55,6 +55,7 @@ from ..models import (
     DownloadStatus,
     HistoryEvent,
     Series,
+    SeriesSourceLink,
     SeriesStatus,
 )
 from ..sources import registry
@@ -1747,31 +1748,47 @@ async def _queue_duplicate_fallback(
 
 
 async def _claim_duplicate_fallback(
-    session: AsyncSession, failed: Download, chapter: Chapter,
+    session: AsyncSession, failed: Download, series: Series, chapter: Chapter,
+    link: SeriesSourceLink,
 ) -> bool:
-    # The API can change the queue or chapter during provider verification.
-    # Recheck under SQLite's write lock and keep it through enqueue + commit.
+    # The API can change the queue, chapter, or source policy during reader
+    # verification. Keep SQLite's write lock from this recheck through commit.
     still_failed = select(Download.id).where(
         Download.id == failed.id,
         Download.status == DownloadStatus.FAILED,
         Download.error == failed.error,
     ).exists()
     active = select(Download.id).where(
-        Download.series_id == chapter.series_id,
+        Download.series_id == series.id,
         or_(Download.chapter_id == chapter.id, Download.chapter_id.is_(None)),
         Download.status.in_(ACTIVE_DOWNLOAD_STATUSES),
     ).exists()
+    same_policy = select(Series.id).where(
+        Series.id == series.id,
+        Series.source_priority == series.source_priority,
+        Series.blocked_sources == series.blocked_sources,
+        Series.preferred_groups == series.preferred_groups,
+        Series.blocked_groups == series.blocked_groups,
+    ).exists()
+    same_link = select(SeriesSourceLink.id).where(
+        SeriesSourceLink.series_id == series.id,
+        SeriesSourceLink.source_name == link.source_name,
+        SeriesSourceLink.external_id == link.external_id,
+    ).exists()
     result = await session.execute(
         sa_update(Chapter)
-        .where(Chapter.id == chapter.id, ~Chapter.excluded, ~Chapter.downloaded,
-               still_failed, ~active)
+        .where(Chapter.id == chapter.id, Chapter.series_id == series.id,
+               ~Chapter.excluded, ~Chapter.downloaded,
+               still_failed, ~active, same_policy, same_link)
         .values(excluded=Chapter.excluded)
         .execution_options(synchronize_session=False)
     )
-    if result.rowcount != 1:
-        await session.rollback()
-        return False
-    return True
+    if result.rowcount == 1:
+        enabled = await settings_service.get(session, f"source_{link.source_name}_enabled")
+        if enabled == "true":
+            return True
+    await session.rollback()
+    return False
 
 
 async def grab_missing_chapters(
@@ -1929,7 +1946,7 @@ async def grab_missing_chapters(
                 if has_blocking_failure(ch, sc):
                     continue
                 if fallback_from is not None and not await _claim_duplicate_fallback(
-                    session, fallback_from, ch,
+                    session, fallback_from, series, ch, link,
                 ):
                     return 0
                 remaining.pop(sc.number, None)

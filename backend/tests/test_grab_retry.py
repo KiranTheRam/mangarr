@@ -29,6 +29,7 @@ from mangarr.models import (
     RootFolder,
     Series,
     SeriesSourceLink,
+    Setting,
 )
 from mangarr.sources.base import DirectSource, SourceChapter, TorrentRelease
 from mangarr.torrent_selection import TorrentSelection
@@ -636,7 +637,10 @@ async def test_duplicate_fallback_does_not_cycle_between_sources(
 
 
 @pytest.mark.parametrize(
-    "interruption", ["excluded", "queued", "downloading", "series torrent", "dismissed"],
+    "interruption", [
+        "excluded", "queued", "downloading", "series torrent", "dismissed",
+        "source blocked", "group blocked", "source relinked", "source disabled",
+    ],
 )
 async def test_duplicate_fallback_rechecks_after_verification(
     db_session, duplicate_release, monkeypatch, interruption,
@@ -645,6 +649,7 @@ async def test_duplicate_fallback_rechecks_after_verification(
     series_id, chapter_id, dl_id = series.id, chapter.id, dl.id
     maker = async_sessionmaker(db_session.bind, expire_on_commit=False)
     alternative.requires_chapter_verification = True
+    alternative.releases[0].group = "Fixture Group"
 
     async def verify(ids):
         async with maker() as other:
@@ -654,6 +659,23 @@ async def test_duplicate_fallback_rechecks_after_verification(
                 await other.commit()
             elif interruption == "dismissed":
                 await queue.remove_from_queue(dl_id, other)
+            elif interruption in {"source blocked", "group blocked"}:
+                current = await other.get(Series, series_id)
+                if interruption == "source blocked":
+                    current.blocked_sources = alternative.name
+                else:
+                    current.blocked_groups = "Fixture Group"
+                await other.commit()
+            elif interruption == "source relinked":
+                link = await other.scalar(select(SeriesSourceLink).where(
+                    SeriesSourceLink.series_id == series_id,
+                    SeriesSourceLink.source_name == alternative.name,
+                ))
+                link.external_id = "new-series-id"
+                await other.commit()
+            elif interruption == "source disabled":
+                other.add(Setting(key=f"source_{alternative.name}_enabled", value="false"))
+                await other.commit()
             else:
                 torrent = interruption == "series torrent"
                 other.add(Download(
