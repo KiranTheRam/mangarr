@@ -88,6 +88,10 @@ NO_ROOT_FOLDER = "series has no root folder configured"
 # leaves them out
 NOT_SOURCE_FAILURES = (LIBRARY_UNAVAILABLE, SOURCE_DISABLED, NO_ROOT_FOLDER)
 
+ACTIVE_DOWNLOAD_STATUSES = (
+    DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+)
+
 # upgrades share the single direct queue with new chapters; a series that
 # just had upgrades enabled must not flood it in one pass
 UPGRADES_PER_PASS = 25
@@ -1316,27 +1320,26 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         log.info("direct download %d cancelled: %s", download_id, cancel_exc)
         return
     except DuplicateChapterPagesError as duplicate:
-        # This is a source-listing alias, not a transient network failure. Keep
-        # the chapter as an excluded tombstone so refreshes cannot recreate or
-        # repeatedly fetch it. The guard runs before write_cbz, so no media
-        # artifact needs to be removed here.
+        # The duplicate check runs before the archive write. Only the failed
+        # release changes here, so any existing copy of the chapter stays intact.
         await session.rollback()
-        current_dl = await session.get(Download, download_id)
-        current_chapter = await session.get(Chapter, chapter_id)
-        if current_dl is None or current_chapter is None:
+        error = f"duplicate pages rejected: {duplicate}"[:500]
+        rejected = await session.execute(
+            sa_update(Download)
+            .where(Download.id == download_id, Download.status == DownloadStatus.DOWNLOADING)
+            .values(status=DownloadStatus.FAILED, error=error, transient_error=False)
+            .execution_options(synchronize_session=False)
+        )
+        if rejected.rowcount != 1:
+            await session.rollback()
             return
-        current_chapter.excluded = True
-        current_chapter.monitored = False
-        current_chapter.downloaded = False
-        current_chapter.file_path = ""
-        current_dl.status = DownloadStatus.FAILED
-        current_dl.error = f"duplicate pages rejected and chapter excluded: {duplicate}"[:500]
         session.add(HistoryEvent(
             series_id=series_id, chapter_id=chapter_id, event="duplicate_rejected",
-            source_name=source_name, detail=current_dl.error,
+            source_name=source_name, detail=error,
         ))
         await session.commit()
         log.warning("direct download %d rejected: %s", download_id, duplicate)
+        await _queue_duplicate_fallback(session, series_id, download_id, error)
         return
     except Exception as exc:
         # a library that went away mid-download is not a source failure: mark
@@ -1719,12 +1722,66 @@ def failed_grab_blocks(now: datetime):
     )
 
 
+async def _queue_duplicate_fallback(
+    session: AsyncSession, series_id: int, download_id: int, error: str,
+) -> None:
+    # Share the monitor and refresh lock so automatic grabs cannot race the
+    # fallback. The rejection is already committed before any provider calls.
+    lock = await acquire_series_lock(series_id)
+    try:
+        failed = await session.get(Download, download_id, populate_existing=True)
+        if failed is None or failed.status != DownloadStatus.FAILED or failed.error != error:
+            return
+        series = await _load_series(session, series_id)
+        if series is not None:
+            values = await registry.apply_settings(session)
+            # The original attempt may have been explicitly requested.
+            await grab_missing_chapters(
+                session, series, values, only_monitored=False, fallback_from=failed,
+            )
+    except Exception:
+        await session.rollback()
+        log.exception("could not queue fallback for direct download %d", download_id)
+    finally:
+        lock.release()
+
+
+async def _claim_duplicate_fallback(
+    session: AsyncSession, failed: Download, chapter: Chapter,
+) -> bool:
+    # The API can change the queue or chapter during provider verification.
+    # Recheck under SQLite's write lock and keep it through enqueue + commit.
+    still_failed = select(Download.id).where(
+        Download.id == failed.id,
+        Download.status == DownloadStatus.FAILED,
+        Download.error == failed.error,
+    ).exists()
+    active = select(Download.id).where(
+        Download.series_id == chapter.series_id,
+        or_(Download.chapter_id == chapter.id, Download.chapter_id.is_(None)),
+        Download.status.in_(ACTIVE_DOWNLOAD_STATUSES),
+    ).exists()
+    result = await session.execute(
+        sa_update(Chapter)
+        .where(Chapter.id == chapter.id, ~Chapter.excluded, ~Chapter.downloaded,
+               still_failed, ~active)
+        .values(excluded=Chapter.excluded)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        await session.rollback()
+        return False
+    return True
+
+
 async def grab_missing_chapters(
     session: AsyncSession, series: Series, values: dict[str, str],
     only_monitored: bool = True,
     chapter_cache: ChapterListCache | None = None,
     exclude_numbers: set[float] | None = None,
     allowed_series_download_id: int | None = None,
+    *,
+    fallback_from: Download | None = None,
 ) -> int:
     """Queue missing monitored chapters from linked direct sources.
 
@@ -1732,6 +1789,7 @@ async def grab_missing_chapters(
     so a newly added series starts pulling available chapters as soon as its
     source links and chapter list have been created. `only_monitored=False`
     (explicit user-requested search) also grabs unmonitored missing chapters.
+    A duplicate fallback is limited to the failed download's chapter.
     """
     if series.root_folder is None:
         # e.g. its root folder was deleted: the worker could only fail every
@@ -1747,11 +1805,7 @@ async def grab_missing_chapters(
     result = await session.execute(
         select(Download.id, Download.chapter_id).where(
             Download.series_id == series.id,
-            Download.status.in_([
-                DownloadStatus.QUEUED,
-                DownloadStatus.DOWNLOADING,
-                DownloadStatus.IMPORTING,
-            ]),
+            Download.status.in_(ACTIVE_DOWNLOAD_STATUSES),
         )
     )
     active_rows = result.all()
@@ -1776,8 +1830,11 @@ async def grab_missing_chapters(
         and not c.downloaded
         and c.id not in active_chapters
         and c.number not in excluded
+        and (fallback_from is None or c.id == fallback_from.chapter_id)
     ]
     sources = registry.series_direct_sources(values, series)
+    if fallback_from is not None:
+        sources = [src for src in sources if src.name != fallback_from.source_name]
     source_order = [src.name for src in sources]
     upgrades = {
         number: chapter
@@ -1786,7 +1843,7 @@ async def grab_missing_chapters(
             skip_ids=active_chapters,
         ).items()
         if number not in excluded
-    }
+    } if fallback_from is None else {}
     if not wanted and not upgrades:
         return 0
 
@@ -1854,13 +1911,27 @@ async def grab_missing_chapters(
                     continue
                 if sc.number in remaining or is_upgrade(ch, src.name, source_order, blocked_groups):
                     candidates.append(sc.external_id)
-            verified = await src.verify_chapters(candidates)
+            if not candidates:
+                continue
+            try:
+                verified = await src.verify_chapters(candidates)
+            except Exception as exc:
+                if fallback_from is None:
+                    raise
+                _note_source_failure(src.name, exc)
+                log.warning("fallback: %s verification failed for %r: %s",
+                            src.name, series.title, type(exc).__name__)
+                continue
             source_chapters = [sc for sc in source_chapters if sc.external_id in verified]
         for sc in source_chapters:
             ch = remaining.get(sc.number)
             if ch is not None:
                 if has_blocking_failure(ch, sc):
                     continue
+                if fallback_from is not None and not await _claim_duplicate_fallback(
+                    session, fallback_from, ch,
+                ):
+                    return 0
                 remaining.pop(sc.number, None)
                 await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url,
                                      commit=False, group=sc.group)
