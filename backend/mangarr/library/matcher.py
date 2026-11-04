@@ -5,6 +5,7 @@ chapter labels on every page use those labels instead of assuming the release's
 volume number matches the metadata edition. Archive directories and ComicInfo
 titles are cached per file version; page images are never read or written."""
 
+import json
 import zipfile
 import zlib
 from collections.abc import Iterable
@@ -119,20 +120,39 @@ def comicinfo_title(path: Path) -> str:
     return title
 
 
-def _read_comicinfo_title(path: Path) -> str:
+# Plenty for ordinary metadata, independent of the archive's compressed size.
+MAX_COMICINFO_BYTES = 1024 * 1024
+
+
+def _read_comicinfo(path: Path) -> ElementTree.Element | None:
     try:
         with zipfile.ZipFile(path) as archive:
             member = next(
-                (name for name in archive.namelist()
-                 if Path(name).name.lower() == "comicinfo.xml"),
+                (info for info in archive.infolist()
+                 if Path(info.filename).name.lower() == "comicinfo.xml"),
                 None,
             )
-            if member is None:
-                return ""
-            root = ElementTree.fromstring(archive.read(member))
-            return " ".join((root.findtext("Title") or "").split())
-    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError):
-        return ""
+            if (member is None or member.file_size > MAX_COMICINFO_BYTES
+                    or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
+                return None
+            # zipfile's BZIP2/LZMA readers can allocate unbounded decompressed
+            # output before applying read(n), unlike STORED/DEFLATED. Ignore
+            # metadata using those methods, even if the declared size is small.
+            # Pass the actual ZipInfo (duplicate names must not change which
+            # entry was checked), and bound decompression even for bad headers.
+            with archive.open(member) as stream:
+                data = stream.read(MAX_COMICINFO_BYTES + 1)
+            if len(data) > MAX_COMICINFO_BYTES:
+                return None
+            return ElementTree.fromstring(data)
+    except (OSError, KeyError, ValueError, RuntimeError, EOFError,
+            zipfile.BadZipFile, zlib.error, ElementTree.ParseError):
+        return None
+
+
+def _read_comicinfo_title(path: Path) -> str:
+    root = _read_comicinfo(path)
+    return " ".join((root.findtext("Title") or "").split()) if root is not None else ""
 
 
 def comicinfo_number(path: Path) -> float | None:
@@ -152,19 +172,13 @@ def comicinfo_number(path: Path) -> float | None:
 
 
 def _read_comicinfo_number(path: Path) -> float | None:
+    root = _read_comicinfo(path)
+    if root is None:
+        return None
+    raw = (root.findtext("Number") or "").strip()
     try:
-        with zipfile.ZipFile(path) as archive:
-            member = next(
-                (name for name in archive.namelist()
-                 if Path(name).name.lower() == "comicinfo.xml"),
-                None,
-            )
-            if member is None:
-                return None
-            root = ElementTree.fromstring(archive.read(member))
-            raw = (root.findtext("Number") or "").strip()
-            return float(raw) if raw else None
-    except (OSError, KeyError, ValueError, zipfile.BadZipFile, ElementTree.ParseError):
+        return float(raw) if raw else None
+    except ValueError:
         return None
 
 
@@ -241,6 +255,58 @@ def _archive_page_signature(path: str, mtime_ns: int, size: int) -> PageSignatur
     except (OSError, zipfile.BadZipFile):
         return None
     return signature or None
+
+
+# Optional provenance binds original identities to the actual archived pages.
+# Keep archive_page_signature's byte identity contract unchanged for its callers.
+PAGE_PROVENANCE_NAME = "MangarrPageProvenance.json"
+
+
+def archive_source_page_signature(path: Path) -> PageSignature | None:
+    if path.suffix.lower() not in {".cbz", ".zip"}:
+        return None
+    try:
+        stat = path.stat()
+        return _archive_source_page_signature(str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=1024)
+def _archive_source_page_signature(path: str, mtime_ns: int, size: int) -> PageSignature | None:
+    stored = _archive_page_signature(path, mtime_ns, size)
+    if not stored:
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = [m for m in archive.infolist() if m.filename == PAGE_PROVENANCE_NAME]
+            if not members:
+                return stored  # archives created before optimization or with it off
+            if len(members) != 1:
+                return None
+            member = members[0]
+            if (member.file_size > MAX_COMICINFO_BYTES or member.compress_type not in
+                    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
+                return None
+            with archive.open(member) as stream:
+                data = stream.read(MAX_COMICINFO_BYTES + 1)
+            if len(data) > MAX_COMICINFO_BYTES:
+                return None
+            payload = json.loads(data)
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                return None
+            original = payload.get("original")
+            if (payload.get("archived") != [list(pair) for pair in stored]
+                    or not isinstance(original, list) or len(original) != len(stored)):
+                return None
+            if not all(isinstance(pair, list) and len(pair) == 2
+                       and all(type(v) is int for v in pair)
+                       and 0 <= pair[0] <= 0xFFFFFFFF and pair[1] > 0 for pair in original):
+                return None
+            return tuple(tuple(pair) for pair in original)
+    except (OSError, KeyError, ValueError, RuntimeError, EOFError, RecursionError,
+            zipfile.BadZipFile, zlib.error):
+        return None
 
 
 def find_series_media_files(

@@ -39,6 +39,8 @@ design; it is the automation half of your manga stack.
     personal API client in Settings for normal use.
   - **MangaFire** (API) — broad English archive and an additional direct source
     for decimal-numbered bonus and special chapters.
+  - **FanFox** (scraper, opt-in) — public mobile reader, including numbered extras.
+    Mangarr checks the public reader and its first image before offering a release.
   - **WeebCentral** (scraper) — broad catalog, no account needed.
   - **Atsumaru** (API) — broad archive of manga, manhwa, and manhua. Where
     several groups translated a chapter, the best-rated one is used. Recent
@@ -248,6 +250,9 @@ Environment variables (all optional):
 | `MANGARR_SQLITE_WAL` | `true`        | Use SQLite WAL mode (see below)                   |
 | `MANGARR_LOG_LEVEL`  | `INFO`        | Log level (uppercase: `DEBUG`, `INFO`, `WARNING`) |
 | `MANGARR_API_KEY`    | *(generated)* | Fixed web UI API key instead of a generated one   |
+| `MANGARR_AUTH_USERNAME` | *(empty)* | Optional browser HTTP Basic login username |
+| `MANGARR_AUTH_PASSWORD` | *(empty)* | Browser login password; set together with username |
+| `MANGARR_ALLOWED_HOSTS` | `[]` | Additional exact DNS names as a JSON array (no scheme, port or wildcard) |
 
 `MANGARR_HOST` and `MANGARR_PORT` apply when Mangarr is started with
 `python -m mangarr.main`; a `uvicorn` command line like the one under Local
@@ -271,6 +276,128 @@ NextPanel or scripts) their own keys, create named keys under **Settings → API
 Keys**; any of them authenticates `/api/v1` calls via `X-Api-Key` and can be
 revoked independently.
 
+### Browser access and upgrading
+
+Browser login is opt-in to preserve existing installations: set both
+`MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD`, then restart. The browser
+prompts for credentials before serving the UI or `/initialize.json`. Partial
+configuration fails startup instead of silently disabling login. To recover
+access, change or remove both values in your environment and restart. Use HTTPS
+on a trusted reverse proxy when credentials travel across the network; Basic
+authentication itself does not encrypt them. There is no automatic local-address
+bypass. With login disabled, anyone who can reach the app using an allowed Host
+can still obtain full API access; startup logs warn about this mode.
+
+Host validation is always enabled, including for API clients. IP addresses
+(IPv4 or bracketed IPv6) and `localhost` work by default. **Before upgrading**,
+add every DNS name used by browsers, reverse proxies and integration clients to
+`MANGARR_ALLOWED_HOSTS`, for example `'["mangarr", "manga.example.com"]'`.
+Names match exactly, ignoring case, without a trailing dot; paths, schemes,
+ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
+with configuration instructions; direct IP access remains available for recovery.
+Proxies must preserve an allowed Host or set it explicitly. Forwarded headers
+never establish trust. Host validation limits DNS rebinding; it is not login.
+
+Existing named API keys and `X-Api-Key` clients continue to work without browser
+credentials. Browser credentials alone do not authenticate API calls; API keys
+alone do not unlock browser bootstrap when login is enabled. `/ping` remains
+public and contains no secrets. Bootstrap responses use `Cache-Control: no-store`.
+
+Saved integration secrets are bound to the exact saved URL (including scheme,
+port and path), and qBittorrent passwords also to the username. After changing
+one of those fields, re-enter the secret before **Test** or **Save**. A masked
+or omitted secret cannot be carried to a new destination; even cosmetic URL
+edits require re-entry. Explicitly clearing a secret on Save removes it rather
+than reusing it. Kavita's saved-library lookup can still omit the key at the
+unchanged saved URL. HTTP client request/debug logs are suppressed even at
+`DEBUG`, and connection errors omit remote URLs and response bodies to avoid
+exposing integration credentials. ComicInfo metadata larger than 1 MiB is
+ignored during matching/scanning, as is metadata compressed with methods other
+than ZIP STORED or DEFLATE. The archive's normal filename/page matching continues.
+
+### Source proxies
+
+The shared **Content proxy URL** and source **Proxy** toggles route only chapter
+image bytes. Search, metadata, and page manifests stay direct by default;
+upgrading preserves these settings and routes.
+
+Under **Settings → Source request proxies**, MangaFire and WeebCentral each
+have an independent HTTP(S) proxy URL and routing selector. Choose **Proxy all
+source requests and images** to explicitly route that source's search, chapter
+metadata, page manifests, and images through its URL. MangaFire's frontend,
+JavaScript retrieval, and token generation use that same route. This mode
+overrides the shared content proxy and toggle for that source. Other sources
+retain their existing content-only proxy support.
+
+Proxy routes fail closed: missing or unreachable proxies produce an error,
+without retrying directly. Disabled sources keep their routing requirements;
+re-enabling a source requires its selected proxy URL. Saved proxy URLs are
+masked because they may contain credentials. To replace a saved URL, enter
+the complete address; to remove it, clear the field and select the default
+routing mode (also clear the content toggle if direct images are wanted).
+Settings changes apply to new requests/jobs. An active download keeps the
+route it started with, including its page manifest and images.
+
+WeebCentral sends browser-compatible HTML request headers. Neither headers
+nor a proxy guarantee access: HTTP 403 can still depend on site policy and
+network conditions. Mangarr does not solve challenges or bypass access controls.
+
+### Chapter image optimization
+
+In **Settings → Chapter Image Optimization**, opt in to reducing new direct-download
+chapter sizes before CBZ packaging. It is **off by default**: original image bytes
+are preserved. Existing library files and torrent imports are never recompressed.
+Each active download snapshots the saved policy when the worker starts; changes
+apply to subsequent downloads.
+
+The live sample preview compares the original image with output from the same
+encoder used by downloads. Drag the quality slider or change format/width to see
+updated image bytes, dimensions and file-size savings without saving settings or
+starting a download. Use **View at actual size (100%)** and scroll each image to
+inspect fine text and artwork. The built-in sample is generated locally and
+contains text, line art, halftones and color gradients; it never fetches external
+images or modifies library files. With optimization off, both views show the
+original image. Savings on the sample do not predict every chapter's savings.
+
+- Choose lossy **WebP** (default) or **JPEG**, with quality **1–100** (default **85**).
+  Even quality 100 is lossy. Savings depend on the source; inspect fine text, line
+  art and gradients before choosing a lower quality. Some readers support JPEG
+  more widely than WebP. Pages may retain mixed formats within a CBZ.
+- **Maximum width** is **0** (original dimensions) by default, or **1–10000** pixels.
+  EXIF orientation is applied first; resizing preserves aspect ratio, rounds the
+  height to the nearest pixel, and never enlarges a page.
+- If encoding is larger or equal in size, keep the original. When a supported
+  page exceeds the explicit width limit, the resized output takes precedence
+  over this size fallback, even if it is larger.
+- Static JPEG, PNG and WebP can be optimized using Pillow. Animation (including
+  APNG/WebP), GIF, AVIF, unsupported color modes, decoder/encoder failures, and
+  pages above **32 MiB compressed or 20 megapixels** keep their original bytes.
+  JPEG preserves transparent pages by keeping the original; WebP keeps alpha.
+  ICC profiles are retained; rewritten pages discard other embedded metadata.
+- Very tall pages that cannot fit the selected encoder (WebP: 16383 pixels per
+  side; JPEG: 65500) stay original. Safety and format preservation take priority
+  over the width limit. Skipped transformations are logged; pages are never
+  silently dropped or split.
+
+The packaged image extensions follow their actual bytes; page order and
+ComicInfo metadata are retained. Archives whose page bytes changed include a small
+`MangarrPageProvenance.json` member binding ordered original page CRC/size pairs
+to the archived page identities. This keeps source-alias duplicate detection
+working across format, quality, resize and enabled/disabled policy changes,
+without treating identical lossy output from different originals as duplicates.
+Volume merging carries these original identities forward.
+Older archives continue using their actual page identities. Modified or invalid
+provenance is ignored for duplicate decisions.
+
+Transforms run off the async event loop, with one decoded page at a time and a
+pixel/input-size limit. Cancellation waits for the current bounded transform to
+finish, then prevents archive publication. The existing atomic CBZ publication
+and partial-file cleanup remain in use. The downloader still holds the chapter's
+compressed output page bytes in memory; optimization does not impose a new total
+chapter size limit. WebP/JPEG encoder availability is checked when enabling the feature;
+standard Pillow wheels in the Docker image supply both codecs. Custom Pillow
+builds must provide the selected encoder.
+
 ## How grabbing works
 
 1. When you add a series, mangarr links it to each enabled source by title
@@ -285,7 +412,7 @@ revoked independently.
    seeders, and size. The selected release goes to qBittorrent under the
    `mangarr` category and is imported when complete.
 
-Please be a good citizen: keep the honest User-Agent, don't lower the rate
+Please be a good citizen: respect source access controls, don't lower the rate
 limits, and use a MangaDex account so their team can see the traffic is
 legitimate.
 

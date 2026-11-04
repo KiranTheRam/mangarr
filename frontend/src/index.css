@@ -786,6 +786,7 @@ table.data-table {
 
 .form-row input[type="text"],
 .form-row input[type="password"],
+.form-row input[type="number"],
 .form-row select,
 .form-row textarea {
   flex: 1;
@@ -2668,4 +2669,27 @@ kbd {
   .poster-card.selecting .no-cover {
     transition: none;
   }
+}
+
+/* Compare the original and actual encoded sample, with optional pixel zoom. */
+.image-quality-controls { display: flex; align-items: center; gap: 14px; flex: 1; max-width: 380px; min-width: 0; }
+.image-quality-controls input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
+.image-quality-controls input[type="number"] { flex: 0 0 80px; width: 80px; }
+.image-preview { margin-top: 24px; }
+.image-preview-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+.image-preview-toolbar h4 { margin: 0; font-size: 14px; }
+.image-preview-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.image-preview figure { margin: 0; min-width: 0; }
+.image-preview figcaption { display: flex; flex-direction: column; gap: 5px; min-height: 64px; font-size: 13px; }
+.image-preview figcaption span { color: var(--text-dim); font-size: 12px; }
+.image-preview-frame { height: 400px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+.image-preview-frame img { display: block; width: 100%; max-width: 100%; height: auto; }
+.image-preview-frame.actual-size img { width: auto; max-width: none; }
+.image-preview-frame.stale { opacity: .5; }
+@media (max-width: 640px) {
+  .image-quality-controls { width: 100%; max-width: none; }
+  .image-quality-controls input[type="number"] { flex: 0 0 80px; width: 80px; }
+  .image-preview-grid { grid-template-columns: 1fr; }
+  .image-preview figcaption { min-height: 46px; }
+  .image-preview-frame { height: 330px; }
 }

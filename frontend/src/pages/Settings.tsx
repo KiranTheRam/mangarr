@@ -7,6 +7,7 @@ import type {
   RootFolder,
   Settings as SettingsType,
 } from "../api/types";
+import { ImageOptimizationPreview } from "../components/ImageOptimizationPreview";
 import { FolderBrowser } from "../components/FolderBrowser";
 import { ErrorNotice, Spinner, Toggle, Toolbar } from "../components/common";
 import { SOURCE_LABELS } from "../sources";
@@ -163,6 +164,7 @@ const SOURCE_HINTS: Record<string, string> = {
   mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
   webtoons: "Official WEBTOON Originals. Only episodes that are currently free (no coins) are listed.",
   mangafire: "Broad English archive coverage, including many bonus and decimal chapters.",
+  fanfox: "Public English chapters, including numbered extras. Releases are checked against the public reader.",
   atsumaru: "Broad archive of manga, manhwa, and manhua; picks the best-rated scanlation of each chapter.",
   viz: "Exact printed-volume mappings for VIZ-licensed series; does not download chapters.",
   wikipedia: "Chapter titles and printed-volume tables for publishers not covered by VIZ.",
@@ -177,6 +179,7 @@ const CONTENT_SOURCES = new Set([
   "mangafire",
   "weebcentral",
   "atsumaru",
+  "fanfox",
   "tcbscans",
   "asura",
   "toonily",
@@ -204,7 +207,7 @@ function orderedSourceNames(form: SettingsType): string[] {
 
 /** Ordered, toggleable source list — stored as the comma-separated
  * source_priority setting, but never hand-edited as text. */
-function SourcePriority({
+export function SourcePriority({
   form,
   setForm,
 }: {
@@ -247,8 +250,8 @@ function SourcePriority({
               <span className="priority-toggle priority-proxy-toggle" title="Proxy chapter page/image downloads">
                 <span>Proxy</span>
                 <Toggle
-                  on={form[`source_${name}_proxy_enabled`] === "true"}
-                  disabled={!enabled}
+                  on={form[`source_${name}_proxy_mode`] === "all" || form[`source_${name}_proxy_enabled`] === "true"}
+                  disabled={!enabled || form[`source_${name}_proxy_mode`] === "all"}
                   label={`Use proxy for ${SOURCE_LABELS[name] ?? name} content downloads`}
                   onChange={(proxyEnabled) =>
                     setForm({
@@ -280,7 +283,7 @@ function SourcePriority({
   );
 }
 
-function ProxySettings({
+export function ProxySettings({
   form,
   setForm,
   set,
@@ -297,17 +300,18 @@ function ProxySettings({
     <div className="settings-section proxy-settings mobile-proxy-settings">
       <h3>Proxy</h3>
       <p className="section-hint">
-        Optionally route chapter page and image downloads through one HTTP proxy. Discovery,
-        metadata, authentication, and page manifests always connect directly.
+        Route chapter page and image downloads through a shared HTTP(S) proxy. Source requests
+        stay direct unless you explicitly select all requests below.
       </p>
       <div className="form-row">
         <label>Proxy address</label>
         <input
-          type="text"
+          type="password"
+          autoComplete="new-password"
           inputMode="url"
           autoCapitalize="none"
           autoCorrect="off"
-          placeholder="http://192.168.1.28:8888"
+          placeholder="http://proxy.example:8080"
           value={form.download_proxy_url ?? ""}
           onChange={set("download_proxy_url")}
         />
@@ -321,13 +325,16 @@ function ProxySettings({
               <div className="proxy-source-copy">
                 <span className="proxy-source-name">{label}</span>
                 <span className="proxy-source-detail">
-                  {form[`source_${name}_proxy_enabled`] === "true"
-                    ? "Downloads fail closed through the proxy"
+                  {form[`source_${name}_proxy_mode`] === "all"
+                    ? "All requests use the source proxy below"
+                    : form[`source_${name}_proxy_enabled`] === "true"
+                    ? "Downloads fail closed through the shared proxy"
                     : "Downloads connect directly"}
                 </span>
               </div>
               <Toggle
-                on={form[`source_${name}_proxy_enabled`] === "true"}
+                on={form[`source_${name}_proxy_mode`] === "all" || form[`source_${name}_proxy_enabled`] === "true"}
+                disabled={form[`source_${name}_proxy_mode`] === "all"}
                 label={`Use proxy for ${label} content downloads`}
                 onChange={(enabled) =>
                   setForm({
@@ -347,7 +354,57 @@ function ProxySettings({
       </div>
       <p className="section-hint proxy-fail-closed-note">
         Proxied downloads fail closed: if the proxy is unavailable, Mangarr does not retry that
-        content request directly. Turn a source off here to make its downloads connect directly.
+        request directly. The all-requests mode below overrides the content toggle for that source.
+      </p>
+    </div>
+  );
+}
+
+/** Broader routing is deliberately independent of existing content-only settings. */
+export function SourceRequestProxySettings({ form, set }: {
+  form: SettingsType;
+  set: (key: string) => (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
+}) {
+  return (
+    <div className="settings-section">
+      <h3>Source request proxies</h3>
+      <p className="section-hint">
+        MangaFire and WeebCentral can use a separate proxy for all source requests: search,
+        frontend and scripts, signing, chapters, page manifests, and images. Existing content
+        proxy settings apply until you opt in here. A proxy cannot guarantee access to a site.
+        Saved addresses are hidden because they may contain credentials.
+      </p>
+      {["mangafire", "weebcentral"].map((name) => (
+        <div key={name}>
+          <div className="form-row">
+            <label htmlFor={`${name}-proxy-mode`}>{SOURCE_LABELS[name]} routing</label>
+            <select
+              id={`${name}-proxy-mode`}
+              value={form[`source_${name}_proxy_mode`] ?? "inherit"}
+              disabled={form[`source_${name}_enabled`] !== "true"}
+              onChange={set(`source_${name}_proxy_mode`)}
+            >
+              <option value="inherit">Direct source requests; use content toggle for images</option>
+              <option value="all">Proxy all source requests and images</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label htmlFor={`${name}-proxy-url`}>{SOURCE_LABELS[name]} proxy URL</label>
+            <input
+              id={`${name}-proxy-url`} type="password" autoComplete="new-password"
+              autoCapitalize="none" autoCorrect="off" placeholder="http://proxy.example:8080"
+              disabled={form[`source_${name}_enabled`] !== "true"}
+              required={form[`source_${name}_proxy_mode`] === "all" && form[`source_${name}_enabled`] === "true"}
+              value={form[`source_${name}_proxy_url`] ?? ""}
+              onChange={set(`source_${name}_proxy_url`)}
+            />
+          </div>
+        </div>
+      ))}
+      <p className="section-hint">
+        All requests uses only the source URL above, including images, and fails closed if it
+        is missing or unavailable. Saving changes affects new requests and jobs; an active
+        download keeps its original route. Disabled sources retain their settings.
       </p>
     </div>
   );
@@ -450,6 +507,7 @@ function KavitaSettings({
         <label>API key</label>
         <input type="password" value={form.kavita_api_key ?? ""} onChange={set("kavita_api_key")} />
       </div>
+      <p className="section-hint">Re-enter the API key after changing the URL, before testing or saving.</p>
       <div className="form-row">
         <label>Scan scope</label>
         <select value={form.kavita_scan_mode ?? "series"} onChange={set("kavita_scan_mode")}>
@@ -508,6 +566,68 @@ function KavitaSettings({
           </select>
         </div>
       ))}
+    </div>
+  );
+}
+
+export function ImageOptimizationSettings({ form, setForm }: {
+  form: SettingsType;
+  setForm: (form: SettingsType) => void;
+}) {
+  const enabled = form.image_optimization_enabled === "true";
+  const change = (key: string) => (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
+    setForm({ ...form, [key]: event.target.value });
+  return (
+    <div className="settings-section">
+      <h3>Chapter Image Optimization</h3>
+      <p className="section-hint">
+        Original quality is the default. Turn on optimization to reduce storage for new direct
+        downloads using lossy compression. Existing files and torrent imports are unchanged.
+        Off keeps the original image bytes. Each download uses the settings saved when it starts.
+      </p>
+      <div className="form-row">
+        <label>Optimize downloaded images</label>
+        <Toggle on={enabled} onChange={(value) => setForm({ ...form,
+          image_optimization_enabled: value ? "true" : "false" })}
+          label="Optimize downloaded images" />
+      </div>
+      <div className="form-row">
+        <label htmlFor="image-format">Output format</label>
+        <select id="image-format" value={form.image_optimization_format ?? "webp"}
+          onChange={change("image_optimization_format")} disabled={!enabled}>
+          <option value="webp">WebP</option>
+          <option value="jpeg">JPEG (wider reader compatibility)</option>
+        </select>
+      </div>
+      <div className="form-row">
+        <label htmlFor="image-quality">Quality (1–100)</label>
+        <div className="image-quality-controls">
+          <input aria-label="Quality slider" type="range" min="1" max="100" step="1"
+            value={form.image_optimization_quality || "85"} disabled={!enabled}
+            onChange={change("image_optimization_quality")} aria-describedby="image-quality-hint" />
+          <input id="image-quality" type="number" min="1" max="100" step="1"
+            value={form.image_optimization_quality ?? "85"} disabled={!enabled}
+            onChange={change("image_optimization_quality")} aria-describedby="image-quality-hint" />
+        </div>
+      </div>
+      <p id="image-quality-hint" className="section-hint">
+        Higher quality usually uses more space. 85 is a starting point; even 100 is lossy.
+        Check small text and line art before choosing lower quality.
+      </p>
+      <div className="form-row">
+        <label htmlFor="image-width">Maximum width (pixels)</label>
+        <input id="image-width" type="number" min="0" max="10000" step="1"
+          value={form.image_optimization_max_width ?? "0"} disabled={!enabled}
+          onChange={change("image_optimization_max_width")} aria-describedby="image-width-hint" />
+      </div>
+      <p id="image-width-hint" className="section-hint">
+        0 keeps the original dimensions. Resizing keeps the aspect ratio and never upscales.
+        Originals are kept when encoding would be larger, unless resizing is required.
+        Animated, unsupported or oversized pages stay original; JPEG also keeps transparent
+        pages original. The width limit applies only to pages that can be safely optimized.
+        See the logs for skipped pages.
+      </p>
+      <ImageOptimizationPreview form={form} />
     </div>
   );
 }
@@ -636,6 +756,8 @@ export default function Settings() {
           </p>
         </div>
 
+        <ImageOptimizationSettings form={form} setForm={setForm} />
+
         <div className="settings-section">
           <h3>Sources</h3>
           <p className="section-hint">
@@ -646,25 +768,27 @@ export default function Settings() {
             <div className="form-row">
               <label>Content proxy URL</label>
               <input
-                type="text"
+                type="password"
+                autoComplete="new-password"
                 inputMode="url"
                 autoCapitalize="none"
                 autoCorrect="off"
-                placeholder="http://192.168.1.28:8888"
+                placeholder="http://proxy.example:8080"
                 value={form.download_proxy_url ?? ""}
                 onChange={set("download_proxy_url")}
               />
             </div>
             <p className="section-hint">
-              Proxy applies only to chapter page/image downloads for checked sources. Discovery,
-              metadata, authentication, and page manifests remain direct. Checked sources fail
-              closed instead of retrying directly when the proxy is unavailable.
+              The shared proxy applies to chapter page/image downloads for checked sources. Other
+              requests stay direct unless all requests is selected below. Proxy failures never
+              retry directly.
             </p>
           </div>
           <SourcePriority form={form} setForm={setForm} />
         </div>
 
         <ProxySettings form={form} setForm={setForm} set={set} />
+        <SourceRequestProxySettings form={form} set={set} />
 
         <div className="settings-section">
           <h3>MangaDex Account</h3>
@@ -699,6 +823,7 @@ export default function Settings() {
           <h3>Download Client — qBittorrent</h3>
           <p className="section-hint">
             Torrent grabs (Nyaa releases) are sent to qBittorrent and imported when complete.
+            Re-enter the password after changing the URL or username, before testing or saving.
           </p>
           <div className="form-row">
             <label>Enabled</label>
@@ -779,6 +904,7 @@ export default function Settings() {
             Notify a request manager (e.g. NextPanel) whenever chapters are imported, so requests
             flip to Available instantly. Point the URL at NextPanel's
             /api/v1/webhooks/mangarr endpoint and paste the same webhook secret configured there.
+            Re-enter the secret after changing the URL, before testing or saving.
           </p>
           <div className="form-row">
             <label>Enabled</label>

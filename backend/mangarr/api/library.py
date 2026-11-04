@@ -449,9 +449,33 @@ async def source_search(
         raise HTTPException(502, f"{source_name} search failed: {exc}") from exc
     return [
         SourceCandidateOut(source_name=source_name, external_id=c.external_id,
-                           title=c.title, url=c.url, alt_titles=c.alt_titles)
+                           title=c.title, url=c.url, alt_titles=c.alt_titles,
+                           cover_url=c.cover_url, description=c.description)
         for c in candidates[:20]
     ]
+
+
+@router.get("/series/{series_id}/sources/details", response_model=SourceCandidateOut)
+async def source_details(
+    series_id: int, source_name: str, external_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    await _load(session, series_id)
+    await registry.apply_settings(session)
+    src = registry.DIRECT_SOURCES.get(source_name)
+    if src is None:
+        raise HTTPException(404, f"Unknown source {source_name!r}")
+    try:
+        details = await src.get_series_details(external_id)
+    except Exception as exc:
+        raise HTTPException(502, f"{source_name} details failed: {exc}") from exc
+    if details is None:
+        raise HTTPException(404, "Source series details unavailable")
+    return SourceCandidateOut(
+        source_name=source_name, external_id=details.external_id, title=details.title,
+        url=details.url, alt_titles=details.alt_titles, cover_url=details.cover_url,
+        description=details.description,
+    )
 
 
 @router.post("/series/{series_id}/sources", response_model=SourceLinkOut, status_code=201)

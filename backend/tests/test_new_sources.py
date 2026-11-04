@@ -1,7 +1,10 @@
+from datetime import datetime, timezone
+
 import httpx
 import pytest
 import respx
 
+from mangarr.sources import asura
 from mangarr.sources.asura import API_URL as ASURA_API, AsuraSource
 from mangarr.sources.mangaplus import API_URL as MP_API, MangaPlusError, MangaPlusSource, _xor_decrypt
 from mangarr.sources.tcbscans import BASE_URL as TCB_URL, TCBScansSource
@@ -176,6 +179,56 @@ async def test_asura_list_chapters_skips_locked_premium():
     chapters = await src.list_chapters("slug-abc")
     assert [c.number for c in chapters] == [178.0, 179.0]
     assert chapters[1].external_id == "slug-abc|179"
+
+
+@respx.mock
+async def test_asura_list_chapters_rechecks_the_unlock_time(monkeypatch):
+    # Asura's chapter list reports the full page count even during early
+    # access. The reported chapter also carried is_premium=false after unlock.
+    class Clock(datetime):
+        current = datetime.fromisoformat("2026-11-03T23:00:00Z")
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr(asura, "datetime", Clock, raising=False)
+    respx.get(f"{ASURA_API}/api/series/slug-abc/chapters").respond(json={
+        "data": [
+            {"number": 186, "is_premium": False, "page_count": 23,
+             "early_access_until": "2026-11-03T23:33:48.488671Z"},
+            {"number": 185, "is_premium": True, "page_count": 28,
+             "early_access_until": "2026-11-04T01:33:48.488671+02:00"},
+            {"number": 184, "is_premium": False, "page_count": 30,
+             "early_access_until": "2026-10-28T19:49:38.71257Z"},
+            {"number": 183, "is_premium": False, "page_count": 26},
+            {"number": 182, "is_premium": False, "page_count": 26,
+             "early_access_until": "invalid"},
+        ],
+    })
+    async with httpx.AsyncClient() as client:
+        src = AsuraSource(client=client)
+        assert [c.number for c in await src.list_chapters("slug-abc")] == [183, 184]
+
+        # The same payload becomes eligible at the public unlock time.
+        Clock.current = datetime(2026, 11, 3, 23, 33, 48, 488671, tzinfo=timezone.utc)
+        chapters = await src.list_chapters("slug-abc")
+        assert [c.number for c in chapters] == [183, 184, 185, 186]
+        assert chapters[-1].external_id == "slug-abc|186"
+
+
+@respx.mock
+async def test_asura_reader_respects_explicit_lock():
+    respx.get(f"{ASURA_API}/api/series/slug-abc/chapters/104").respond(json={
+        "data": {
+            "is_locked": True,
+            "unlock_time": "2026-11-04T06:39:25.445036Z",
+            "chapter": {"number": 104, "page_count": 0, "is_premium": True,
+                        "pages": [{"url": "https://cdn/placeholder.webp"}]},
+        },
+    })
+    async with httpx.AsyncClient() as client:
+        assert await AsuraSource(client=client).get_pages("slug-abc|104") == []
 
 
 @respx.mock

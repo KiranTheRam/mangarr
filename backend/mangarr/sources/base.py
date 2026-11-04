@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 
@@ -13,6 +14,8 @@ class SourceSeries:
     title: str
     url: str = ""
     alt_titles: list[str] = field(default_factory=list)
+    cover_url: str = ""
+    description: str = ""
 
 
 @dataclass
@@ -28,6 +31,8 @@ class SourceChapter:
     # that carry several groups' copies of a chapter list every copy, in
     # their own preference order; automation.select_group_variants picks one.
     group: str = ""
+    # When this release's early-access window ended, if the source says.
+    public_since: datetime | None = None
 
 
 @dataclass
@@ -64,10 +69,33 @@ class DirectSource(ABC):
     """A site we can search, list chapters on, and pull page images from."""
 
     name: str
-    # Configured at runtime by registry.apply_settings(). Only page/image
-    # bytes use this; source API and metadata clients remain direct.
-    content_proxy_enabled: bool = False
-    content_proxy_url: str = ""
+    # Fallbacks support standalone source instances. Registry settings are
+    # task-local, even though the adapter objects themselves are singletons.
+    _content_proxy_enabled: bool = False
+    _content_proxy_url: str = ""
+
+    @property
+    def content_proxy_enabled(self) -> bool:
+        from .routing import route_for
+
+        route = route_for(self.name)
+        return route.content_enabled if route else self._content_proxy_enabled
+
+    @content_proxy_enabled.setter
+    def content_proxy_enabled(self, value: bool) -> None:
+        self._content_proxy_enabled = value
+
+    @property
+    def content_proxy_url(self) -> str:
+        from .routing import route_for
+
+        route = route_for(self.name)
+        return route.content_url if route else self._content_proxy_url
+
+    @content_proxy_url.setter
+    def content_proxy_url(self, value: str) -> None:
+        self._content_proxy_url = value
+
     # per-source proactive limiter for page-image fetches (separate from the
     # HTML/API limiter so images can be pulled a bit faster). Sources override.
     image_limiter: RateLimiter | None = None
@@ -75,10 +103,24 @@ class DirectSource(ABC):
     @abstractmethod
     async def search_series(self, query: str) -> list[SourceSeries]: ...
 
+    async def get_series_details(self, external_id: str) -> SourceSeries | None:
+        """Optional series metadata supplied by a download source."""
+        return None
+
     @abstractmethod
     async def list_chapters(self, external_id: str) -> list[SourceChapter]:
         """Chapters the source serves. May hold several copies of one chapter
         number (one per scanlation group), best first."""
+
+    # Catalog-only chapter lists need an explicit reader check before they
+    # can be advertised as downloadable.
+    requires_chapter_verification: bool = False
+
+    async def verify_chapters(
+        self, external_ids: list[str], *, max_checks: int | None = 60,
+    ) -> set[str]:
+        """Return the chapter IDs that can be offered as direct releases."""
+        return set(external_ids)
 
     @abstractmethod
     async def get_pages(self, chapter_external_id: str) -> list[str]:

@@ -169,9 +169,9 @@ class Chapter(Base):
     downloaded: Mapped[bool] = mapped_column(Boolean, default=False)
     file_path: Mapped[str] = mapped_column(String, default="")
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Comma-separated enabled direct sources whose latest successful chapter
-    # listing contains this exact number.  Metadata-only/catalogue rows remain
-    # visible while the UI can honestly say that no linked source serves them.
+    # Comma-separated direct sources that reported this chapter as available.
+    # None means availability is unconfirmed, including catalog-only entries
+    # that require a reader check at search or grab time.
     available_sources: Mapped[str | None] = mapped_column(
         String, nullable=True, default=None
     )

@@ -5,9 +5,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import settings_service
 from .base import DirectSource, TorrentIndexer
+from .routing import SOURCE_PROXY_NAMES, SourceRoute, set_routes
 from .asura import source as asura_source
 from .toonily import source as toonily_source
 from .atsumaru import source as atsumaru_source
+from .fanfox import source as fanfox_source
 from .mangadex import source as mangadex_source
 from .mangafire import source as mangafire_source
 from .mangaplus import source as mangaplus_source
@@ -27,6 +29,7 @@ DIRECT_SOURCES: dict[str, DirectSource] = {
     atsumaru_source.name: atsumaru_source,
     tcbscans_source.name: tcbscans_source,
     asura_source.name: asura_source,
+    fanfox_source.name: fanfox_source,
     toonily_source.name: toonily_source,
     viz_source.name: viz_source,
     wikipedia_source.name: wikipedia_source,
@@ -38,7 +41,7 @@ ALL_SOURCE_NAMES = [*DIRECT_SOURCES, *TORRENT_INDEXERS]
 
 
 async def apply_settings(session: AsyncSession) -> dict[str, str]:
-    """Push runtime settings into source instances; returns the settings dict."""
+    """Bind a routing snapshot to this task; returns the settings dict."""
     values = await settings_service.get_all(session)
     mangadex_source.configure(
         client_id=values["mangadex_client_id"],
@@ -47,13 +50,29 @@ async def apply_settings(session: AsyncSession) -> dict[str, str]:
         password=values["mangadex_password"],
         language=values["mangadex_language"],
     )
-    proxy_url = values["download_proxy_url"].strip()
-    for name, source in DIRECT_SOURCES.items():
-        source.content_proxy_enabled = (
+    routes = {}
+    for name in DIRECT_SOURCES:
+        if (
+            name in SOURCE_PROXY_NAMES
+            and values.get(f"source_{name}_proxy_mode", "inherit") not in {"inherit", "all"}
+        ):
+            raise ValueError(f"{name} has an invalid source proxy mode")
+        all_requests = (
+            name in SOURCE_PROXY_NAMES
+            and values.get(f"source_{name}_proxy_mode") == "all"
+        )
+        source_url = values.get(f"source_{name}_proxy_url", "")
+        content_enabled = all_requests or (
             name in settings_service.CONTENT_SOURCE_NAMES
             and values.get(f"source_{name}_proxy_enabled") == "true"
         )
-        source.content_proxy_url = proxy_url if source.content_proxy_enabled else ""
+        routes[name] = SourceRoute(
+            all_requests=all_requests, proxy_url=source_url,
+            content_enabled=content_enabled,
+            content_url=(source_url if all_requests else values["download_proxy_url"])
+            if content_enabled else "",
+        )
+    set_routes(routes)
     return values
 
 

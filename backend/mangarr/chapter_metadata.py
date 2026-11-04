@@ -36,6 +36,7 @@ SOURCE_AUTHORITY = {
     "mangaupdates": 25,
     "weebcentral": 10,
     "atsumaru": 10,
+    "fanfox": 10,
     "disk-inferred": 5,
     "legacy": 0,
     "": 0,
