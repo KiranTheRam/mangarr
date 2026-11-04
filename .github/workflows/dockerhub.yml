@@ -46,6 +46,8 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
+          build-args: |
+            MANGARR_BUILD_VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('0.0.0+g{0}', github.sha) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
