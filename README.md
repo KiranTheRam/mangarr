@@ -84,6 +84,7 @@ docker compose up -d
 The default Compose file runs the published `kirantheram/mangarr:latest`
 Docker Hub image and stores configuration and media under `./data`. Open
 <http://localhost:6996> after it starts.
+Follow the setup screen to create a browser login.
 The image's healthcheck polls `GET /ping` (no API key needed), so
 `docker ps` shows the container as `healthy` once Mangarr is serving.
 
@@ -210,7 +211,7 @@ Backend (Python ≥3.11):
 ```bash
 cd backend
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/uvicorn mangarr.main:app --port 6996 --reload
+MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true .venv/bin/uvicorn mangarr.main:app --port 6996 --reload
 ```
 
 Frontend (Node 20.19+ or 22.12+, as required by Vite 8):
@@ -230,6 +231,35 @@ cd backend && .venv/bin/python -m pytest
 `npm run build` writes the production bundle to `backend/static/`, which the
 FastAPI app serves when present.
 
+## App versions
+
+Docker Hub builds from `main` automatically increment the patch version for each
+main-branch commit after the latest explicit version change. A merged PR counts
+once when merged with a merge commit or squash merge; a rebase merge counts each
+commit added to `main`. The version is calculated from Git history, so rerunning
+the same build keeps the same version and needs no bot commits or write token.
+The image's app/API version uses this calculated version. Existing `v*` tag
+builds continue to use the tag as their version.
+
+To choose a version manually, run this from the repository root:
+
+```bash
+python3 scripts/version.py set 1.2.0
+```
+
+Commit the resulting `backend/VERSION`, `frontend/package.json`, and
+`frontend/package-lock.json` changes and merge them into `main`. That merge builds
+as exactly `1.2.0`; subsequent main commits build as `1.2.1`, `1.2.2`, and so on.
+Choose a version higher than the latest published version to keep versions
+increasing. `backend/VERSION` is the release baseline; local installs use that
+baseline unless a build supplies `MANGARR_BUILD_VERSION`. The frontend package
+versions track the manually selected baseline.
+
+Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
+`--revision <commit>` to inspect another commit. This requires a full Git clone;
+CI checks out the complete history. Avoid rewriting `main` history, since the
+commit count determines the patch increment.
+
 ## Configuration
 
 Environment variables (all optional):
@@ -242,8 +272,9 @@ Environment variables (all optional):
 | `MANGARR_SQLITE_WAL` | `true`        | Use SQLite WAL mode (see below)                   |
 | `MANGARR_LOG_LEVEL`  | `INFO`        | Log level (uppercase: `DEBUG`, `INFO`, `WARNING`) |
 | `MANGARR_API_KEY`    | *(generated)* | Fixed web UI API key instead of a generated one   |
-| `MANGARR_AUTH_USERNAME` | *(empty)* | Optional browser HTTP Basic login username |
+| `MANGARR_AUTH_USERNAME` | *(empty)* | Browser HTTP Basic login username |
 | `MANGARR_AUTH_PASSWORD` | *(empty)* | Browser login password; set together with username |
+| `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER` | `false` | Allow browser access without built-in login on an explicitly trusted deployment |
 | `MANGARR_ALLOWED_HOSTS` | `[]` | Additional exact DNS names as a JSON array (no scheme, port or wildcard) |
 
 `MANGARR_HOST` and `MANGARR_PORT` apply when Mangarr is started with
@@ -270,15 +301,56 @@ revoked independently.
 
 ### Browser access and upgrading
 
-Browser login is opt-in to preserve existing installations: set both
-`MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD`, then restart. The browser
-prompts for credentials before serving the UI or `/initialize.json`. Partial
-configuration fails startup instead of silently disabling login. To recover
-access, change or remove both values in your environment and restart. Use HTTPS
-on a trusted reverse proxy when credentials travel across the network; Basic
-authentication itself does not encrypt them. There is no automatic local-address
-bypass. With login disabled, anyone who can reach the app using an allowed Host
-can still obtain full API access; startup logs warn about this mode.
+If Mangarr has no browser login, the first visit after installing or upgrading
+opens a setup screen. Choose a username and password to create the login and
+start using Mangarr immediately.
+Complete this step on a trusted local network before exposing Mangarr through
+a public reverse proxy or port forward. The first person who submits the form
+creates the login. The library UI and browser API key stay behind the login
+boundary during setup. Existing API-key integrations continue to work.
+
+Use **Settings → Browser Security** to change your password or sign out.
+A password change requires the current password and signs out all browser
+sessions. API keys continue to work. Browser sessions expire after seven days.
+
+Mangarr stores the password hash in `browser_login.json` in the data directory.
+If you forget the password, run the local reset command from an interactive
+terminal. With Docker Compose, run this while the container is running:
+
+```bash
+docker compose exec mangarr mangarr-entrypoint python -m mangarr.reset_password
+```
+
+On Unraid, open the Mangarr container console and run
+`mangarr-entrypoint python -m mangarr.reset_password`.
+
+For a direct Python install, run `python -m mangarr.reset_password` as the
+service user with the same working directory, Python environment and
+`MANGARR_DATA_DIR` as the server. Enter and confirm your new password at the
+hidden prompts. The reset keeps your username, signs out all browser sessions,
+and leaves API keys available throughout. Mangarr applies the change immediately.
+The sign-in screen includes recovery instructions, and the reset command shows
+your username before prompting.
+
+For the Mangarr-managed login, after five failed sign-ins from the same client
+in a one-minute window, the next attempt in that window returns HTTP 429 with
+a `Retry-After` header. A successful sign-in clears the client's count. The
+limit is per server process and groups IPv6 clients by their /64 prefix.
+Clients behind a reverse proxy share its limit by default. To use the original
+client addresses, set `FORWARDED_ALLOW_IPS` to the addresses of trusted proxies
+that sanitize forwarding headers. If you launch Uvicorn directly, configure
+`--forwarded-allow-ips` explicitly (`''` to trust no proxies).
+
+Existing `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` settings still
+take precedence when both are set. Update `MANGARR_AUTH_PASSWORD` and restart
+Mangarr to reset an environment-managed login. Setting only one fails startup.
+Use HTTPS on a trusted reverse proxy when credentials travel across the network.
+
+Custom deployments can explicitly set `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true`
+before creating a login and with both credential variables unset, for example when an authenticated reverse proxy
+is the only route to Mangarr. In this mode any client with direct access to
+Mangarr can obtain full API access. If an existing instance was accessible to
+untrusted clients before upgrading, rotate its bootstrap and named API keys.
 
 Host validation is always enabled, including for API clients. IP addresses
 (IPv4 or bracketed IPv6) and `localhost` work by default. **Before upgrading**,
@@ -287,13 +359,15 @@ add every DNS name used by browsers, reverse proxies and integration clients to
 Names match exactly, ignoring case, without a trailing dot; paths, schemes,
 ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
 with configuration instructions; direct IP access remains available for recovery.
-Proxies must preserve an allowed Host or set it explicitly. Forwarded headers
-never establish trust. Host validation limits DNS rebinding; it is not login.
+For browser setup, sign-in, and requests that change state, reverse proxies
+must preserve the browser's Host header.
+For other requests, proxies can preserve an allowed Host or set it explicitly.
+Forwarded headers never establish trust. Host validation limits DNS rebinding.
 
-Existing named API keys and `X-Api-Key` clients continue to work without browser
-credentials. Browser credentials alone do not authenticate API calls; API keys
-alone do not unlock browser bootstrap when login is enabled. `/ping` remains
-public and contains no secrets. Bootstrap responses use `Cache-Control: no-store`.
+Existing named API keys and `X-Api-Key` clients continue to work independently
+of browser sessions. When Mangarr manages the login, the browser uses a
+session cookie for UI and API requests. API keys alone do not unlock browser
+bootstrap when login is enabled. `/ping` remains public and contains no secrets.
 
 Saved integration secrets are bound to the exact saved URL (including scheme,
 port and path), and qBittorrent passwords also to the username. After changing

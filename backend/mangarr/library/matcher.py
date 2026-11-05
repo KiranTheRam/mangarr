@@ -279,33 +279,43 @@ def _archive_source_page_signature(path: str, mtime_ns: int, size: int) -> PageS
         return None
     try:
         with zipfile.ZipFile(path) as archive:
-            members = [m for m in archive.infolist() if m.filename == PAGE_PROVENANCE_NAME]
-            if not members:
-                return stored  # archives created before optimization or with it off
-            if len(members) != 1:
-                return None
-            member = members[0]
-            if (member.file_size > MAX_COMICINFO_BYTES or member.compress_type not in
-                    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
-                return None
-            with archive.open(member) as stream:
-                data = stream.read(MAX_COMICINFO_BYTES + 1)
-            if len(data) > MAX_COMICINFO_BYTES:
-                return None
-            payload = json.loads(data)
-            if not isinstance(payload, dict) or payload.get("version") != 1:
-                return None
-            original = payload.get("original")
-            if (payload.get("archived") != [list(pair) for pair in stored]
-                    or not isinstance(original, list) or len(original) != len(stored)):
-                return None
-            if not all(isinstance(pair, list) and len(pair) == 2
-                       and all(type(v) is int for v in pair)
-                       and 0 <= pair[0] <= 0xFFFFFFFF and pair[1] > 0 for pair in original):
-                return None
-            return tuple(tuple(pair) for pair in original)
+            return read_archive_source_page_signature(archive, stored)
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+def read_archive_source_page_signature(
+    archive: zipfile.ZipFile, stored: PageSignature
+) -> PageSignature | None:
+    """Validate provenance against the pages of an already opened archive."""
+    try:
+        members = [m for m in archive.infolist() if m.filename == PAGE_PROVENANCE_NAME]
+        if not members:
+            return stored  # archives created before optimization or with it off
+        if len(members) != 1:
+            return None
+        member = members[0]
+        if (member.file_size > MAX_COMICINFO_BYTES or member.compress_type not in
+                {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
+            return None
+        with archive.open(member) as stream:
+            data = stream.read(MAX_COMICINFO_BYTES + 1)
+        if len(data) > MAX_COMICINFO_BYTES:
+            return None
+        payload = json.loads(data)
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return None
+        original = payload.get("original")
+        if (payload.get("archived") != [list(pair) for pair in stored]
+                or not isinstance(original, list) or len(original) != len(stored)):
+            return None
+        if not all(isinstance(pair, list) and len(pair) == 2
+                   and all(type(v) is int for v in pair)
+                   and 0 <= pair[0] <= 0xFFFFFFFF and pair[1] > 0 for pair in original):
+            return None
+        return tuple(tuple(pair) for pair in original)
     except (OSError, KeyError, ValueError, RuntimeError, EOFError, RecursionError,
-            zipfile.BadZipFile, zlib.error):
+        zipfile.BadZipFile, zlib.error):
         return None
 
 

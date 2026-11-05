@@ -19,7 +19,7 @@ dependencies = [
     "python-multipart>=0.0.32",
     "mwparserfromhell>=0.7.2",
     "mini-racer>=0.14",
-    "Pillow>=12.3",
+    "Pillow>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +30,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=78.1.1"]
+requires = ["setuptools>=84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
