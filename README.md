@@ -231,6 +231,35 @@ cd backend && .venv/bin/python -m pytest
 `npm run build` writes the production bundle to `backend/static/`, which the
 FastAPI app serves when present.
 
+## App versions
+
+Docker Hub builds from `main` automatically increment the patch version for each
+main-branch commit after the latest explicit version change. A merged PR counts
+once when merged with a merge commit or squash merge; a rebase merge counts each
+commit added to `main`. The version is calculated from Git history, so rerunning
+the same build keeps the same version and needs no bot commits or write token.
+The image's app/API version uses this calculated version. Existing `v*` tag
+builds continue to use the tag as their version.
+
+To choose a version manually, run this from the repository root:
+
+```bash
+python3 scripts/version.py set 1.2.0
+```
+
+Commit the resulting `backend/VERSION`, `frontend/package.json`, and
+`frontend/package-lock.json` changes and merge them into `main`. That merge builds
+as exactly `1.2.0`; subsequent main commits build as `1.2.1`, `1.2.2`, and so on.
+Choose a version higher than the latest published version to keep versions
+increasing. `backend/VERSION` is the release baseline; local installs use that
+baseline unless a build supplies `MANGARR_BUILD_VERSION`. The frontend package
+versions track the manually selected baseline.
+
+Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
+`--revision <commit>` to inspect another commit. This requires a full Git clone;
+CI checks out the complete history. Avoid rewriting `main` history, since the
+commit count determines the patch increment.
+
 ## Configuration
 
 Environment variables (all optional):
