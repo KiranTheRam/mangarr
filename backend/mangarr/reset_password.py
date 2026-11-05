@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Run the password reset in an interactive terminal.", file=sys.stderr)
         return 1
 
+    print(f"Resetting the password for {login.username!r}.")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", GetPassWarning)
@@ -56,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     if not changed:
         print("The login changed while you were entering the password. Run the reset command again.", file=sys.stderr)
         return 1
-    print("Mangarr password reset. Sign in with your username and new password.")
+    print(f"Mangarr password reset. Sign in as {login.username!r} with your new password.")
     return 0
 
 

@@ -273,7 +273,8 @@ revoked independently.
 ### Browser access and upgrading
 
 If Mangarr has no browser login, the first visit after installing or upgrading
-opens a setup screen. Choose a username and password and sign in when prompted.
+opens a setup screen. Choose a username and password to create the login and
+start using Mangarr immediately.
 Complete this step on a trusted local network before exposing Mangarr through
 a public reverse proxy or port forward. The first person who submits the form
 creates the login. The library UI and browser API key stay behind the login
@@ -299,6 +300,8 @@ service user with the same working directory, Python environment and
 `MANGARR_DATA_DIR` as the server. Enter and confirm your new password at the
 hidden prompts. The reset keeps your username, signs out all browser sessions,
 and leaves API keys available throughout. Mangarr applies the change immediately.
+The sign-in screen includes recovery instructions, and the reset command shows
+your username before prompting.
 
 For the Mangarr-managed login, after five failed sign-ins from the same client
 in a one-minute window, the next attempt in that window returns HTTP 429 with

@@ -121,6 +121,7 @@ async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tm
     page = await client.get("/", follow_redirects=True)
     assert page.url.path == "/setup"
     assert "Set up your Mangarr login" in page.text
+    assert "Use 12 to 128 characters" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert 'name="code"' not in page.text
     assert page.text.count('type="password" required maxlength="256"') == 2
@@ -134,7 +135,12 @@ async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tm
     assert (await client.post("/setup", data=data, headers={**headers, "Sec-Fetch-Site": "cross-site"})).status_code == 403
     login_file = tmp_path / LOGIN_FILE
     assert not login_file.exists()
-    assert (await client.post("/setup", data={**data, "confirmation": "mismatch"}, headers=headers)).status_code == 400
+    rejected = await client.post("/setup", data={**data, "confirmation": "mismatch"}, headers=headers)
+    assert rejected.status_code == 400
+    assert 'value="reader"' in rejected.text and password not in rejected.text
+    escaped = await client.post("/setup", data={"username": '<img src=x onerror="alert(1)">', "password": password}, headers=headers)
+    assert escaped.status_code == 400
+    assert "&lt;img" in escaped.text and "<img" not in escaped.text
     assert (await client.post("/setup", data={**data, "password": "x" * 8192}, headers=headers)).status_code == 413
     responses = await asyncio.gather(
         client.post("/setup", data=data, headers=headers),
@@ -143,10 +149,17 @@ async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tm
     assert any(r.status_code == 303 and r.headers["location"] == "/" for r in responses)
     assert stat.S_IMODE(login_file.stat().st_mode) == 0o600
     assert password not in login_file.read_text()
+    assert client.cookies.get(browser_setup.SESSION_COOKIE)
+    assert (await client.get("/api/v1/settings")).status_code == 200
+    client.cookies.clear()
 
     monkeypatch.setattr(config, "allow_unauthenticated_browser", True)
     assert (await client.get("/initialize.json")).status_code == 401
     assert (await client.get("/", follow_redirects=True)).url.path == "/login"
+    recovery = (await client.get("/login")).text
+    assert "Forgot your username or password?" in recovery
+    assert "python -m mangarr.reset_password" in recovery
+    assert password not in recovery
     for name in ("reader", "other"):
         response = await client.post("/login", data={"username": name, "password": password}, headers=headers)
         if response.status_code == 303:
@@ -174,6 +187,7 @@ async def test_password_change_and_logout_preserve_api_keys(client, session, mon
     password = "old fixture password"
     new = "new fixture password"
     assert (await client.post("/setup", data={"username": "reader", "password": password, "confirmation": password}, headers=headers)).status_code == 303
+    client.cookies.clear()
     payload = {"current": password, "password": new, "confirmation": new}
     assert (await client.post("/auth/password", data=payload, headers={**headers, "X-Api-Key": "bootstrap"})).status_code == 401
     assert (await client.post("/login", data={"username": "reader", "password": password}, headers=headers)).status_code == 303
@@ -199,6 +213,7 @@ async def test_sign_in_throttle_checks_peer_before_password_verification(client,
     headers = {"Origin": "http://localhost"}
     login = {"username": "reader", "password": password}
     assert (await client.post("/setup", data={**login, "confirmation": password}, headers=headers)).status_code == 303
+    client.cookies.clear()
 
     async def failed(index):
         # Changing the username, claimed address or peer port cannot bypass the limit.
@@ -219,7 +234,7 @@ async def test_sign_in_throttle_checks_peer_before_password_verification(client,
     assert (await failed(0)).status_code == 401
 
 
-async def test_local_reset_preserves_username_and_recovers_throttled_peer(client, session, monkeypatch, tmp_path):
+async def test_local_reset_preserves_username_and_recovers_throttled_peer(client, session, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(browser_setup, "engine", session.bind)
     headers = {"Origin": "http://localhost"}
     old = "old fixture password"
@@ -236,6 +251,8 @@ async def test_local_reset_preserves_username_and_recovers_throttled_peer(client
     monkeypatch.setattr(reset_password.sys, "stdin", Mock(isatty=Mock(return_value=True)))
     monkeypatch.setattr(reset_password, "getpass", Mock(side_effect=[new, new]))
     assert await asyncio.to_thread(reset_password.main, []) == 0
+    output = capsys.readouterr().out
+    assert "'reader'" in output and new not in output
 
     assert stat.S_IMODE((tmp_path / LOGIN_FILE).stat().st_mode) == 0o600
     assert (await client.get("/")).headers["location"] == "/login"

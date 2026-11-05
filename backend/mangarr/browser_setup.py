@@ -7,6 +7,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import parse_qs, urlsplit
@@ -89,8 +90,10 @@ def load_browser_login() -> BrowserLogin | None:
     return BrowserLogin(data["username"], bytes.fromhex(data["salt"]), bytes.fromhex(data["digest"]))
 
 
-def setup_page(message: str = "", status_code: int = 200, *, sign_in: bool = False, changed: bool = False) -> HTMLResponse:
-    # Messages are fixed server strings. Submitted values never appear in HTML.
+def setup_page(message: str = "", status_code: int = 200, *, sign_in: bool = False,
+               changed: bool = False, username: str = "") -> HTMLResponse:
+    # Escape the retained username. Password fields always render empty.
+    username_value = escape(username, quote=True)
     error = f'<p role="alert" class="error">{message}</p>' if message else ""
     title = "Sign in to Mangarr" if sign_in else "Set up your Mangarr login"
     intro = (
@@ -110,6 +113,21 @@ def setup_page(message: str = "", status_code: int = 200, *, sign_in: bool = Fal
     )
     autocomplete = "current-password" if sign_in else "new-password"
     button = "Sign in" if sign_in else "Create login"
+    password_hint = "" if sign_in else (
+        '<p id="password-requirements">Use 12 to 128 characters, including spaces if you like. '
+        'Avoid control characters such as tabs and line breaks.</p>'
+    )
+    recovery = "" if not sign_in else (
+        '<details><summary>Forgot your username or password?</summary>'
+        '<p>Open a terminal on the server running Mangarr. In Docker Compose, run</p>'
+        '<pre><code>docker compose exec mangarr mangarr-entrypoint python -m mangarr.reset_password</code></pre>'
+        '<p>On Unraid, open the Mangarr container console and run</p>'
+        '<pre><code>mangarr-entrypoint python -m mangarr.reset_password</code></pre>'
+        '<p>The command shows your username and asks for a new password. '
+        'For a direct Python install, run <code>python -m mangarr.reset_password</code> '
+        'as the service user with the same data directory.</p></details>'
+    )
+    password_description = "" if sign_in else ' aria-describedby="password-requirements"'
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="en">
@@ -124,17 +142,21 @@ label {{ display: block; margin-top: 1rem }}
 input, button {{ box-sizing: border-box; width: 100%; font: inherit; padding: .65rem; margin-top: .35rem }}
 button {{ margin-top: 1.25rem; cursor: pointer }}
 .error {{ color: #ffb4ab }}
+summary {{ cursor: pointer; margin-top: 1.5rem }}
+pre {{ white-space: pre-wrap; overflow-wrap: anywhere }}
 </style>
 <main>
   <h1>{title}</h1>
   {intro}
   {error}
   <form method="post">
-    <label>Username<input name="username" required maxlength="64" autocomplete="username"></label>
-    <label>Password<input name="password" type="password" required maxlength="256" autocomplete="{autocomplete}"></label>
+    <label>Username<input name="username" required maxlength="64" autocomplete="username" value="{username_value}"></label>
+    <label>Password<input name="password" type="password" required maxlength="256" autocomplete="{autocomplete}"{password_description}></label>
+    {password_hint}
     {confirmation}
     <button>{button}</button>
   </form>
+  {recovery}
 </main>
 </html>""",
         status_code=status_code,
@@ -157,9 +179,10 @@ def same_origin(request: Request) -> bool:
 
 
 class FormError(ValueError):
-    def __init__(self, message: str, status: int) -> None:
+    def __init__(self, message: str, status: int, username: str = "") -> None:
         super().__init__(message)
         self.status = status
+        self.username = username
 
 
 async def read_form(request: Request, *names: str) -> tuple[str, ...]:
@@ -174,9 +197,12 @@ async def read_form(request: Request, *names: str) -> tuple[str, ...]:
         body.extend(chunk)
     try:
         fields = parse_qs(body.decode(), max_num_fields=len(names))
-        return tuple(fields[name][0] for name in names)
-    except (KeyError, ValueError) as exc:
+    except ValueError as exc:
         raise FormError("Fill in all fields.", 400) from exc
+    try:
+        return tuple(fields[name][0] for name in names)
+    except KeyError as exc:
+        raise FormError("Fill in all fields.", 400, fields.get("username", [""])[0]) from exc
 
 
 async def encode_login(username: str, password: str) -> str:
@@ -193,25 +219,27 @@ async def submit_browser_setup(request: Request, home: str) -> Response:
     try:
         username, password, confirmation = await read_form(request, "username", "password", "confirmation")
     except FormError as exc:
-        return setup_page(str(exc), exc.status)
+        return setup_page(str(exc), exc.status, username=exc.username)
     if not 1 <= len(username) <= 64 or username != username.strip() or not username.isprintable() or ":" in username:
-        return setup_page("Choose a username of up to 64 characters without a colon or surrounding spaces.", 400)
+        return setup_page("Choose a username of up to 64 characters without a colon or surrounding spaces.", 400, username=username)
     if not valid_password(password, confirmation):
-        return setup_page("Choose a password of 12 to 128 characters and enter it twice.", 400)
+        return setup_page("Choose a password of 12 to 128 characters and enter it twice.", 400, username=username)
 
     data = await encode_login(username, password)
     try:
         _write_private_file(config.data_dir / LOGIN_FILE, data)
     except FileExistsError:
         return setup_page("A login has already been created. Open Mangarr to sign in.", 409)
-    return RedirectResponse(home, status_code=303, headers={"Cache-Control": "no-store"})
+    saved = json.loads(data)
+    login = BrowserLogin(saved["username"], bytes.fromhex(saved["salt"]), bytes.fromhex(saved["digest"]))
+    return signed_in_response(request, login, home)
 
 
 async def submit_sign_in(request: Request, login: BrowserLogin, home: str) -> Response:
     try:
         username, password = await read_form(request, "username", "password")
     except FormError as exc:
-        return setup_page(str(exc), exc.status, sign_in=True)
+        return setup_page(str(exc), exc.status, sign_in=True, username=exc.username)
     # The form can arrive after a password reset. Use the current revision
     # for throttling so attempts against the old login cannot lock out the new one.
     if load_browser_login() != login:
@@ -219,18 +247,22 @@ async def submit_sign_in(request: Request, login: BrowserLogin, home: str) -> Re
     host = request.client.host if request.client else None
     attempt = _sign_in_throttle.reserve(host, login.salt)
     if isinstance(attempt, int):
-        response = setup_page("Too many sign-in attempts. Wait a moment and try again.", 429, sign_in=True)
+        response = setup_page("Too many sign-in attempts. Wait a moment and try again.", 429, sign_in=True, username=username)
         response.headers["Retry-After"] = str(attempt)
         return response
     signed_in = False
     try:
         if not await login.verify(username.encode(), password.encode()):
-            return setup_page("The username or password is incorrect.", 401, sign_in=True)
+            return setup_page("The username or password is incorrect.", 401, sign_in=True, username=username)
         if load_browser_login() != login:
             return setup_page("The login changed. Please try again.", 409, sign_in=True)
         signed_in = True
     finally:
         _sign_in_throttle.finish(host, attempt, success=signed_in)
+    return signed_in_response(request, login, home)
+
+
+def signed_in_response(request: Request, login: BrowserLogin, home: str) -> Response:
     response = RedirectResponse(home, status_code=303, headers={"Cache-Control": "no-store"})
     response.set_cookie(
         SESSION_COOKIE, login.session_token(), max_age=SESSION_SECONDS, path=home,
