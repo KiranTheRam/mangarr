@@ -134,7 +134,7 @@ export default function Calendar() {
           <Spinner />
         ) : data && data.released.length === 0 && data.expected.length === 0 ? (
           <EmptyState
-            icon="◷"
+            icon="calendar"
             title="No releases to show"
             hint="Release dates come from MangaUpdates. Series linked to MangaUpdates show up here once they have a few releases."
           />

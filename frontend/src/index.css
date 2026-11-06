@@ -2693,3 +2693,37 @@ kbd {
   .image-preview figcaption { min-height: 46px; }
   .image-preview-frame { height: 330px; }
 }
+
+/* Reserve space for a consistent inset indicator instead of the browser's
+   platform-specific arrow. The native select and keyboard behavior stay intact. */
+select:not([multiple]):not([size]),
+select:not([multiple])[size="1"] {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 38px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239099a8' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m5 9 7 7 7-7'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 20px 20px;
+  text-overflow: ellipsis;
+}
+
+@media (forced-colors: active) {
+  select:not([multiple]):not([size]),
+  select:not([multiple])[size="1"] {
+    appearance: auto;
+    -webkit-appearance: auto;
+    background-image: none;
+    padding-right: 10px;
+  }
+}
+
+
+/* Consistent alignment at navigation, action, and empty-state sizes. */
+.ui-icon {
+  display: inline-block;
+  flex: 0 0 auto;
+  vertical-align: -0.18em;
+}
+.nav-item .icon { display: inline-flex; align-items: center; justify-content: center; }
+.empty-state .ui-icon { color: var(--text-dim); }

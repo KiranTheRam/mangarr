@@ -1,3 +1,4 @@
+import { Icon } from "./Icon";
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
@@ -194,7 +195,7 @@ export function AutomationModal({
                 <span className="priority-rank">{i + 1}</span>
                 <span className="priority-arrows">
                   <button className="btn icon-btn" disabled={i === 0} onClick={() => move(i, -1)} title="Higher priority">
-                    ↑
+                    <Icon name="arrow-up" />
                   </button>
                   <button
                     className="btn icon-btn"
@@ -202,7 +203,7 @@ export function AutomationModal({
                     onClick={() => move(i, 1)}
                     title="Lower priority"
                   >
-                    ↓
+                    <Icon name="arrow-down" />
                   </button>
                 </span>
                 <span className="priority-name">{sourceLabel(name)}</span>

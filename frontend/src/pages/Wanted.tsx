@@ -32,7 +32,7 @@ export default function Wanted() {
           <Spinner />
         ) : !data && error ? null : !data || data.length === 0 ? (
           <EmptyState
-            icon="✔"
+            icon="check"
             title="Nothing wanted"
             hint="All monitored chapters are downloaded."
           />
