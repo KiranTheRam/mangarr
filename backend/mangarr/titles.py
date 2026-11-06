@@ -85,12 +85,23 @@ def split_alt_titles(raw: str | None) -> list[str]:
     return [title.strip() for title in (raw or "").split("\n") if title.strip()]
 
 
+def source_title_key(title: str) -> str:
+    """Use exact text for titles written without ASCII letters.
+
+    The loose normalizer can reduce a title such as a Korean alias to a
+    digit shared by unrelated series.
+    """
+    if not _LATIN_RE.search(title) and any(char.isalpha() for char in title):
+        return " ".join(title.casefold().split())
+    return normalize_title(title)
+
+
 def unique_titles(titles: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for title in titles:
         title = title.strip()
-        key = normalize_title(title) or title.casefold()
+        key = source_title_key(title) or title.casefold()
         if not title or key in seen:
             continue
         seen.add(key)
@@ -184,9 +195,9 @@ def plausible_title_match(candidate: str, query: str) -> bool:
     equal; beyond that one title may only extend the other by a little —
     a bare prefix match must not link "Berserk" to "Berserk of Gluttony",
     which is a different series that merely shares the opening word."""
-    nc = normalize_title(candidate).replace(" ", "")
-    nq = normalize_title(query).replace(" ", "")
-    if not nc or not nq or len(nq) < 4:
+    nc = source_title_key(candidate).replace(" ", "")
+    nq = source_title_key(query).replace(" ", "")
+    if not nc or len(nq) < 4 or not (nc.isascii() and nq.isascii()):
         return False
     if nc == nq:
         return True

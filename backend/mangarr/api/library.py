@@ -451,7 +451,7 @@ async def source_search(
         SourceCandidateOut(source_name=source_name, external_id=c.external_id,
                            title=c.title, url=c.url, alt_titles=c.alt_titles,
                            cover_url=c.cover_url, description=c.description)
-        for c in candidates[:20]
+        for c in candidates[:src.manual_search_limit]
     ]
 
 

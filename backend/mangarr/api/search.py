@@ -16,8 +16,13 @@ from ..models import Chapter, Series
 from ..schemas import MetadataResult, ReleaseOut
 from ..sources import registry
 from ..sources.base import DirectSource
-from ..titles import english_title, plausible_title_match, split_alt_titles, title_queries
-from ..util import normalize_title
+from ..titles import (
+    english_title,
+    plausible_title_match,
+    source_title_key,
+    split_alt_titles,
+    title_queries,
+)
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +90,7 @@ async def search_metadata(
 def _candidate_matches_series(candidate_titles: list[str], wanted: set[str]) -> bool:
     if not wanted:
         return False
-    cand_titles = {n for title in candidate_titles if (n := normalize_title(title))}
+    cand_titles = {n for title in candidate_titles if (n := source_title_key(title))}
     return bool(wanted & cand_titles)
 
 
@@ -93,7 +98,7 @@ async def _find_direct_source_ids(
     src: DirectSource,
     queries: list[str],
 ) -> list[tuple[str, str, str]]:
-    wanted = {n for title in queries if (n := normalize_title(title))}
+    wanted = {n for title in queries if (n := source_title_key(title))}
     matches: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for query in queries:

@@ -69,6 +69,7 @@ class DirectSource(ABC):
     """A site we can search, list chapters on, and pull page images from."""
 
     name: str
+    manual_search_limit: int = 20
     # Fallbacks support standalone source instances. Registry settings are
     # task-local, even though the adapter objects themselves are singletons.
     _content_proxy_enabled: bool = False

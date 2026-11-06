@@ -7,6 +7,7 @@ from .. import settings_service
 from .base import DirectSource, TorrentIndexer
 from .routing import SOURCE_PROXY_NAMES, SourceRoute, set_routes
 from .asura import source as asura_source
+from .toonily import source as toonily_source
 from .atsumaru import source as atsumaru_source
 from .fanfox import source as fanfox_source
 from .mangadex import source as mangadex_source
@@ -29,6 +30,7 @@ DIRECT_SOURCES: dict[str, DirectSource] = {
     tcbscans_source.name: tcbscans_source,
     asura_source.name: asura_source,
     fanfox_source.name: fanfox_source,
+    toonily_source.name: toonily_source,
     viz_source.name: viz_source,
     wikipedia_source.name: wikipedia_source,
 }

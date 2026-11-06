@@ -60,7 +60,7 @@ from ..models import (
 )
 from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
-from ..titles import plausible_title_match, split_alt_titles, title_queries
+from ..titles import plausible_title_match, source_title_key, split_alt_titles, title_queries
 from ..torrent_selection import select_best_torrent
 from ..util import is_transient_error, normalize_title
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
@@ -303,10 +303,7 @@ async def link_sources(
     SOURCE_COOLDOWN_SECONDS)."""
     linked = {sl.source_name for sl in series.source_links}
     titles = _titles_of(series)
-    # normalized titles that are empty (e.g. a title written only in CJK) must
-    # not be used for matching — an empty string is a prefix/substring of
-    # everything and would match the first result of any catalog
-    wanted = {nt for t in titles if (nt := normalize_title(t))}
+    wanted = {key for title in titles if (key := source_title_key(title))}
     for src in registry.enabled_direct_sources(values):
         if src.name in linked:
             continue
@@ -320,8 +317,7 @@ async def link_sources(
         failure: Exception | None = None
         # try each known title variant until the source yields a match
         for query in titles[:4]:
-            nq = normalize_title(query)
-            if not nq:
+            if not source_title_key(query):
                 continue
             try:
                 candidates = await src.search_series(query)
@@ -332,7 +328,7 @@ async def link_sources(
                 break
             searched = True
             for cand in candidates:
-                cand_titles = {n for t in [cand.title, *cand.alt_titles] if (n := normalize_title(t))}
+                cand_titles = {key for t in [cand.title, *cand.alt_titles] if (key := source_title_key(t))}
                 if wanted & cand_titles:
                     match = cand
                     break

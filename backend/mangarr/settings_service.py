@@ -16,6 +16,7 @@ CONTENT_SOURCE_NAMES = (
     "fanfox",
     "tcbscans",
     "asura",
+    "toonily",
 )
 
 DEFAULTS: dict[str, str] = {
@@ -30,7 +31,7 @@ DEFAULTS: dict[str, str] = {
     # Source priority: comma-separated source names, first = preferred.
     # Official sources first, then fast scanlation sources (tcbscans) ahead
     # of archive sources so new chapters are grabbed as soon as they appear.
-    "source_priority": "mangaplus,webtoons,tcbscans,mangadex,mangafire,weebcentral,atsumaru,asura,fanfox,viz,wikipedia,nyaa",
+    "source_priority": "mangaplus,webtoons,tcbscans,mangadex,mangafire,weebcentral,atsumaru,asura,fanfox,toonily,viz,wikipedia,nyaa",
     # MangaDex credentials (personal API client)
     "mangadex_client_id": "",
     "mangadex_client_secret": "",
@@ -66,6 +67,8 @@ DEFAULTS: dict[str, str] = {
     "source_webtoons_enabled": "true",
     "source_tcbscans_enabled": "true",
     "source_asura_enabled": "true",
+    # Opt-in: Toonily includes mature content.
+    "source_toonily_enabled": "false",
     # MangaPlus needs a residential IP (bans datacenters); off until the user
     # confirms it reaches the API from their host
     "source_mangaplus_enabled": "false",
