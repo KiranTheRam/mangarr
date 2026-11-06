@@ -114,7 +114,7 @@ def setup_page(message: str = "", status_code: int = 200, *, sign_in: bool = Fal
     autocomplete = "current-password" if sign_in else "new-password"
     button = "Sign in" if sign_in else "Create login"
     password_hint = "" if sign_in else (
-        '<p id="password-requirements">Use 12 to 128 characters, including spaces if you like. '
+        '<p id="password-requirements">Use 8 to 128 characters, including spaces if you like. '
         'Avoid control characters such as tabs and line breaks.</p>'
     )
     recovery = "" if not sign_in else (
@@ -212,7 +212,7 @@ async def encode_login(username: str, password: str) -> str:
 
 
 def valid_password(password: str, confirmation: str) -> bool:
-    return 12 <= len(password) <= 128 and password.isprintable() and password == confirmation
+    return 8 <= len(password) <= 128 and password.isprintable() and password == confirmation
 
 
 async def submit_browser_setup(request: Request, home: str) -> Response:
@@ -223,7 +223,7 @@ async def submit_browser_setup(request: Request, home: str) -> Response:
     if not 1 <= len(username) <= 64 or username != username.strip() or not username.isprintable() or ":" in username:
         return setup_page("Choose a username of up to 64 characters without a colon or surrounding spaces.", 400, username=username)
     if not valid_password(password, confirmation):
-        return setup_page("Choose a password of 12 to 128 characters and enter it twice.", 400, username=username)
+        return setup_page("Choose a password of 8 to 128 characters and enter it twice.", 400, username=username)
 
     data = await encode_login(username, password)
     try:
@@ -287,7 +287,7 @@ async def change_password(request: Request, login: BrowserLogin) -> Response:
     try:
         current, password, confirmation = await read_form(request, "current", "password", "confirmation")
         if not valid_password(password, confirmation):
-            raise FormError("Choose a password of 12 to 128 characters and enter it twice.", 400)
+            raise FormError("Choose a password of 8 to 128 characters and enter it twice.", 400)
         if current == password:
             raise FormError("Choose a different password.", 400)
         if not await login.verify(login.username.encode(), current.encode()):

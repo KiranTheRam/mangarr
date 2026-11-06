@@ -121,13 +121,13 @@ async def test_browser_setup_keeps_existing_api_and_accepts_one_login(client, tm
     page = await client.get("/", follow_redirects=True)
     assert page.url.path == "/setup"
     assert "Set up your Mangarr login" in page.text
-    assert "Use 12 to 128 characters" in page.text
+    assert "Use 8 to 128 characters" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert 'name="code"' not in page.text
     assert page.text.count('type="password" required maxlength="256"') == 2
     assert (await client.get("/initialize.json")).status_code == 403
     assert (await client.get("/api/v1/settings", headers={"X-Api-Key": "bootstrap"})).status_code == 200
-    password = "correct horse battery staple"
+    password = "abcdefgh"
     data = {"username": "reader", "password": password, "confirmation": password}
     headers = {"Origin": "http://localhost"}
     assert (await client.post("/setup", data=data)).status_code == 403
@@ -185,7 +185,7 @@ async def test_password_change_and_logout_preserve_api_keys(client, session, mon
     monkeypatch.setattr(browser_setup, "engine", session.bind)
     headers = {"Origin": "http://localhost"}
     password = "old fixture password"
-    new = "new fixture password"
+    new = "abcdefgh"
     assert (await client.post("/setup", data={"username": "reader", "password": password, "confirmation": password}, headers=headers)).status_code == 303
     client.cookies.clear()
     payload = {"current": password, "password": new, "confirmation": new}
@@ -432,3 +432,16 @@ async def test_qbt_redirect_remains_a_failed_request(respx_mock):
         with pytest.raises(QbtError, match="HTTP 302"):
             await operation
     await client.close()
+
+
+@pytest.mark.parametrize("password, expected", [
+    ("abcdefg", False),
+    ("abcdefgh", True),
+    ("12345678", True),
+    ("a" * 128, True),
+    ("a" * 129, False),
+    ("abcd\tefgh", False),
+])
+def test_password_length_without_composition_requirements(password, expected):
+    assert browser_setup.valid_password(password, password) is expected
+    assert not browser_setup.valid_password(password, password + "x")
