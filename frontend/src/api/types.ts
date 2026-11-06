@@ -83,6 +83,8 @@ export interface SeriesEditorResult {
 }
 
 export interface SeriesDetail extends Series {
+  search_title: string;
+  search_templates: string;
   chapters: Chapter[];
   source_links: SourceLink[];
   refreshing: boolean;

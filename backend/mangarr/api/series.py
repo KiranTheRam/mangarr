@@ -378,6 +378,16 @@ async def update_series(
     series = result.scalar_one_or_none()
     if series is None:
         raise HTTPException(404, "Series not found")
+    if body.search_templates is not None:
+        from ..sources.queries import validate_templates
+
+        try:
+            validate_templates(body.search_templates)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        series.search_templates = body.search_templates.strip()
+    if body.search_title is not None:
+        series.search_title = body.search_title.strip()
     _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
     if body.source_priority is not None:
         _check_source_names(body.source_priority, "source_priority")

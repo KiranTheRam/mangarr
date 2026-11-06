@@ -94,6 +94,8 @@ class SeriesOut(BaseModel):
 
 
 class SeriesDetailOut(SeriesOut):
+    search_title: str = ""
+    search_templates: str = ""
     chapters: list[ChapterOut] = []
     source_links: list[SourceLinkOut] = []
     refreshing: bool = False  # a full refresh is running in the background
@@ -163,6 +165,8 @@ class FolderPreviewOut(BaseModel):
 
 
 class SeriesUpdateIn(BaseModel):
+    search_title: str | None = None
+    search_templates: str | None = None
     monitored: bool | None = None
     root_folder_id: int | None = None
     folder_name: str | None = None

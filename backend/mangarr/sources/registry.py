@@ -99,8 +99,10 @@ def series_direct_sources(values: dict[str, str], series) -> list[DirectSource]:
 
 
 def enabled_torrent_indexers(values: dict[str, str]) -> list[TorrentIndexer]:
+    from .torznab import configured_indexers
+
     return [
         idx
         for name, idx in TORRENT_INDEXERS.items()
         if values.get(f"source_{name}_enabled") == "true"
-    ]
+    ] + configured_indexers(values.get("torznab_indexers", "[]"))

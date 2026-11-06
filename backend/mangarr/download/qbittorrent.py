@@ -121,6 +121,17 @@ class QbtClient:
         if resp.text.strip() == "Fails.":
             raise QbtError("qBittorrent rejected the torrent")
 
+    async def add_torrent(self, content: bytes, category: str, save_path: str | None = None) -> None:
+        data = {"category": category}
+        if save_path:
+            data.update(savepath=save_path, autoTMM="false")
+        resp = await self._request(
+            "POST", "/torrents/add", data=data,
+            files={"torrents": ("release.torrent", content, "application/x-bittorrent")},
+        )
+        if resp.text.strip() == "Fails.":
+            raise QbtError("qBittorrent rejected the torrent")
+
     async def list_torrents(self, category: str) -> list[QbtTorrent]:
         resp = await self._request("GET", "/torrents/info", params={"category": category})
         return [

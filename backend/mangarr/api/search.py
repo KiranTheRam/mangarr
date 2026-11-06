@@ -17,7 +17,7 @@ from ..schemas import MetadataResult, ReleaseOut
 from ..sources import registry
 from ..sources.base import DirectSource
 from ..titles import english_title, plausible_title_match, split_alt_titles, title_queries
-from ..util import normalize_title
+from ..util import normalize_title, safe_error_reason
 
 log = logging.getLogger(__name__)
 
@@ -129,6 +129,7 @@ async def search_releases(
     series_id: int | None = None,
     chapter_id: Annotated[list[int], Query()] = [],  # noqa: B006 — FastAPI copies it
     include_torrents: bool = True,
+    q: Annotated[str | None, Query(max_length=2000)] = None,
     session: AsyncSession = Depends(get_session),
 ):
     """Interactive search across direct sources and torrent indexers.
@@ -263,11 +264,16 @@ async def search_releases(
         async def torrent_releases_for_indexer(indexer) -> list[ReleaseOut]:
             out: list[ReleaseOut] = []
             torrent_seen: set[str] = set()
-            for query in queries:
+            from ..sources.queries import search_queries
+
+            torrent_queries = [q.strip()] if q and q.strip() else search_queries(
+                series, list(selected.values()) if selected else list(local_chapters.values()), values,
+            )
+            for query in torrent_queries:
                 try:
                     torrents = await indexer.search(query)
                 except Exception as exc:
-                    log.warning("indexer %s search failed for %r: %r", indexer.name, query, exc)
+                    log.warning("indexer %s search failed: %s", indexer.name, safe_error_reason(exc))
                     continue
                 for t in torrents[:25]:
                     key = t.magnet or t.url or t.title
@@ -277,7 +283,7 @@ async def search_releases(
                     out.append(
                         ReleaseOut(
                             kind="torrent",
-                            source_name=indexer.name,
+                            source_name=t.source_name,
                             title=t.title,
                             magnet=t.magnet,
                             url=t.url,

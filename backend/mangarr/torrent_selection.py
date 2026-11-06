@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from .download.torrent import magnet_btih_hex, torrent_info_hash
 from .filename import parse_filename
 from .models import Chapter, Series
 from .sources.base import TorrentIndexer, TorrentRelease
@@ -15,6 +16,7 @@ from .titles import split_alt_titles, title_queries
 from .util import (
     is_special_chapter,
     normalize_title,
+    safe_error_reason,
 )
 
 log = logging.getLogger(__name__)
@@ -168,6 +170,8 @@ def release_matches_series(release_title: str, series: Series) -> bool:
     if not release:
         return False
     aliases = title_queries(series.title, split_alt_titles(series.alt_titles))
+    if getattr(series, "search_title", ""):
+        aliases.insert(0, series.search_title)
     normalized = [normalize_title(alias) for alias in aliases]
     for alias in normalized:
         compact_length = len(alias.replace(" ", ""))
@@ -194,6 +198,9 @@ async def select_best_torrent(
     *,
     max_size_bytes: int,
     min_seeders: int,
+    values: dict[str, str] | None = None,
+    blocked_payloads: set[tuple[str, str]] | None = None,
+    blocked_hashes: set[str] | None = None,
 ) -> TorrentSelection | None:
     # This selector is used by the explicit add-time "Search now" flow, which
     # intentionally searches even when the new series itself is unmonitored.
@@ -201,7 +208,10 @@ async def select_best_torrent(
     wanted = {c.number for c in chapters if not c.downloaded}
     if not wanted or not indexers:
         return None
-    queries = title_queries(series.title, split_alt_titles(series.alt_titles))
+    from .sources.queries import search_queries
+
+    queries = search_queries(series, [c for c in chapters if c.number in wanted], values or {})
+    blocked_hashes = {info_hash.lower() for info_hash in (blocked_hashes or set())}
     candidates: list[tuple[TorrentIndexer, TorrentRelease]] = []
     seen: set[str] = set()
     for indexer in indexers:
@@ -210,13 +220,15 @@ async def select_best_torrent(
                 releases = await indexer.search(query)
             except Exception as exc:
                 # logged so a blocked indexer is told apart from "no results"
-                log.warning("indexer %s search failed for %r: %r", indexer.name, query, exc)
+                log.warning("indexer %s search failed: %s", indexer.name, safe_error_reason(exc))
                 continue
             for release in releases:
                 key = release.magnet
                 if (
                     not key
                     or key in seen
+                    or (release.source_name, key) in (blocked_payloads or set())
+                    or (key.startswith("magnet:") and magnet_btih_hex(key) in blocked_hashes)
                     or release.seeders < min_seeders
                     or release.size_bytes <= 0
                     or release.size_bytes > max_size_bytes
@@ -239,6 +251,11 @@ async def select_best_torrent(
         indexer, release = item
         try:
             metadata = await indexer.get_torrent_metadata(release)
+            # Signed download URLs and tracker labels can change between feed
+            # requests. The torrent's own identity must keep its cooldown.
+            info_hash = torrent_info_hash(metadata) if metadata else release.info_hash.lower()
+            if info_hash in blocked_hashes:
+                return TorrentSelection(release=release, coverage=set())
             coverage = (
                 torrent_coverage(metadata, release.title, chapters, series)
                 if metadata

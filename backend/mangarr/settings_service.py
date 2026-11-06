@@ -37,6 +37,9 @@ DEFAULTS: dict[str, str] = {
     "mangadex_username": "",
     "mangadex_password": "",
     "mangadex_language": "en",
+    "torznab_indexers": "[]",
+    "torrent_query_templates": "{series}",
+    "torrent_monitor_enabled": "false",
     # qBittorrent
     "qbittorrent_url": "http://localhost:8080",
     "qbittorrent_username": "admin",
@@ -125,6 +128,15 @@ def validate(values: dict[str, str]) -> None:
     from .library.naming import chapter_filename
     from .download.images import ImageOptimization
 
+    from .sources.torznab import validate_indexers
+    from .sources.queries import validate_templates
+
+    if "torznab_indexers" in values:
+        validate_indexers(values["torznab_indexers"])
+    if "torrent_query_templates" in values:
+        validate_templates(values["torrent_query_templates"], required=True)
+    if values.get("torrent_monitor_enabled", "false") not in {"true", "false"}:
+        raise ValueError("torrent_monitor_enabled must be true or false")
     ImageOptimization.from_settings(values)
 
     for key in ("naming_template", "naming_template_no_volume"):

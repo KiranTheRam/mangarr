@@ -51,6 +51,8 @@ class Series(Base):
     anilist_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)
     mangaupdates_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)
     title: Mapped[str] = mapped_column(String)
+    search_title: Mapped[str] = mapped_column(String, default="")
+    search_templates: Mapped[str] = mapped_column(Text, default="")
     sort_title: Mapped[str] = mapped_column(String, default="")
     alt_titles: Mapped[str] = mapped_column(Text, default="")  # newline-separated
     description: Mapped[str] = mapped_column(Text, default="")
@@ -225,7 +227,7 @@ class Download(Base):
     )
     title: Mapped[str] = mapped_column(String, default="")  # human-readable release title
     source_name: Mapped[str] = mapped_column(String, default="")
-    payload: Mapped[str] = mapped_column(Text, default="")  # source-specific: chapter external id / magnet
+    payload: Mapped[str] = mapped_column(Text, default="")  # source-specific: chapter external id / magnet / torrent URL
     # scanlation group of the grabbed release, when the source reports one
     release_group: Mapped[str] = mapped_column(String, default="")
     torrent_hash: Mapped[str] = mapped_column(String, default="")
