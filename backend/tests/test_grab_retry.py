@@ -323,7 +323,8 @@ async def test_auto_torrent_grab_returns_inspected_coverage(db_session, tmp_path
         captured["min_seeders"] = kwargs["min_seeders"]
         return TorrentSelection(release=release, coverage={1.0, 2.5})
 
-    async def fake_enqueue(session, selected_series, magnet, title, values):
+    async def fake_enqueue(session, selected_series, magnet, title, values, *, source_name):
+        captured["source"] = source_name
         captured["enqueued"] = (selected_series.id, magnet, title)
         return SimpleNamespace(id=321)
 
@@ -341,6 +342,7 @@ async def test_auto_torrent_grab_returns_inspected_coverage(db_session, tmp_path
         },
     )
 
+    assert captured["source"] == "nyaa"
     assert grab is not None
     assert grab.download_id == 321
     assert grab.coverage == {1.0, 2.5}

@@ -63,6 +63,9 @@ class TorrentRelease:
     size_bytes: int = 0
     seeders: int = 0
     leechers: int = 0
+    # Resolved btih identity, including HTTP endpoints that redirect to a
+    # magnet and therefore have no downloadable metadata bytes to inspect.
+    info_hash: str = ""
 
 
 class DirectSource(ABC):

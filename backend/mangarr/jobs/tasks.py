@@ -2,8 +2,6 @@
 processing, qBittorrent sync, and the monitor loop."""
 
 import asyncio
-import base64
-import binascii
 import logging
 import re
 import time
@@ -41,6 +39,7 @@ from ..db import session_scope
 from ..download.direct import DuplicateChapterPagesError, download_chapter_to_cbz
 from ..download.images import ImageOptimization
 from ..download.qbittorrent import QbtClient
+from ..download.torrent import magnet_btih_hex
 from ..filename import parse_filename
 from ..library.importer import import_torrent_payload
 from ..library.matcher import find_media_files, find_series_media_files, match_files
@@ -62,12 +61,10 @@ from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
 from ..titles import plausible_title_match, split_alt_titles, title_queries
 from ..torrent_selection import select_best_torrent
-from ..util import is_transient_error, normalize_title
+from ..util import is_transient_error, normalize_title, safe_error_reason
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
 
 log = logging.getLogger(__name__)
-
-BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 
 # error text marking a download the user cancelled — it must not count as a
 # source failure (which would stop the monitor from ever retrying that
@@ -843,6 +840,8 @@ async def refresh_series_full(
                 await grab_missing_chapters(
                     session, series, values, chapter_cache=chapter_cache,
                 )
+                if values.get("torrent_monitor_enabled") == "true":
+                    await auto_grab_best_torrent(session, series, values, only_monitored=True)
             elif grab_missing:
                 # explicit one-time search (e.g. "search for missing" at add
                 # time): runs even for unmonitored series, whose chapters carry
@@ -945,22 +944,6 @@ async def enqueue_direct(
     return dl
 
 
-def magnet_btih_hex(magnet: str) -> str:
-    """The magnet's info-hash in the lowercase hex form qBittorrent reports.
-    Base32 hashes (older magnet links) are converted — matching against
-    qBittorrent by their raw form would never succeed."""
-    m = BTIH_RE.search(magnet)
-    if not m:
-        return ""
-    raw = m.group(1)
-    if len(raw) == 40:
-        return raw.lower()
-    try:
-        return base64.b32decode(raw).hex()
-    except (binascii.Error, ValueError):
-        return ""
-
-
 def torrent_save_path(base: str, category: str) -> str | None:
     """Return the category's final path without duplicating its suffix.
 
@@ -983,12 +966,18 @@ def torrent_save_path(base: str, category: str) -> str | None:
 
 
 async def submit_torrent(magnet: str, values: dict[str, str]) -> str:
-    """Submit a magnet to qBittorrent and return its normalized info hash.
+    """Submit a magnet or torrent-file URL and return its normalized info hash.
 
     Kept separate from the database row creation so a failed torrent can be
     submitted again without replacing its Activity entry.
     """
-    torrent_hash = magnet_btih_hex(magnet)
+    torrent_data = None
+    if magnet.startswith(("http://", "https://")):
+        from ..download.torrent import fetch_torrent
+
+        magnet, torrent_hash, torrent_data = await fetch_torrent(magnet)
+    else:
+        torrent_hash = magnet_btih_hex(magnet)
     if not torrent_hash:
         raise ValueError("magnet link must include a valid btih info hash")
     client = QbtClient(
@@ -1003,7 +992,10 @@ async def submit_torrent(magnet: str, values: dict[str, str]) -> str:
         base = values.get("downloads_dir", "").strip() or await client.default_save_path()
         save_path = torrent_save_path(base, category)
         await client.ensure_category(category, save_path)
-        await client.add_magnet(magnet, category=category, save_path=save_path)
+        if torrent_data is not None:
+            await client.add_torrent(torrent_data, category=category, save_path=save_path)
+        else:
+            await client.add_magnet(magnet, category=category, save_path=save_path)
     finally:
         await client.close()
     return torrent_hash
@@ -1011,6 +1003,7 @@ async def submit_torrent(magnet: str, values: dict[str, str]) -> str:
 
 async def enqueue_torrent(
     session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
+    source_name: str = "manual",
 ) -> Download:
     torrent_hash = await submit_torrent(magnet, values)
     dl = Download(
@@ -1018,14 +1011,14 @@ async def enqueue_torrent(
         kind=DownloadKind.TORRENT,
         status=DownloadStatus.DOWNLOADING,
         title=title,
-        source_name="nyaa",
+        source_name=source_name,
         payload=magnet,
         torrent_hash=torrent_hash,
     )
     session.add(dl)
     session.add(HistoryEvent(
         series_id=series.id if series else None, event="grabbed",
-        source_name="nyaa", detail=title,
+        source_name=source_name, detail=title,
     ))
     await session.commit()
     return dl
@@ -1038,9 +1031,10 @@ class AutomaticTorrentGrab:
 
 
 async def auto_grab_best_torrent(
-    session: AsyncSession, series: Series, values: dict[str, str]
+    session: AsyncSession, series: Series, values: dict[str, str],
+    *, only_monitored: bool = False,
 ) -> AutomaticTorrentGrab | None:
-    """Inspect Nyaa metadata and queue one best-coverage add-time release.
+    """Inspect torrent metadata and queue one best-coverage release.
 
     Returns the new download id and its expected chapter coverage. The id lets
     the caller distinguish this torrent from an older series-level download;
@@ -1052,11 +1046,14 @@ async def auto_grab_best_torrent(
         or not registry.enabled_torrent_indexers(values)
     ):
         return None
+    reason = await library_root_unavailable(session, series)
+    if reason:
+        log.warning("Not grabbing torrents for %r: %s", series.title, reason)
+        return None
     existing_download = await session.scalar(
         select(Download.id)
         .where(
             Download.series_id == series.id,
-            Download.chapter_id.is_(None),
             Download.status.in_([
                 DownloadStatus.QUEUED,
                 DownloadStatus.DOWNLOADING,
@@ -1067,23 +1064,34 @@ async def auto_grab_best_torrent(
     )
     if existing_download is not None:
         log.info(
-            "automatic torrent search skipped for %r: series download %d is in flight",
+            "automatic torrent search skipped for %r: download %d is in flight",
             series.title,
             existing_download,
         )
         return None
+    failures = (await session.execute(
+        select(Download.source_name, Download.payload, Download.torrent_hash).where(
+            Download.series_id == series.id,
+            Download.kind == DownloadKind.TORRENT,
+            failed_grab_blocks(datetime.now(timezone.utc), include_series=True),
+        )
+    )).all()
     try:
         max_gib = int(values.get("torrent_auto_max_size_gib", "30"))
         min_seeders = int(values.get("torrent_auto_min_seeders", "1"))
         selection = await select_best_torrent(
             series,
-            [chapter for chapter in series.chapters if not chapter.excluded],
+            [chapter for chapter in series.chapters
+             if not chapter.excluded and (chapter.monitored or not only_monitored)],
             registry.enabled_torrent_indexers(values),
             max_size_bytes=max_gib * 1024**3,
-            min_seeders=min_seeders,
+            min_seeders=max(1, min_seeders) if only_monitored else min_seeders,
+            values=values,
+            blocked_payloads={(source, payload) for source, payload, _ in failures},
+            blocked_hashes={info_hash.lower() for _, _, info_hash in failures if info_hash},
         )
     except Exception as exc:
-        log.warning("automatic torrent search failed for %r: %s", series.title, exc)
+        log.warning("automatic torrent search failed for %r: %s", series.title, safe_error_reason(exc))
         return None
     if selection is None:
         if not any(
@@ -1104,10 +1112,11 @@ async def auto_grab_best_torrent(
         return None
     try:
         download = await enqueue_torrent(
-            session, series, selection.release.magnet, selection.release.title, values
+            session, series, selection.release.magnet, selection.release.title, values,
+            source_name=selection.release.source_name
         )
     except Exception as exc:
-        log.warning("automatic torrent grab failed for %r: %s", series.title, exc)
+        log.warning("automatic torrent grab failed for %r: %s", series.title, safe_error_reason(exc))
         return None
     log.info(
         "automatic torrent selected %r for %r: %d chapter(s), %d seeder(s), %.2f GiB",
@@ -1681,7 +1690,7 @@ async def _import_torrent(
             # recorded origin — the import found it rather than placed it
             if not chapter.downloaded or chapter.file_path != str(dest):
                 chapter.file_path = str(dest)
-                chapter.file_source = "nyaa"
+                chapter.file_source = dl.source_name or "nyaa"
             chapter.downloaded = True
         else:
             for chapter_id in coverage.get(str(dest), []):
@@ -1690,12 +1699,12 @@ async def _import_torrent(
                     ch.downloaded = True
                     # set after file_path: assigning it resets provenance
                     ch.file_path = str(dest)
-                    ch.file_source = "nyaa"
+                    ch.file_source = dl.source_name or "nyaa"
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
     dl.error = ""
     session.add(HistoryEvent(
-        series_id=series.id, event="imported", source_name="nyaa",
+        series_id=series.id, event="imported", source_name=dl.source_name or "nyaa",
         detail=f"{len(imported)} file(s) from {dl.title}",
     ))
     await session.commit()
@@ -1705,13 +1714,13 @@ async def _import_torrent(
 
 # ------------------------------------------------------------ monitor loop
 
-def failed_grab_blocks(now: datetime):
+def failed_grab_blocks(now: datetime, *, include_series: bool = False):
     """Filter for FAILED downloads that still keep the monitor from retrying
     their chapter on their source. The queue keeps these visible too, so a
     block never outlasts its entry in Activity."""
     return and_(
         Download.status == DownloadStatus.FAILED,
-        Download.chapter_id.isnot(None),
+        *([] if include_series else [Download.chapter_id.isnot(None)]),
         Download.error != REMOVED_BY_USER,
         # stopped before the source was asked: not the source's failure
         *(~Download.error.startswith(prefix) for prefix in NOT_SOURCE_FAILURES),
@@ -2121,6 +2130,8 @@ async def monitor_all() -> None:
                         log.warning("library scan failed for series %d: %s", series_id, exc)
                     await grab_missing_chapters(session, series, values,
                                                 chapter_cache=chapter_cache)
+                    if values.get("torrent_monitor_enabled") == "true":
+                        await auto_grab_best_torrent(session, series, values, only_monitored=True)
                     try:
                         await merge_complete_volumes(session, series, values)
                     except Exception as exc:

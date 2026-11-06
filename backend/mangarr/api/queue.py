@@ -55,7 +55,7 @@ async def get_queue(session: AsyncSession = Depends(get_session)):
             ),
             # ...and for as long as it keeps the monitor from retrying that
             # chapter on that source, however long that is
-            failed_grab_blocks(now),
+            failed_grab_blocks(now, include_series=True),
         ))
         .order_by(Download.id)
     )
@@ -163,9 +163,19 @@ async def retry_failed_download(
         if values["qbittorrent_enabled"] != "true":
             raise HTTPException(400, "qBittorrent is not enabled in settings")
         try:
-            dl.torrent_hash = await submit_torrent(dl.payload, values)
+            existing = None
+            if dl.torrent_hash:
+                # Import failures leave completed data seeding. Track that
+                # torrent again without re-fetching an expired signed URL.
+                client = QbtClient(values["qbittorrent_url"], values["qbittorrent_username"], values["qbittorrent_password"])
+                try:
+                    existing = await client.get_torrent(dl.torrent_hash)
+                finally:
+                    await client.close()
+            if existing is None:
+                dl.torrent_hash = await submit_torrent(dl.payload, values)
         except Exception as exc:
-            raise HTTPException(502, f"qBittorrent error: {exc}") from exc
+            raise HTTPException(502, "Torrent submission failed; check the indexer and qBittorrent settings") from exc
         dl.status = DownloadStatus.DOWNLOADING
     else:
         source = registry.DIRECT_SOURCES.get(dl.source_name)
@@ -208,15 +218,18 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
     elif body.magnet:
         if values["qbittorrent_enabled"] != "true":
             raise HTTPException(400, "qBittorrent is not enabled in settings")
-        if not magnet_btih_hex(body.magnet):
-            raise HTTPException(422, "Magnet link must include a valid btih info hash")
+        if not magnet_btih_hex(body.magnet) and not body.magnet.startswith(("http://", "https://")):
+            raise HTTPException(422, "Provide a valid btih magnet or an HTTP(S) torrent URL")
         series = await session.get(Series, body.series_id) if body.series_id else None
+        if body.series_id and series is None:
+            raise HTTPException(404, "Series not found")
         try:
             dl = await enqueue_torrent(
-                session, series, body.magnet, body.title or "manual torrent", values
+                session, series, body.magnet, body.title or "manual torrent", values,
+                source_name=body.source_name or "manual"
             )
         except Exception as exc:
-            raise HTTPException(502, f"qBittorrent error: {exc}") from exc
+            raise HTTPException(502, "Torrent submission failed; check the indexer and qBittorrent settings") from exc
     else:
         raise HTTPException(422, "Provide chapter_id+source_name+external_id or magnet")
 

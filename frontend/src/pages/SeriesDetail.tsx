@@ -50,6 +50,8 @@ function InteractiveSearch({
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
+  const [queryInput, setQueryInput] = useState("");
+  const [manualQuery, setManualQuery] = useState("");
   const params = useMemo(() => {
     const q = new URLSearchParams();
     if (chapterIds && chapterIds.length > 0) {
@@ -58,8 +60,9 @@ function InteractiveSearch({
       q.set("series_id", String(seriesId));
     }
     if (!includeTorrents) q.set("include_torrents", "false");
+    if (manualQuery) q.set("q", manualQuery);
     return q.toString();
-  }, [seriesId, chapterIds, includeTorrents]);
+  }, [seriesId, chapterIds, includeTorrents, manualQuery]);
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["releases", params],
     queryFn: () => api.get<Release[]>(`/search/releases?${params}`),
@@ -113,6 +116,7 @@ function InteractiveSearch({
     }
     return api.post("/queue/grab", {
       series_id: seriesId,
+      source_name: release.source_name,
       magnet: release.magnet,
       title: release.title,
     });
@@ -168,6 +172,12 @@ function InteractiveSearch({
 
   return (
     <Modal title={`Search — ${title}`} onClose={onClose}>
+      {includeTorrents && <form className="form-row" onSubmit={(event) => { event.preventDefault(); setManualQuery(queryInput.trim()); }}>
+        <label htmlFor="torrent-manual-query">Torrent search query</label>
+        <input id="torrent-manual-query" value={queryInput} placeholder="Automatic queries" onChange={(event) => setQueryInput(event.target.value)} />
+        <button className="btn" type="submit">Search</button>
+      </form>}
+      {includeTorrents && <p className="form-hint">Leave blank for automatic torrent queries. Direct source results use the series links.</p>}
       {isLoading ? (
         <Spinner />
       ) : isError ? (

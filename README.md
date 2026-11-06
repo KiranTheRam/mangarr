@@ -488,3 +488,62 @@ legitimate.
   source/metadata plugin interfaces are already in place.
 - Discord notifications, and notifications on grab (a webhook on import
   already exists — see Features).
+
+## Torznab, Prowlarr, and Jackett (optional)
+
+In **Settings → Torznab indexers**, add one or more indexers with a name,
+Torznab API URL, API key, and comma-separated category IDs. Copy the API URL
+from Prowlarr or Jackett (for example `http://prowlarr:9696/1/api` or
+`http://jackett:9117/api/v2.0/indexers/my-indexer/results/torznab/api`). Use the
+base API URL without query parameters; Mangarr supplies the key and query.
+An aggregate Torznab endpoint can also be used when supported by your server.
+The default category is comics (`7030`); choose the category IDs your indexer
+uses for manga/books. Search type defaults to `search`; select `book` only
+when the indexer supports it. API keys are masked after saving. Changing a
+saved API URL requires re-entering its key.
+
+Enable and configure qBittorrent to include torrent releases in **Search
+Releases**. Nyaa and direct sources keep their existing controls. Results show
+the configured feed/tracker, size, seeders, and leechers. Both magnets and
+HTTP(S) torrent-file links work, including redirects to magnets. Torrent files
+need a v1 btih identity: v1 and hybrid torrents are supported; v2-only metadata
+is rejected before submission to qBittorrent. Completed
+torrents use the existing chapter/volume importer, preserving the actual
+source in Activity, history, and file provenance. Mount qBittorrent's completed
+paths into Mangarr and configure the shared downloads directory. Hardlinks
+keep seeding without duplicating data when downloads and library share a
+filesystem; copy mode handles separate filesystems.
+
+**Default torrent query templates** in Settings accept one variant per line
+(up to 10 templates and 20 rendered queries per search). The default,
+`{series}`, searches the title and known alternative titles. In a series'
+**Automation → Torrent search options**, override the title or templates,
+for example:
+
+```text
+{series} c{chapter:03d}
+{series} v{volume:02d}
+{series} {year}
+```
+
+Tokens are `{series}`, `{chapter}`, `{volume}`, and `{year}` (the series year).
+Chapter padding preserves decimals: chapter 12.5 becomes `c012.5`. Volume
+queries need a chapter-to-volume map. Chapter-scoped searches render those
+chapters; series-wide searches render the known, non-excluded chapters.
+If a numeric template has no applicable metadata, a title search is used.
+Blank per-series fields restore the defaults. The release dialog also accepts
+a manual torrent query; clear it to return to automatic variants. These query
+settings do not change direct-source discovery.
+
+Add-time **Search now** uses enabled indexers and Mangarr's existing coverage
+selector: matching series title, maximum size, minimum seeders, then chapter
+and volume coverage from torrent metadata (or a parseable release title when
+metadata is unavailable). Volume-only releases need a chapter-to-volume map;
+unknown coverage is never assumed to mean the entire series.
+
+**Scheduled torrent fallback** is off by default. Enable it in Settings to
+also search enabled torrent indexers after direct sources during scheduled
+monitoring and monitored Search Missing passes. It respects monitored and
+excluded chapters, requires at least one seeder, skips series with active
+downloads or unavailable library roots, and applies the normal failure
+cooldown to failed torrent releases. Explicit manual grabs remain available.

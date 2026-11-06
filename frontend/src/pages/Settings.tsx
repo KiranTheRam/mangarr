@@ -225,6 +225,43 @@ function ApiKeys() {
   );
 }
 
+interface TorznabConfig {
+  id: string;
+  name: string;
+  url: string;
+  api_key: string;
+  categories: string;
+  search_type: string;
+  enabled: boolean;
+}
+
+export function TorznabSettings({ form, setForm }: { form: SettingsType; setForm: (form: SettingsType) => void }) {
+  const entries: TorznabConfig[] = JSON.parse(form.torznab_indexers || "[]");
+  const update = (next: TorznabConfig[]) => setForm({ ...form, torznab_indexers: JSON.stringify(next) });
+  return <div className="settings-section">
+    <h3>Torznab indexers (optional)</h3>
+    <p className="section-hint">Add API URLs from Prowlarr, Jackett, or a Torznab indexer. Enable qBittorrent to search and download. Re-enter the API key after changing an indexer's URL.</p>
+    {entries.map((entry, index) => {
+      const set = (patch: Partial<TorznabConfig>) => update(entries.map((item, i) => i === index ? { ...item, ...patch } : item));
+      return <fieldset key={entry.id} style={{ marginBottom: 16 }}>
+        <legend>{entry.name || "New indexer"}</legend>
+        <Toggle label="Enable indexer" on={entry.enabled} onChange={(enabled) => set({ enabled })} />
+        {([ ["name", "Name"], ["url", "Torznab API URL"], ["api_key", "API key"], ["categories", "Categories"] ] as const).map(([key, label]) => <div className="form-row" key={key}>
+          <label htmlFor={`${entry.id}-${key}`}>{label}</label>
+          <input id={`${entry.id}-${key}`} type={key === "api_key" ? "password" : "text"} placeholder={key === "url" ? "http://prowlarr:9696/1/api" : ""} value={entry[key]} onChange={(e) => set({ [key]: e.target.value })} />
+        </div>)}
+        <div className="form-row"><label htmlFor={`${entry.id}-type`}>Search type</label><select id={`${entry.id}-type`} value={entry.search_type} onChange={(e) => set({ search_type: e.target.value })}><option value="search">Search</option><option value="book">Book</option></select></div>
+        <button className="btn sm" onClick={() => update(entries.filter((_, i) => i !== index))}>Remove indexer</button>
+      </fieldset>;
+    })}
+    <button className="btn" onClick={() => update([...entries, { id: Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join(""), name: "", url: "", api_key: "", categories: "7030", search_type: "search", enabled: true }])}>Add Torznab indexer</button>
+    <div className="form-row"><label htmlFor="torrent-templates">Default torrent query templates</label><textarea id="torrent-templates" value={form.torrent_query_templates ?? "{series}"} onChange={(e) => setForm({ ...form, torrent_query_templates: e.target.value })} /></div>
+    <p className="section-hint">One variant per line (up to 10). Tokens: {"{series}, {chapter}, {volume}, {year}"}. Examples: {"{series} c{chapter:03d}"} or {"{series} v{volume:02d}"}. Decimal chapter numbers are preserved. Volume queries require chapter-to-volume metadata. Override these in a series' Automation options.</p>
+    <div className="form-row"><label>Scheduled torrent fallback</label><Toggle label="Search torrents for missing monitored chapters" on={form.torrent_monitor_enabled === "true"} onChange={(enabled) => setForm({ ...form, torrent_monitor_enabled: String(enabled) })} /></div>
+    <p className="section-hint">After direct sources, search enabled torrent indexers for missing monitored chapters. Requires seeders and matching chapter/volume coverage. Active downloads and recently failed releases are skipped. Add-time Search now uses torrents regardless of this toggle.</p>
+  </div>;
+}
+
 const SOURCE_HINTS: Record<string, string> = {
   mangaplus: "Official same-day Shonen Jump. Needs a residential IP — bans datacenters.",
   webtoons: "Official WEBTOON Originals. Only episodes that are currently free (no coins) are listed.",
@@ -883,10 +920,12 @@ export default function Settings() {
           </div>
         </div>
 
+        <TorznabSettings form={form} setForm={setForm} />
+
         <div className="settings-section">
           <h3>Download Client — qBittorrent</h3>
           <p className="section-hint">
-            Torrent grabs (Nyaa releases) are sent to qBittorrent and imported when complete.
+            Torrent grabs (Nyaa and Torznab releases) are sent to qBittorrent and imported when complete.
             Re-enter the password after changing the URL or username, before testing or saving.
           </p>
           <div className="form-row">

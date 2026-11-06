@@ -24,6 +24,13 @@ os.umask(_UMASK)
 NEW_FILE_MODE = 0o666 & ~_UMASK
 
 
+def safe_error_reason(error: Exception) -> str:
+    """Describe failures without logging credential-bearing request URLs."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    kind = type(error).__name__
+    return f"{kind} (HTTP {status})" if status else kind
+
+
 class RateLimiter:
     """Simple async token-bucket limiter shared per source."""
 
