@@ -55,11 +55,11 @@ function BrowserSecurity({ dirty }: { dirty: boolean }) {
             </div>
             <div className="form-row">
               <label htmlFor="browser-new-password">New password</label>
-              <input id="browser-new-password" name="password" type="password" autoComplete="new-password" minLength={12} maxLength={256} required />
+              <input id="browser-new-password" name="password" type="password" autoComplete="new-password" minLength={8} maxLength={256} required />
             </div>
             <div className="form-row">
               <label htmlFor="browser-confirm-password">Confirm new password</label>
-              <input id="browser-confirm-password" name="confirmation" type="password" autoComplete="new-password" minLength={12} maxLength={256} required />
+              <input id="browser-confirm-password" name="confirmation" type="password" autoComplete="new-password" minLength={8} maxLength={256} required />
             </div>
             <button className="btn primary" disabled={busy || dirty}>Change Password</button>{" "}
             <button className="btn" type="button" disabled={busy || dirty} onClick={() => void submit("logout")}>Sign Out</button>

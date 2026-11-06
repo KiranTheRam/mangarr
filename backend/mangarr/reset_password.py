@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nPassword reset canceled.", file=sys.stderr)
         return 1
     if not valid_password(password, confirmation):
-        print("Choose a password of 12 to 128 characters and enter it twice.", file=sys.stderr)
+        print("Choose a password of 8 to 128 characters and enter it twice.", file=sys.stderr)
         return 1
 
     try:
