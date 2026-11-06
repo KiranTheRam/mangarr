@@ -94,7 +94,7 @@ export default function AddSeries() {
         {isFetching ? (
           <Spinner />
         ) : results && results.length === 0 ? (
-          <EmptyState icon="🔍" title="No results" hint="Try a different title." />
+          <EmptyState icon="search" title="No results" hint="Try a different title." />
         ) : (
           results?.map((r) => {
             const clickable = canAdd && !r.in_library;

@@ -1,3 +1,4 @@
+import { Icon } from "./Icon";
 import { useEffect, useState } from "react";
 import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
@@ -57,7 +58,7 @@ export function FoldersPanel({
     <div className="folders-panel">
       {data?.map((f) => (
         <div className="folder-line" key={f.id ?? "primary"}>
-          📁 <code>{f.path || "(unset)"}</code>
+          <Icon name="folder" /> <code>{f.path || "(unset)"}</code>
           {f.primary && <span className="tag">primary</span>}
           {f.volume_offset !== null && (
             <span className="tag" title="Physical volume minus this offset becomes the series-local volume">
@@ -71,7 +72,7 @@ export function FoldersPanel({
             </button>
           ) : (
             <button className="btn sm" title="Remove" onClick={() => removeExtra.mutate(f.id!)}>
-              ✕
+              <Icon name="close" />
             </button>
           )}
         </div>
@@ -198,7 +199,7 @@ export function SourcesModal({
               <td>{l.external_title || l.external_id}</td>
               <td style={{ width: 40 }}>
                 <button className="btn sm" title="Remove" onClick={() => remove.mutate(l.id)}>
-                  ✕
+                  <Icon name="close" />
                 </button>
               </td>
             </tr>
@@ -496,7 +497,7 @@ export function RenameModal({
             <tbody>
               {outcomes.map((o, i) => (
                 <tr key={i}>
-                  <td>{o.status === "renamed" ? "✓" : "⚠"}</td>
+                  <td>{o.status === "renamed" ? <Icon name="check" /> : <Icon name="warning" />}</td>
                   <td>{o.new_name}</td>
                   <td style={{ color: "var(--text-faint)" }}>
                     {o.status !== "renamed" ? o.status.replace("skipped-", "") : ""}
@@ -521,7 +522,7 @@ export function RenameModal({
               <>
                 {" "}
                 <span style={{ color: "var(--danger)" }}>
-                  ⚠ some targets already exist (a duplicate file) and can't be renamed.
+                  <Icon name="warning" /> some targets already exist (a duplicate file) and can't be renamed.
                 </span>
               </>
             )}
@@ -549,7 +550,7 @@ export function RenameModal({
                     />
                   </td>
                   <td className="old">{i.current_name}</td>
-                  <td className="arrow">→</td>
+                  <td className="arrow"><Icon name="arrow-right" /></td>
                   <td className="new">
                     {i.new_name}
                     {i.conflict && (

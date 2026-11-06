@@ -1,3 +1,4 @@
+import { Icon } from "./Icon";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
@@ -175,7 +176,7 @@ export function AddSeriesModal({
               title="Remove folder"
               onClick={() => setExtraFolders((prev) => prev.filter((_, j) => j !== i))}
             >
-              ✕
+              <Icon name="close" />
             </button>
           </div>
         </div>

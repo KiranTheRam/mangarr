@@ -1,3 +1,4 @@
+import { Icon } from "./Icon";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
@@ -73,7 +74,7 @@ export function RelatedTitles({ seriesId }: { seriesId: number }) {
   return (
     <div className="related-section">
       <button type="button" className="related-toggle" aria-expanded={open} onClick={toggle}>
-        <span className="chevron">{open ? "▾" : "▸"}</span> Related &amp; recommended
+        <span className="chevron">{open ? <Icon name="chevron-down" /> : <Icon name="chevron-right" />}</span> Related &amp; recommended
         {data && !empty && (
           <span className="dim"> · {data.relations.length + data.recommendations.length}</span>
         )}

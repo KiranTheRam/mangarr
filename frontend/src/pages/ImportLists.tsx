@@ -553,7 +553,7 @@ export default function ImportLists() {
           <Spinner />
         ) : lists && lists.length === 0 ? (
           <EmptyState
-            icon="☰"
+            icon="files"
             title="No import lists"
             hint="Add an AniList, MyAnimeList, MangaDex or MangaUpdates list to add what you read automatically."
           />

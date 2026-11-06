@@ -1,3 +1,4 @@
+import { Icon } from "../components/Icon";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
@@ -257,7 +258,7 @@ function InteractiveSearch({
                       }
                       onClick={() => grab.mutate(r)}
                     >
-                      ⇓
+                      <Icon name="download" />
                     </button>
                   </td>
                 </tr>
@@ -905,7 +906,7 @@ export default function SeriesDetail() {
                   toggleChapter.mutate({ chapterIds: [ch.id], monitored: !ch.monitored })
                 }
               >
-                {ch.monitored ? "🔖" : "◻"}
+                {ch.monitored ? <Icon name="bookmark" /> : <Icon name="bookmark-off" />}
               </button>
             </td>
             <td className="cell-chapter">
@@ -960,7 +961,7 @@ export default function SeriesDetail() {
                 title={`Edit title, volume, and exclusion${ch.volume_source ? ` (volume source: ${ch.volume_source})` : ""}`}
                 onClick={() => setEditingChapter(ch)}
               >
-                ✏️
+                <Icon name="rename" />
               </button>
               <button
                 className="btn icon-btn"
@@ -974,7 +975,7 @@ export default function SeriesDetail() {
                   })
                 }
               >
-                🔍
+                <Icon name="search" />
               </button>
             </td>
           </tr>
@@ -992,7 +993,7 @@ export default function SeriesDetail() {
           onClick={() => refresh.mutate()}
           disabled={refresh.isPending}
         >
-          {refresh.isPending ? "Refreshing…" : "⟳ Refresh"}
+          {refresh.isPending ? "Refreshing…" : <><Icon name="refresh" /> Refresh</>}
         </button>
         <button
           className="btn"
@@ -1000,28 +1001,28 @@ export default function SeriesDetail() {
           onClick={() => scan.mutate()}
           disabled={scan.isPending}
         >
-          {scan.isPending ? "Scanning…" : "🗂 Scan Disk"}
+          {scan.isPending ? "Scanning…" : <><Icon name="scan" /> Scan Disk</>}
         </button>
         <button
           className="btn"
           title="Browse detected files and manually map unmatched files"
           onClick={() => setShowFiles(true)}
         >
-          📄 Files
+          <Icon name="files" /> Files
         </button>
         <button
           className="btn"
           title="Preview and apply the configured file naming pattern"
           onClick={() => setShowRename(true)}
         >
-          ✏️ Rename
+          <Icon name="rename" /> Rename
         </button>
         <button
           className="btn"
           title="Find duplicate or orphaned files that can be cleaned up"
           onClick={() => setShowCleanup(true)}
         >
-          🧹 Clean up
+          <Icon name="cleanup" /> Clean up
         </button>
         <button
           className="btn"
@@ -1041,21 +1042,21 @@ export default function SeriesDetail() {
             })
           }
         >
-          🔍 Search Missing
+          <Icon name="search-missing" /> Search Missing
         </button>
         <button
           className="btn"
           title="Search direct sources and torrent indexers for this series, including whole-volume packs"
           onClick={() => setSearch({ title: `${series.title} (all releases)` })}
         >
-          🔍 Search Releases
+          <Icon name="search" /> Search Releases
         </button>
         <button
           className="btn"
           title="Monitoring mode, source order, scanlation groups, upgrades, and volume merging"
           onClick={() => setShowAutomation(true)}
         >
-          ⚙ Automation
+          <Icon name="settings" /> Automation
         </button>
         <button
           className="btn"
@@ -1063,7 +1064,7 @@ export default function SeriesDetail() {
           onClick={() => toggleMonitor.mutate()}
           disabled={toggleMonitor.isPending}
         >
-          {series.monitored ? "🔖 Monitored" : "◻ Unmonitored"}
+          {series.monitored ? <><Icon name="bookmark" /> Monitored</> : <><Icon name="bookmark-off" /> Unmonitored</>}
         </button>
         <button
           className="btn danger"
@@ -1074,7 +1075,7 @@ export default function SeriesDetail() {
               deleteSeries.mutate();
           }}
         >
-          ✕
+          <Icon name="close" />
         </button>
       </Toolbar>
       <div className="content">
@@ -1207,7 +1208,7 @@ export default function SeriesDetail() {
             <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               {series.source_links.map((sl) => (
                 <span className="tag" key={sl.id} title={sl.external_title}>
-                  🔗 {sl.source_name}
+                  <Icon name="link" /> {sl.source_name}
                 </span>
               ))}
               <button className="btn sm" onClick={() => setShowSources(true)}>
@@ -1243,7 +1244,7 @@ export default function SeriesDetail() {
                   disabled={toggleChapter.isPending}
                   onClick={() => toggleChapter.mutate({ chapterIds: selectedIds, monitored: true })}
                 >
-                  🔖 Monitor
+                  <Icon name="bookmark" /> Monitor
                 </button>
                 <button
                   className="btn sm"
@@ -1251,10 +1252,10 @@ export default function SeriesDetail() {
                   disabled={toggleChapter.isPending}
                   onClick={() => toggleChapter.mutate({ chapterIds: selectedIds, monitored: false })}
                 >
-                  ◻ Unmonitor
+                  <Icon name="bookmark-off" /> Unmonitor
                 </button>
                 <button className="btn primary sm" onClick={searchSelected}>
-                  🔍 Search {selectedIds.length} selected
+                  <Icon name="search-missing" /> Search {selectedIds.length} selected
                 </button>
               </>
             )}
@@ -1275,7 +1276,7 @@ export default function SeriesDetail() {
               title={allCollapsed ? "Expand every volume section" : "Collapse every volume section"}
               onClick={() => setAllCollapsed(!allCollapsed)}
             >
-              {allCollapsed ? "▸ Expand all" : "▾ Collapse all"}
+              {allCollapsed ? <><Icon name="chevron-right" /> Expand all</> : <><Icon name="chevron-down" /> Collapse all</>}
             </button>
           </div>
           {groups.map(({ volume, chapters }) => {
@@ -1296,7 +1297,7 @@ export default function SeriesDetail() {
                   className="volume-header"
                   onClick={() => setCollapsed({ ...collapsed, [key]: !isCollapsed })}
                 >
-                  <span className="chevron">{isCollapsed ? "▸" : "▾"}</span>
+                  <span className="chevron">{isCollapsed ? <Icon name="chevron-right" /> : <Icon name="chevron-down" />}</span>
                   <button
                     className={`monitor-toggle${allMonitored ? " on" : ""}`}
                     title={included.length === 0 ? "Every chapter in this volume is excluded" : allMonitored ? "Unmonitor this volume" : "Monitor this volume"}
@@ -1309,7 +1310,7 @@ export default function SeriesDetail() {
                       });
                     }}
                   >
-                    {allMonitored ? "🔖" : "◻"}
+                    {allMonitored ? <Icon name="bookmark" /> : <Icon name="bookmark-off" />}
                   </button>
                   {archiveFile ? (
                     <h4
