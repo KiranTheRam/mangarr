@@ -847,7 +847,7 @@ export default function Settings() {
             <button
               type="button"
               className="btn"
-              disabled={applyingTitlePref}
+              disabled={applyingTitlePref || dirty}
               onClick={async () => {
                 if (
                   !window.confirm(
@@ -871,6 +871,11 @@ export default function Settings() {
               {applyingTitlePref ? "Applying…" : "Apply to existing series"}
             </button>
           </div>
+          {dirty && (
+            <p className="section-hint">
+              Save your settings before applying the preferred title to existing series.
+            </p>
+          )}
           <div className="form-row">
             <label>Chapter naming (with volume)</label>
             {text("naming_template")}
