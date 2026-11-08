@@ -15,6 +15,7 @@ from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import kavita, notifications, settings_service
+from .. import settings_service
 from ..automation import (
     FINISHED_SERIES_MODES,
     MERGED_FILE_SOURCE,
@@ -59,7 +60,14 @@ from ..models import (
 )
 from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
-from ..titles import plausible_title_match, split_alt_titles, title_queries
+from ..titles import (
+    compute_title_variants,
+    pick_title,
+    plausible_title_match,
+    split_alt_titles,
+    title_queries,
+    unique_titles,
+)
 from ..torrent_selection import select_best_torrent
 from ..util import is_transient_error, normalize_title, safe_error_reason
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
@@ -218,8 +226,49 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
         await anilist.get_series(str(series.anilist_id)) if series.anilist_id else None
     )
     if meta is not None:
-        series.title = meta.title
-        series.alt_titles = "\n".join(meta.alt_titles)
+        series.provider_title = meta.title
+        all_meta_titles = [meta.title, *meta.alt_titles, *getattr(meta, "titles", {}).values()]
+        eng_norm = normalize_title(series.title_english) or series.title_english.casefold()
+        hint = series.title_english if (
+            eng_norm and any(
+                (normalize_title(t) or t.casefold()) == eng_norm
+                for t in all_meta_titles if t
+            )
+        ) else ""
+        variants = compute_title_variants(
+            getattr(meta, "titles", None),
+            meta.title,
+            meta.alt_titles,
+            english_hint=hint,
+        )
+        series.title_english = variants.get("english", "")
+        series.title_romaji = variants.get("romaji", "")
+        series.title_native = variants.get("native", "")
+
+        if not series.title_locked:
+            values = await settings_service.get_all(session)
+            pref = values.get("preferred_title_language", "provider")
+            target_title = pick_title(pref, variants, series.provider_title)
+            if target_title != series.title:
+                if not series.folder_name:
+                    series.folder_name = series_folder(series.title)
+                series.title = target_title
+                series.sort_title = target_title.lower()
+
+        known = [
+            series.title,
+            series.provider_title,
+            series.title_english,
+            series.title_romaji,
+            series.title_native,
+            *meta.alt_titles,
+            *split_alt_titles(series.alt_titles),
+        ]
+        target_norm = normalize_title(series.title) or series.title.casefold()
+        series.alt_titles = "\n".join([
+            t for t in unique_titles(known)
+            if (normalize_title(t) or t.casefold()) != target_norm
+        ])
         series.description = meta.description
         series.status = SeriesStatus(meta.status)
         series.year = meta.year
@@ -238,9 +287,16 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
             series.total_volumes = max(mu_meta.total_volumes, series.total_volumes or 0)
         # MangaUpdates' associated titles help cross-source matching
         if meta is None or meta is not mu_meta:
-            known = set(series.alt_titles.split("\n"))
-            extra = [t for t in mu_meta.alt_titles if t and t not in known]
-            series.alt_titles = "\n".join(filter(None, [series.alt_titles, *extra]))
+            known = [
+                series.title,
+                *split_alt_titles(series.alt_titles),
+                *mu_meta.alt_titles,
+            ]
+            target_norm = normalize_title(series.title) or series.title.casefold()
+            series.alt_titles = "\n".join([
+                t for t in unique_titles(known)
+                if (normalize_title(t) or t.casefold()) != target_norm
+            ])
     series.metadata_refreshed_at = datetime.now(timezone.utc)
     await session.commit()
 
@@ -882,15 +938,23 @@ def _notify_kavita(values: dict[str, str], series: Series) -> None:
     """Ask Kavita to scan the library this series' files live in.
 
     Kavita names a series from the ComicInfo <Series> mangarr writes (the
-    series title) or else from the folder name, so only those two are offered.
-    Alternate titles are not: a series Kavita has not seen yet matches nothing
-    under its own name, and an alternate such as "Berserk" (for "Berserk of
-    Gluttony") would then pick an unrelated series and scan it instead of the
-    library that holds the new folder.
+    series title), older files' provider title, or else from the folder name,
+    so only those are offered. Alternate titles are deliberately NOT
+    offered: a series Kavita has not seen yet matches nothing under its own
+    name, and an alternate such as "Berserk" (for "Berserk of Gluttony") would
+    then pick an unrelated series and scan it instead of the library that
+    holds the new folder.
     """
     if series.root_folder is None:
         return
-    titles = [series.title, series.folder_name]
+    candidates = [series.title, series.folder_name, getattr(series, "provider_title", "")]
+    titles: list[str] = []
+    seen: set[str] = set()
+    for t in candidates:
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            titles.append(t)
     kavita.notify_import(values, series.root_folder_id, series.root_folder.path, titles)
 
 
@@ -2013,12 +2077,18 @@ async def merge_complete_volumes(
     merged: list[int] = []
     for volume, members in mergeable_volumes(series, series.chapters, busy).items():
         dest = folders[0] / volume_filename(series_folder(series.title), volume)
+        localized_series = (
+            series.provider_title
+            if series.provider_title and series.title != series.provider_title
+            else None
+        )
         try:
             await asyncio.to_thread(
                 merge_chapter_archives,
                 [(c.number, Path(c.file_path)) for c in members],
                 dest, series.title, volume,
                 series.description if volume == 1 else "",
+                localized_series=localized_series,
             )
         except Exception as exc:
             log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)

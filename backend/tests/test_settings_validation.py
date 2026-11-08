@@ -106,3 +106,16 @@ class TestKavita:
 
     def test_api_key_is_masked_like_other_secrets(self):
         assert "kavita_api_key" in SECRET_KEYS
+
+
+class TestPreferredTitleLanguage:
+    def test_default_is_provider(self):
+        assert DEFAULTS.get("preferred_title_language") == "provider"
+
+    @pytest.mark.parametrize("value", ["provider", "english", "romaji", "native"])
+    def test_valid_languages_accepted(self, value):
+        validate({"preferred_title_language": value})
+
+    def test_unknown_language_rejected(self):
+        with pytest.raises(ValueError, match="preferred_title_language"):
+            validate({"preferred_title_language": "french"})

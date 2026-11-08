@@ -30,10 +30,12 @@ from ..jobs.tasks import (
     try_acquire_series_lock,
 )
 from ..library.move import MoveError, anchor_extra_folders, move_series_folder
+from ..library.naming import series_folder
 from ..models import Chapter, Download, DownloadKind, DownloadStatus, RootFolder, Series
 from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
     AddSeriesIn,
+    ApplyTitlePreferenceOut,
     ChapterMetadataIn,
     ChapterMonitorIn,
     ChapterOut,
@@ -52,8 +54,14 @@ from ..schemas import (
     VolumeMergeOut,
 )
 from ..sources import registry
-from ..titles import english_title, split_alt_titles
-from ..util import is_special_chapter
+from ..titles import (
+    compute_title_variants,
+    english_title,
+    pick_title,
+    split_alt_titles,
+    unique_titles,
+)
+from ..util import is_special_chapter, normalize_title
 
 router = APIRouter(prefix="/series", tags=["series"])
 
@@ -368,6 +376,55 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     return out
 
 
+@router.post("/apply-title-preference", response_model=ApplyTitlePreferenceOut)
+async def apply_title_preference(session: AsyncSession = Depends(get_session)):
+    """Apply the preferred title language to all unlocked series."""
+    values = await settings_service.get_all(session)
+    pref = values.get("preferred_title_language", "provider")
+    result = await session.execute(
+        select(Series).where(Series.title_locked == False)  # noqa: E712
+    )
+    unlocked = result.scalars().all()
+    changed = 0
+    for series in unlocked:
+        variants = {
+            "english": series.title_english,
+            "romaji": series.title_romaji,
+            "native": series.title_native,
+        }
+        if not any(variants.values()):
+            variants = compute_title_variants(
+                None, series.provider_title or series.title, split_alt_titles(series.alt_titles)
+            )
+            series.title_english = variants["english"]
+            series.title_romaji = variants["romaji"]
+            series.title_native = variants["native"]
+        target_title = pick_title(pref, variants, series.provider_title or series.title)
+        if target_title and target_title != series.title:
+            if not series.folder_name:
+                series.folder_name = series_folder(series.title)
+            old_title = series.title
+            series.title = target_title
+            series.sort_title = target_title.lower()
+            known = [
+                old_title,
+                series.provider_title,
+                series.title_english,
+                series.title_romaji,
+                series.title_native,
+                *split_alt_titles(series.alt_titles),
+            ]
+            target_norm = normalize_title(series.title) or series.title.casefold()
+            series.alt_titles = "\n".join([
+                t for t in unique_titles(known)
+                if (normalize_title(t) or t.casefold()) != target_norm
+            ])
+            changed += 1
+    if changed > 0:
+        await session.commit()
+    return ApplyTitlePreferenceOut(count=changed, updated=changed)
+
+
 @router.put("/{series_id}", response_model=SeriesDetailOut)
 async def update_series(
     series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
@@ -378,6 +435,68 @@ async def update_series(
     series = result.scalar_one_or_none()
     if series is None:
         raise HTTPException(404, "Series not found")
+    if body.title is not None:
+        new_title = body.title.strip()
+        if not new_title:
+            raise HTTPException(422, "Title cannot be empty")
+        if new_title != series.title:
+            if not series.folder_name:
+                series.folder_name = series_folder(series.title)
+            old_title = series.title
+            series.title = new_title
+            series.sort_title = new_title.lower()
+            known = [
+                old_title,
+                series.provider_title,
+                series.title_english,
+                series.title_romaji,
+                series.title_native,
+                *split_alt_titles(series.alt_titles),
+            ]
+            target_norm = normalize_title(series.title) or series.title.casefold()
+            series.alt_titles = "\n".join([
+                t for t in unique_titles(known)
+                if (normalize_title(t) or t.casefold()) != target_norm
+            ])
+        series.title_locked = True
+    elif body.title_locked is False:
+        series.title_locked = False
+        values = await settings_service.get_all(session)
+        pref = values.get("preferred_title_language", "provider")
+        variants = {
+            "english": series.title_english,
+            "romaji": series.title_romaji,
+            "native": series.title_native,
+        }
+        if not any(variants.values()):
+            variants = compute_title_variants(
+                None, series.provider_title or series.title, split_alt_titles(series.alt_titles)
+            )
+            series.title_english = variants["english"]
+            series.title_romaji = variants["romaji"]
+            series.title_native = variants["native"]
+        target_title = pick_title(pref, variants, series.provider_title or series.title)
+        if target_title and target_title != series.title:
+            if not series.folder_name:
+                series.folder_name = series_folder(series.title)
+            old_title = series.title
+            series.title = target_title
+            series.sort_title = target_title.lower()
+            known = [
+                old_title,
+                series.provider_title,
+                series.title_english,
+                series.title_romaji,
+                series.title_native,
+                *split_alt_titles(series.alt_titles),
+            ]
+            target_norm = normalize_title(series.title) or series.title.casefold()
+            series.alt_titles = "\n".join([
+                t for t in unique_titles(known)
+                if (normalize_title(t) or t.casefold()) != target_norm
+            ])
+    elif body.title_locked is True:
+        series.title_locked = True
     if body.search_templates is not None:
         from ..sources.queries import validate_templates
 

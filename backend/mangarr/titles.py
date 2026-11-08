@@ -7,6 +7,8 @@ import re
 from .util import normalize_title
 
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
+_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+_HANGUL_RE = re.compile(r"[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _ENGLISH_WORDS = {
     "a",
@@ -210,3 +212,78 @@ def title_queries(primary: str, alt_titles: list[str], limit: int = 6) -> list[s
         ordered.append(english)
     ordered.extend(sorted(alt_titles, key=_english_score, reverse=True))
     return unique_titles(ordered)[:limit]
+
+
+def find_native_title(alt_titles: list[str]) -> str:
+    """Pick the best native title candidate from alternate titles for unlabeled providers.
+
+    Prioritizes kana for Japanese manga, then hangul for Korean manhwa, then
+    other CJK ideographs (e.g. Chinese manhua or kanji-only titles).
+    """
+    candidates = unique_titles(alt_titles)
+    for title in candidates:
+        if _KANA_RE.search(title):
+            return title
+    for title in candidates:
+        if _HANGUL_RE.search(title):
+            return title
+    for title in candidates:
+        if _CJK_RE.search(title):
+            return title
+    return ""
+
+
+def compute_title_variants(
+    labeled_titles: dict[str, str] | None,
+    canonical: str,
+    alt_titles: list[str],
+    english_hint: str = "",
+) -> dict[str, str]:
+    """Derive english, romaji, and native title variants.
+
+    Labeled providers (AniList) supply explicit language tags. When unlabeled
+    (MangaUpdates), romaji is the canonical title if Latin-script and distinct
+    from English; native is picked from alternates by script (kana, hangul,
+    CJK); and English falls back to hints or heuristics.
+    """
+    labeled = labeled_titles or {}
+    english = labeled.get("english", "").strip()
+    romaji = labeled.get("romaji", "").strip()
+    native = labeled.get("native", "").strip()
+
+    if not english:
+        english = english_hint.strip() or english_title(canonical, alt_titles)
+
+    if not labeled:
+        is_latin = bool(
+            _LATIN_RE.search(canonical)
+            and not _CJK_RE.search(canonical)
+            and not _HANGUL_RE.search(canonical)
+        )
+        canonical_norm = normalize_title(canonical) or canonical.casefold()
+        english_norm = normalize_title(english) or english.casefold()
+        if is_latin and canonical_norm != english_norm:
+            romaji = canonical
+        native = find_native_title(alt_titles)
+
+    return {
+        "english": english,
+        "romaji": romaji,
+        "native": native,
+    }
+
+
+def pick_title(
+    preference: str,
+    variants: dict[str, str],
+    provider_title: str,
+) -> str:
+    """Select the series title according to user preference.
+
+    Falls back to provider_title if the preferred variant is missing or
+    preference is 'provider'.
+    """
+    if preference == "provider":
+        return provider_title
+    variant = (variants.get(preference) or "").strip()
+    return variant or provider_title

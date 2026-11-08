@@ -20,6 +20,7 @@ CONTENT_SOURCE_NAMES = (
 
 DEFAULTS: dict[str, str] = {
     # Media management
+    "preferred_title_language": "provider",
     "naming_template": "{series} - Ch. {chapter:04.1f}",
     "naming_template_no_volume": "{series} - Ch. {chapter:04.1f}",
     # Optional lossy optimization of new direct-download pages only.
@@ -181,6 +182,12 @@ def validate(values: dict[str, str]) -> None:
         if values["finished_series_mode"] not in FINISHED_SERIES_MODES:
             raise ValueError(
                 "finished_series_mode must be one of " + ", ".join(FINISHED_SERIES_MODES)
+            )
+
+    if "preferred_title_language" in values:
+        if values["preferred_title_language"] not in {"provider", "english", "romaji", "native"}:
+            raise ValueError(
+                "preferred_title_language must be one of provider, english, romaji, native"
             )
 
     for key in ("download_proxy_url", *(f"source_{name}_proxy_url" for name in SOURCE_PROXY_NAMES)):

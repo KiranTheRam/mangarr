@@ -609,6 +609,163 @@ function ChapterMetadataModal({
   );
 }
 
+function TitleEditorModal({
+  series,
+  onClose,
+  onSave,
+}: {
+  series: SeriesDetailType;
+  onClose: () => void;
+  onSave: (updates: { title?: string; title_locked?: boolean }) => Promise<void>;
+}) {
+  const [customTitle, setCustomTitle] = useState(series.title);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const rawKnown = [
+    { label: "Provider title", title: series.provider_title },
+    { label: "English", title: series.title_english },
+    { label: "Romaji", title: series.title_romaji },
+    { label: "Native", title: series.title_native },
+    ...(series.alt_titles || "")
+      .split("\n")
+      .map((t: string) => t.trim())
+      .filter(Boolean)
+      .map((t: string) => ({ label: "Alternate", title: t })),
+  ].filter((item) => item.title && item.title.trim());
+
+  const seen = new Set<string>();
+  const knownTitles: { label: string; title: string }[] = [];
+  for (const item of rawKnown) {
+    const key = item.title.trim().toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      knownTitles.push(item);
+    }
+  }
+
+  async function handleSave() {
+    const trimmed = customTitle.trim();
+    if (!trimmed) {
+      setError("Title cannot be empty");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ title: trimmed });
+      onClose();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleUnlock() {
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ title_locked: false });
+      onClose();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal title="Edit Series Title" onClose={onClose}>
+      {error && <div className="error-banner">{error}</div>}
+
+      {series.title_locked && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: "8px 12px",
+            background: "var(--bg-subtle)",
+            borderRadius: 6,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+          }}
+        >
+          <span>
+            <strong>Title locked</strong> — overrides metadata refresh and global preference.
+          </span>
+          <button
+            type="button"
+            className="btn sm"
+            disabled={saving}
+            onClick={handleUnlock}
+          >
+            Unlock (use preference)
+          </button>
+        </div>
+      )}
+
+      <div className="form-row">
+        <label>Title</label>
+        <input
+          type="text"
+          value={customTitle}
+          onChange={(event) => setCustomTitle(event.target.value)}
+          placeholder="Series title"
+        />
+      </div>
+
+      {knownTitles.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <label style={{ fontSize: 13, fontWeight: 600, color: "var(--text-dim)" }}>
+            Known titles:
+          </label>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8, maxHeight: 180, overflowY: "auto" }}>
+            {knownTitles.map((item, idx) => (
+              <button
+                key={idx}
+                type="button"
+                className="btn sm"
+                style={{
+                  textAlign: "left",
+                  justifyContent: "flex-start",
+                  display: "flex",
+                  gap: 8,
+                  padding: "6px 10px",
+                  borderColor: customTitle.trim() === item.title ? "var(--primary)" : undefined,
+                }}
+                onClick={() => setCustomTitle(item.title)}
+              >
+                <span className="tag" style={{ fontSize: 11, padding: "1px 6px" }}>
+                  {item.label}
+                </span>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {item.title}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="modal-actions" style={{ marginTop: 20 }}>
+        <button type="button" className="btn" onClick={onClose} disabled={saving}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="btn primary"
+          onClick={handleSave}
+          disabled={saving || !customTitle.trim()}
+        >
+          {saving ? "Saving…" : "Save (lock title)"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 export default function SeriesDetail() {
   const { id } = useParams();
   const seriesId = Number(id);
@@ -628,6 +785,7 @@ export default function SeriesDetail() {
   const [descExpanded, setDescExpanded] = useState(false);
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const toggleReveal = (k: string) => setRevealed((r) => ({ ...r, [k]: !r[k] }));
+  const [editingTitle, setEditingTitle] = useState(false);
   const [showRename, setShowRename] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [showSources, setShowSources] = useState(false);
@@ -1161,6 +1319,24 @@ export default function SeriesDetail() {
               <h2>
                 {series.title}{" "}
                 {series.year && <span style={{ color: "var(--text-dim)" }}>({series.year})</span>}
+                {series.title_locked && (
+                  <span
+                    className="pill gray"
+                    style={{ marginLeft: 8, fontSize: 12, verticalAlign: "middle" }}
+                    title="Title is locked"
+                  >
+                    Locked
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="btn sm"
+                  style={{ marginLeft: 8, verticalAlign: "middle" }}
+                  onClick={() => setEditingTitle(true)}
+                  title="Edit title"
+                >
+                  Edit title
+                </button>
               </h2>
               {series.english_title && series.english_title !== series.title && (
                 <div className="alt-title-line series-alt-title">
@@ -1360,6 +1536,16 @@ export default function SeriesDetail() {
           includeTorrents={search.includeTorrents}
           title={search.title}
           onClose={() => setSearch(null)}
+        />
+      )}
+      {editingTitle && (
+        <TitleEditorModal
+          series={series}
+          onClose={() => setEditingTitle(false)}
+          onSave={async (updates) => {
+            await api.put(`/series/${seriesId}`, updates);
+            invalidate();
+          }}
         />
       )}
       {editingChapter && (

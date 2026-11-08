@@ -44,6 +44,7 @@ def build_comicinfo(
     summary: str = "",
     web: str = "",
     page_count: int | None = None,
+    localized_series: str | None = None,
 ) -> str:
     root = Element("ComicInfo")
     root.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
@@ -55,6 +56,10 @@ def build_comicinfo(
         SubElement(root, tag).text = XML_ILLEGAL_CHARS.sub("", str(value))
 
     add("Series", series)
+    # Kavita groups files that share a Series/LocalizedSeries name, so new files
+    # under a new title stay grouped with older files (Kavita behaviour, not a
+    # ComicInfo standard field).
+    add("LocalizedSeries", localized_series)
     if number is not None:
         add("Number", int(number) if float(number).is_integer() else number)
     add("Volume", volume)
