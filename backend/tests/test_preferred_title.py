@@ -228,6 +228,110 @@ class TestRefreshMetadata:
         assert series.title_english == "New English Name"
         assert "New Provider Title" in series.alt_titles.split("\n")
 
+    async def test_refresh_drops_stale_alt_titles(self, session, monkeypatch):
+        # A series whose alt_titles contains a stale title the provider no longer returns
+        series = Series(
+            id=3,
+            anilist_id=3003,
+            title="Attack on Titan",
+            provider_title="Shingeki no Kyojin",
+            title_english="Attack on Titan",
+            title_romaji="Shingeki no Kyojin",
+            title_native="進撃の巨人",
+            title_locked=False,
+            folder_name="Attack on Titan",
+            alt_titles="Old Dropped Title\nShingeki no Kyojin\nOld Alternative",
+        )
+        session.add(series)
+        await session.merge(Setting(key="preferred_title_language", value="english"))
+        await session.commit()
+
+        mock_meta = SeriesMetadata(
+            provider="anilist",
+            provider_id="3003",
+            title="Shingeki no Kyojin",
+            titles={
+                "english": "Attack on Titan",
+                "romaji": "Shingeki no Kyojin",
+                "native": "進撃の巨人",
+            },
+            alt_titles=["Current Alt Title"],
+        )
+
+        async def fake_ani_get(provider_id: str):
+            return mock_meta
+
+        async def fake_mu_search(query: str, limit: int = 20):
+            return []
+
+        monkeypatch.setattr(anilist_provider, "get_series", fake_ani_get)
+        monkeypatch.setattr(mu_provider, "search", fake_mu_search)
+
+        await tasks.refresh_series_metadata(session, series)
+
+        alt_titles = series.alt_titles.split("\n")
+        # stale titles are gone
+        assert "Old Dropped Title" not in alt_titles
+        assert "Old Alternative" not in alt_titles
+        # provider title (when not in use) is present
+        assert "Shingeki no Kyojin" in alt_titles
+        # provider's current alt titles are present
+        assert "Current Alt Title" in alt_titles
+        # title in use is not duplicated into alt_titles
+        assert series.title == "Attack on Titan"
+        assert "Attack on Titan" not in alt_titles
+
+    async def test_refresh_locked_series_with_user_typed_title(
+        self, session, monkeypatch
+    ):
+        series = Series(
+            id=4,
+            anilist_id=4004,
+            title="User Typed Custom Title",
+            provider_title="Old Provider Name",
+            title_english="Old English",
+            title_romaji="Old Romaji",
+            title_native="Old Native",
+            title_locked=True,
+            folder_name="User Typed Custom Title",
+            alt_titles="Old Provider Name\nObsolete Title",
+        )
+        session.add(series)
+        await session.merge(Setting(key="preferred_title_language", value="english"))
+        await session.commit()
+
+        mock_meta = SeriesMetadata(
+            provider="anilist",
+            provider_id="4004",
+            title="Current Provider Name",
+            titles={
+                "english": "Current English",
+                "romaji": "Current Romaji",
+                "native": "Current Native",
+            },
+            alt_titles=["Current Alt Title"],
+        )
+
+        async def fake_ani_get(provider_id: str):
+            return mock_meta
+
+        async def fake_mu_search(query: str, limit: int = 20):
+            return []
+
+        monkeypatch.setattr(anilist_provider, "get_series", fake_ani_get)
+        monkeypatch.setattr(mu_provider, "search", fake_mu_search)
+
+        await tasks.refresh_series_metadata(session, series)
+
+        # After refresh the typed title is still series.title
+        assert series.title == "User Typed Custom Title"
+        # and the provider title appears in alt_titles
+        alt_titles = series.alt_titles.split("\n")
+        assert "Current Provider Name" in alt_titles
+        # stale title is gone and title in use is not duplicated into alt_titles
+        assert "Obsolete Title" not in alt_titles
+        assert "User Typed Custom Title" not in alt_titles
+
 
 class TestDataSafetyRetitleFolder:
     async def test_retitle_with_empty_folder_name_pins_old_folder(self, session):

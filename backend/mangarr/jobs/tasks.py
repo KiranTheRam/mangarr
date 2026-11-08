@@ -15,7 +15,6 @@ from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import kavita, notifications, settings_service
-from .. import settings_service
 from ..automation import (
     FINISHED_SERIES_MODES,
     MERGED_FILE_SOURCE,
@@ -262,7 +261,6 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
             series.title_romaji,
             series.title_native,
             *meta.alt_titles,
-            *split_alt_titles(series.alt_titles),
         ]
         target_norm = normalize_title(series.title) or series.title.casefold()
         series.alt_titles = "\n".join([
