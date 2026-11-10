@@ -44,12 +44,16 @@ function BrowserSecurity({ dirty }: { dirty: boolean }) {
   return (
     <section className="settings-section" aria-labelledby="browser-security-title">
       <h3 id="browser-security-title">Browser Security</h3>
-      {mode === "managed" ? (
+      {mode !== "external" ? (
         <>
-          <p className="section-hint">Changing your password signs out every browser session. API keys keep working.</p>
-          {dirty && <p className="section-hint">Save your other settings before changing your password or signing out.</p>}
+          <p className="section-hint">
+            {mode === "environment"
+              ? "This login is managed by your deployment. Change the configured password and restart Mangarr."
+              : "Changing your password signs out every browser session. API keys keep working."}
+          </p>
+          {dirty && <p className="section-hint">Save your other settings before continuing.</p>}
           {error && <p role="alert">{error}</p>}
-          <form onSubmit={(event) => void submit("password", event)}>
+          {mode === "managed" && <form onSubmit={(event) => void submit("password", event)}>
             <div className="form-row">
               <label htmlFor="browser-current-password">Current password</label>
               <input id="browser-current-password" name="current" type="password" autoComplete="current-password" maxLength={256} required />
@@ -62,16 +66,12 @@ function BrowserSecurity({ dirty }: { dirty: boolean }) {
               <label htmlFor="browser-confirm-password">Confirm new password</label>
               <input id="browser-confirm-password" name="confirmation" type="password" autoComplete="new-password" minLength={8} maxLength={256} required />
             </div>
-            <button className="btn primary" disabled={busy || dirty}>Change Password</button>{" "}
-            <button className="btn" type="button" disabled={busy || dirty} onClick={() => void submit("logout")}>Sign Out</button>
-          </form>
+            <button className="btn primary" disabled={busy || dirty}>Change Password</button>
+          </form>}{" "}
+          <button className="btn" type="button" disabled={busy || dirty} onClick={() => void submit("logout")}>Sign Out</button>
         </>
       ) : (
-        <p className="section-hint">
-          {mode === "environment"
-            ? "This login is managed by your deployment. Change the configured password and restart Mangarr."
-            : "Mangarr's browser login is disabled for this deployment."}
-        </p>
+        <p className="section-hint">Mangarr's browser login is disabled for this deployment.</p>
       )}
     </section>
   );

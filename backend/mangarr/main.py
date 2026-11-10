@@ -21,7 +21,7 @@ from .api import (
     system,
 )
 from .api.deps import get_api_key, require_api_access
-from .browser_setup import load_browser_login
+from .browser_setup import load_browser_login, prepare_environment_login
 from .config import config
 from .db import init_db
 from .jobs import scheduler
@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI):
         else:
             log.info("Open Mangarr on a trusted network to create the browser login.")
     await init_db()
+    app.state.environment_login = await prepare_environment_login()
     await scheduler.start()
     log.info("Mangarr %s ready on %s:%d", __version__, config.host, config.port)
     yield
@@ -72,8 +73,8 @@ app.mount("/api/v1", api)
 @app.get("/initialize.json")
 async def initialize(request: Request):
     """Browser bootstrap, protected by the browser access boundary."""
-    mode = "managed" if request.state.browser_session else "environment" if config.auth_username else "external"
-    return {"apiKey": "" if mode == "managed" else get_api_key(), "authMode": mode,
+    mode = "environment" if config.auth_username else "managed" if request.state.browser_session else "external"
+    return {"apiKey": get_api_key() if mode == "external" else "", "authMode": mode,
             "version": __version__, "urlBase": ""}
 
 

@@ -272,7 +272,7 @@ Environment variables (all optional):
 | `MANGARR_SQLITE_WAL` | `true`        | Use SQLite WAL mode (see below)                   |
 | `MANGARR_LOG_LEVEL`  | `INFO`        | Log level (uppercase: `DEBUG`, `INFO`, `WARNING`) |
 | `MANGARR_API_KEY`    | *(generated)* | Fixed web UI API key instead of a generated one   |
-| `MANGARR_AUTH_USERNAME` | *(empty)* | Browser HTTP Basic login username |
+| `MANGARR_AUTH_USERNAME` | *(empty)* | Deployment-managed browser login username |
 | `MANGARR_AUTH_PASSWORD` | *(empty)* | Browser login password; set together with username |
 | `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER` | `false` | Allow browser access without built-in login on an explicitly trusted deployment |
 | `MANGARR_ALLOWED_HOSTS` | `[]` | Additional exact DNS names as a JSON array (no scheme, port or wildcard) |
@@ -309,9 +309,11 @@ a public reverse proxy or port forward. The first person who submits the form
 creates the login. The library UI and browser API key stay behind the login
 boundary during setup. Existing API-key integrations continue to work.
 
-Use **Settings → Browser Security** to change your password or sign out.
-A password change requires the current password and signs out all browser
-sessions. API keys continue to work. Browser sessions expire after seven days.
+Use **Settings → Browser Security** to sign out or change an app-managed
+password. A password change requires the current password and signs out all
+browser sessions. API keys continue to work. Browser sessions expire after
+seven days. After upgrading from an older release, sign in again to create a
+session scoped to the instance's address and port.
 
 Mangarr stores the password hash in `browser_login.json` in the data directory.
 If you forget the password, run the local reset command from an interactive
@@ -332,7 +334,7 @@ and leaves API keys available throughout. Mangarr applies the change immediately
 The sign-in screen includes recovery instructions, and the reset command shows
 your username before prompting.
 
-For the Mangarr-managed login, after five failed sign-ins from the same client
+After five failed sign-ins from the same client
 in a one-minute window, the next attempt in that window returns HTTP 429 with
 a `Retry-After` header. A successful sign-in clears the client's count. The
 limit is per server process and groups IPv6 clients by their /64 prefix.
@@ -341,9 +343,11 @@ client addresses, set `FORWARDED_ALLOW_IPS` to the addresses of trusted proxies
 that sanitize forwarding headers. If you launch Uvicorn directly, configure
 `--forwarded-allow-ips` explicitly (`''` to trust no proxies).
 
-Existing `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` settings still
-take precedence when both are set. Update `MANGARR_AUTH_PASSWORD` and restart
-Mangarr to reset an environment-managed login. Setting only one fails startup.
+When both `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` are set, use
+those credentials on the Mangarr sign-in page. They take precedence over an
+app-managed login. Update the deployment credentials and restart Mangarr to
+reset this login and sign out existing sessions. Setting only one fails startup.
+Scripts can use the `/api/v1` endpoints with `X-Api-Key`.
 Use HTTPS on a trusted reverse proxy when credentials travel across the network.
 
 Custom deployments can explicitly set `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true`
@@ -359,9 +363,8 @@ add every DNS name used by browsers, reverse proxies and integration clients to
 Names match exactly, ignoring case, without a trailing dot; paths, schemes,
 ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
 with configuration instructions; direct IP access remains available for recovery.
-For browser setup, sign-in, and requests that change state, reverse proxies
-must preserve the browser's Host header.
-For other requests, proxies can preserve an allowed Host or set it explicitly.
+Reverse proxies must preserve the browser's Host header for browser traffic.
+For API-key clients, proxies can preserve an allowed Host or set it explicitly.
 Forwarded headers never establish trust. Host validation limits DNS rebinding.
 
 Existing named API keys and `X-Api-Key` clients continue to work independently

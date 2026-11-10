@@ -1,16 +1,13 @@
 """Browser access and DNS-rebinding protection, outside the API-key boundary."""
 
-import base64
-import binascii
 import ipaddress
-import secrets
 from urllib.parse import urlsplit
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from .browser_setup import (
-    SESSION_COOKIE, change_password, load_browser_login, same_origin, setup_page,
+    BrowserLogin, EnvironmentLogin, change_password, load_active_login, same_origin, session_cookie_name, setup_page,
     submit_browser_setup, submit_sign_in,
 )
 from .config import config
@@ -39,20 +36,6 @@ def allowed_host(request: Request) -> bool:
         return False
 
 
-def browser_authenticated(request: Request) -> bool:
-    try:
-        scheme, encoded = request.headers.get("authorization", "").split(" ", 1)
-        if scheme.lower() != "basic":
-            return False
-        username, password = base64.b64decode(encoded, validate=True).split(b":", 1)
-    except (ValueError, binascii.Error):
-        return False
-    # Compare bytes so non-ASCII credentials are supported, without short-circuit.
-    user_ok = secrets.compare_digest(username, config.auth_username.encode())
-    password_ok = secrets.compare_digest(password, config.auth_password.get_secret_value().encode())
-    return user_ok & password_ok
-
-
 async def access_boundary(request: Request, call_next):
     if not allowed_host(request):
         return JSONResponse(
@@ -68,17 +51,17 @@ async def access_boundary(request: Request, call_next):
     is_api = path == "/api/v1" or path.startswith("/api/v1/")
     if path == "/ping":
         return await call_next(request)
-    # API keys and app-managed browser sessions are independent.
+    # API keys and browser sessions are independent.
     if is_api and request.headers.get("x-api-key"):
         return await call_next(request)
-    login = None if config.auth_username else load_browser_login()
+    login = load_active_login(request)
     signed_in = login is not None and login.has_session(request)
     request.state.browser_session = signed_in
     if is_api:
         if signed_in and request.method not in {"GET", "HEAD", "OPTIONS"} and not same_origin(request):
             return JSONResponse({"detail": "Submit the request from Mangarr."}, status_code=403)
     else:
-        needs_setup = not config.auth_username and login is None and not config.allow_unauthenticated_browser
+        needs_setup = login is None and not config.allow_unauthenticated_browser
         home = f"/{root_path.strip('/')}".rstrip("/") + "/"
         if path == "/setup":
             if not needs_setup:
@@ -94,7 +77,9 @@ async def access_boundary(request: Request, call_next):
             if request.method == "POST":
                 return await submit_sign_in(request, login, home)
             if request.method == "GET":
-                return setup_page(sign_in=True, changed=request.query_params.get("changed") == "1")
+                environment = isinstance(login, EnvironmentLogin)
+                return setup_page(sign_in=True, environment=environment,
+                                  changed=not environment and request.query_params.get("changed") == "1")
             return Response(status_code=405, headers={"Allow": "GET, POST"})
         if path in {"/auth/password", "/auth/logout"}:
             if request.method != "POST":
@@ -103,10 +88,15 @@ async def access_boundary(request: Request, call_next):
                 return JSONResponse({"detail": "Sign in with your Mangarr login."}, status_code=401)
             if not same_origin(request):
                 return JSONResponse({"detail": "Submit the request from Mangarr."}, status_code=403)
-            response = (await change_password(request, login) if path == "/auth/password"
-                        else Response(status_code=204, headers={"Cache-Control": "no-store"}))
+            if path == "/auth/password":
+                if not isinstance(login, BrowserLogin):
+                    return JSONResponse({"detail": "Change the configured password and restart Mangarr."},
+                                        status_code=403, headers={"Cache-Control": "no-store"})
+                response = await change_password(request, login)
+            else:
+                response = Response(status_code=204, headers={"Cache-Control": "no-store"})
             if response.status_code == 204:
-                response.delete_cookie(SESSION_COOKIE, path=home, httponly=True, samesite="lax",
+                response.delete_cookie(session_cookie_name(request), path=home, httponly=True, samesite="lax",
                                        secure=request.headers["origin"].startswith("https://"))
             return response
         if needs_setup:
@@ -122,12 +112,6 @@ async def access_boundary(request: Request, call_next):
                 return RedirectResponse(f"{home}login", headers={"Cache-Control": "no-store"})
             return JSONResponse({"detail": "Sign in to Mangarr."}, status_code=401,
                                 headers={"Cache-Control": "no-store"})
-        if config.auth_username and not browser_authenticated(request):
-            return JSONResponse(
-                {"detail": "Browser login required"}, status_code=401,
-                headers={"WWW-Authenticate": 'Basic realm="Mangarr", charset="UTF-8"',
-                         "Cache-Control": "no-store"},
-            )
     response = await call_next(request)
     if path == "/initialize.json" or signed_in:
         response.headers["Cache-Control"] = "no-store"

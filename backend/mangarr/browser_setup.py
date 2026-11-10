@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
@@ -15,22 +16,33 @@ from urllib.parse import parse_qs, urlsplit
 from anyio import CapacityLimiter, to_thread
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from sqlalchemy.exc import SQLAlchemyError
 
+from .api.deps import get_api_key
 from .config import config
 from .db import engine
 from .sign_in_throttle import SignInThrottle
 
 LOGIN_FILE = "browser_login.json"
+ENVIRONMENT_LOGIN_FILE = "environment_login.json"
 MAX_FORM_BYTES = 8192
-SESSION_COOKIE = "mangarr_session"
 SESSION_SECONDS = 7 * 24 * 60 * 60
 _password_workers = CapacityLimiter(2)
 _sign_in_throttle = SignInThrottle()
+log = logging.getLogger(__name__)
 
 
-def _write_private_file(path: Path, value: str, *, replace: bool = False) -> None:
-    # Publish a complete 0600 file without replacing an existing one, even
-    # when two workers submit the setup form at the same time.
+def session_cookie_name(request: Request) -> str:
+    # Cookies are shared across ports, so include the validated public
+    # authority and mount path in the name.
+    authority = request.headers["host"].lower()
+    mount = request.scope.get("root_path", "").rstrip("/")
+    scope = hashlib.sha256(f"{authority}\0{mount}".encode()).hexdigest()[:16]
+    return f"mangarr_session_{scope}"
+
+
+def _write_private_file(path: Path, value: str) -> None:
+    # Callers hold the SQLite writer lock while checking and publishing.
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temp = NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
     try:
@@ -38,26 +50,15 @@ def _write_private_file(path: Path, value: str, *, replace: bool = False) -> Non
             temp.write(value)
             temp.flush()
             os.fsync(temp.fileno())
-        if replace:
-            os.replace(temp.name, path)
-        else:
-            os.link(temp.name, path)
+        os.replace(temp.name, path)
     finally:
         Path(temp.name).unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
-class BrowserLogin:
+class BrowserSession:
     username: str
-    salt: bytes
     digest: bytes
-
-    async def verify(self, username: bytes, password: bytes) -> bool:
-        if len(password) > 512 or not secrets.compare_digest(username, self.username.encode()):
-            return False
-        digest = await to_thread.run_sync(_password_digest, password, self.salt, limiter=_password_workers)
-        return secrets.compare_digest(digest, self.digest)
-
 
     def session_token(self) -> str:
         payload = f"{int(time.time()) + SESSION_SECONDS}.{secrets.token_hex(16)}"
@@ -65,7 +66,7 @@ class BrowserLogin:
         return f"{payload}.{signature}"
 
     def has_session(self, request: Request) -> bool:
-        token = request.cookies.get(SESSION_COOKIE, "")
+        token = request.cookies.get(session_cookie_name(request), "")
         if len(token) > 128 or not token.isascii():
             return False
         payload, _, signature = token.rpartition(".")
@@ -78,20 +79,86 @@ class BrowserLogin:
         return hmac.digest(self.digest, b"mangarr-browser-session:" + payload.encode(), "sha256").hex()
 
 
+@dataclass(frozen=True)
+class BrowserLogin(BrowserSession):
+    salt: bytes
+
+    async def verify(self, username: bytes, password: bytes) -> bool:
+        if len(password) > 512 or not secrets.compare_digest(username, self.username.encode()):
+            return False
+        digest = await to_thread.run_sync(_password_digest, password, self.salt, limiter=_password_workers)
+        return secrets.compare_digest(digest, self.digest)
+
+
+@dataclass(frozen=True)
+class EnvironmentLogin(BrowserSession):
+    credential_digest: bytes
+
+    async def verify(self, username: bytes, password: bytes) -> bool:
+        username_ok = secrets.compare_digest(username, self.username.encode())
+        password_ok = secrets.compare_digest(_environment_digest(self.username, password), self.credential_digest)
+        return username_ok & password_ok
+
+
+def _environment_digest(username: str, password: bytes) -> bytes:
+    return hmac.digest(
+        get_api_key().encode(),
+        b"mangarr-environment-login:" + username.encode() + b":" + password,
+        "sha256",
+    )
+
+
+async def prepare_environment_login() -> EnvironmentLogin | None:
+    """Resolve the session key once per startup, sharing the revision across workers."""
+    path = config.data_dir / ENVIRONMENT_LOGIN_FILE
+    if not config.auth_username and not path.exists():
+        return None
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if not config.auth_username:
+            path.unlink(missing_ok=True)
+            return None
+        username = config.auth_username
+        credential_digest = _environment_digest(username, config.auth_password.get_secret_value().encode())
+        verifier = credential_digest.hex()
+        revision = _read_login(path)
+        if revision is None or not await revision.verify(username.encode(), verifier.encode()):
+            data = await encode_login(username, verifier)
+            _write_private_file(path, data)
+            revision = _decode_login(data)
+    # Each transition gets a fresh salt, even when restoring older credentials.
+    signing_key = hmac.digest(credential_digest, b"mangarr-environment-session:" + revision.salt, "sha256")
+    return EnvironmentLogin(username, signing_key, credential_digest)
+
+
+def load_active_login(request: Request) -> BrowserLogin | EnvironmentLogin | None:
+    if config.auth_username:
+        return request.app.state.environment_login
+    return load_browser_login()
+
+
 def _password_digest(password: bytes, salt: bytes) -> bytes:
     return hashlib.scrypt(password, salt=salt, n=2**15, r=8, p=1, maxmem=64 * 1024**2)
 
 
 def load_browser_login() -> BrowserLogin | None:
+    return _read_login(config.data_dir / LOGIN_FILE)
+
+
+def _read_login(path: Path) -> BrowserLogin | None:
     try:
-        data = json.loads((config.data_dir / LOGIN_FILE).read_text(encoding="utf-8"))
+        return _decode_login(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    return BrowserLogin(data["username"], bytes.fromhex(data["salt"]), bytes.fromhex(data["digest"]))
+
+
+def _decode_login(value: str) -> BrowserLogin:
+    data = json.loads(value)
+    return BrowserLogin(data["username"], bytes.fromhex(data["digest"]), bytes.fromhex(data["salt"]))
 
 
 def setup_page(message: str = "", status_code: int = 200, *, sign_in: bool = False,
-               changed: bool = False, username: str = "") -> HTMLResponse:
+               changed: bool = False, username: str = "", environment: bool = False) -> HTMLResponse:
     # Escape the retained username. Password fields always render empty.
     username_value = escape(username, quote=True)
     error = f'<p role="alert" class="error">{message}</p>' if message else ""
@@ -127,6 +194,14 @@ def setup_page(message: str = "", status_code: int = 200, *, sign_in: bool = Fal
         'For a direct Python install, run <code>python -m mangarr.reset_password</code> '
         'as the service user with the same data directory.</p></details>'
     )
+    if environment:
+        recovery = (
+            '<details><summary>Forgot your username or password?</summary>'
+            '<p>Your deployment sets this login. Update <code>MANGARR_AUTH_USERNAME</code> '
+            'and <code>MANGARR_AUTH_PASSWORD</code> in the deployment configuration and restart Mangarr.</p></details>'
+        )
+    username_limit = "" if environment else ' maxlength="64"'
+    password_limit = "" if environment else ' maxlength="256"'
     password_description = "" if sign_in else ' aria-describedby="password-requirements"'
     return HTMLResponse(
         f"""<!doctype html>
@@ -150,11 +225,11 @@ pre {{ white-space: pre-wrap; overflow-wrap: anywhere }}
   {intro}
   {error}
   <form method="post">
-    <label>Username<input name="username" required maxlength="64" autocomplete="username" value="{username_value}"></label>
-    <label>Password<input name="password" type="password" required maxlength="256" autocomplete="{autocomplete}"{password_description}></label>
+    <label>Username<input id="username" name="username" required{username_limit} autocomplete="username" value="{username_value}"></label>
+    <label>Password<input id="password" name="password" type="password" required{password_limit} autocomplete="{autocomplete}"{password_description}></label>
     {password_hint}
     {confirmation}
-    <button>{button}</button>
+    <button type="submit">{button}</button>
   </form>
   {recovery}
 </main>
@@ -226,46 +301,57 @@ async def submit_browser_setup(request: Request, home: str) -> Response:
         return setup_page("Choose a password of 8 to 128 characters and enter it twice.", 400, username=username)
 
     data = await encode_login(username, password)
+    path = config.data_dir / LOGIN_FILE
     try:
-        _write_private_file(config.data_dir / LOGIN_FILE, data)
-    except FileExistsError:
-        return setup_page("A login has already been created. Open Mangarr to sign in.", 409)
-    saved = json.loads(data)
-    login = BrowserLogin(saved["username"], bytes.fromhex(saved["salt"]), bytes.fromhex(saved["digest"]))
-    return signed_in_response(request, login, home)
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                _write_private_file(path, data)
+            else:
+                return setup_page("A login has already been created. Open Mangarr to sign in.", 409)
+    except (OSError, SQLAlchemyError):
+        log.exception("Could not save the browser login")
+        return setup_page("Could not save your login. Check that Mangarr can write to its data directory and try again.",
+                          503, username=username)
+    return signed_in_response(request, _decode_login(data), home)
 
 
-async def submit_sign_in(request: Request, login: BrowserLogin, home: str) -> Response:
+async def submit_sign_in(request: Request, login: BrowserLogin | EnvironmentLogin, home: str) -> Response:
+    environment = isinstance(login, EnvironmentLogin)
     try:
         username, password = await read_form(request, "username", "password")
     except FormError as exc:
-        return setup_page(str(exc), exc.status, sign_in=True, username=exc.username)
+        return setup_page(str(exc), exc.status, sign_in=True, username=exc.username, environment=environment)
     # The form can arrive after a password reset. Use the current revision
     # for throttling so attempts against the old login cannot lock out the new one.
-    if load_browser_login() != login:
-        return setup_page("The login changed. Please try again.", 409, sign_in=True)
+    if load_active_login(request) != login:
+        return setup_page("The login changed. Please try again.", 409, sign_in=True, environment=environment)
     host = request.client.host if request.client else None
-    attempt = _sign_in_throttle.reserve(host, login.salt)
+    attempt = _sign_in_throttle.reserve(host, login.digest)
     if isinstance(attempt, int):
-        response = setup_page("Too many sign-in attempts. Wait a moment and try again.", 429, sign_in=True, username=username)
+        response = setup_page("Too many sign-in attempts. Wait a moment and try again.", 429, sign_in=True,
+                              username=username, environment=environment)
         response.headers["Retry-After"] = str(attempt)
         return response
     signed_in = False
     try:
         if not await login.verify(username.encode(), password.encode()):
-            return setup_page("The username or password is incorrect.", 401, sign_in=True, username=username)
-        if load_browser_login() != login:
-            return setup_page("The login changed. Please try again.", 409, sign_in=True)
+            return setup_page("The username or password is incorrect.", 401, sign_in=True, username=username,
+                              environment=environment)
+        if load_active_login(request) != login:
+            return setup_page("The login changed. Please try again.", 409, sign_in=True, environment=environment)
         signed_in = True
     finally:
         _sign_in_throttle.finish(host, attempt, success=signed_in)
     return signed_in_response(request, login, home)
 
 
-def signed_in_response(request: Request, login: BrowserLogin, home: str) -> Response:
+def signed_in_response(request: Request, login: BrowserSession, home: str) -> Response:
     response = RedirectResponse(home, status_code=303, headers={"Cache-Control": "no-store"})
     response.set_cookie(
-        SESSION_COOKIE, login.session_token(), max_age=SESSION_SECONDS, path=home,
+        session_cookie_name(request), login.session_token(), max_age=SESSION_SECONDS, path=home,
         httponly=True, samesite="lax", secure=request.headers["origin"].startswith("https://"),
     )
     return response
@@ -279,7 +365,7 @@ async def replace_browser_password(login: BrowserLogin, password: str) -> bool:
         await connection.exec_driver_sql("BEGIN IMMEDIATE")
         if load_browser_login() != login:
             return False
-        _write_private_file(config.data_dir / LOGIN_FILE, data, replace=True)
+        _write_private_file(config.data_dir / LOGIN_FILE, data)
     return True
 
 
