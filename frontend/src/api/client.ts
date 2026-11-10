@@ -54,7 +54,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (!resp.ok) {
-    if (resp.status === 401 && authMode === "managed") window.location.assign("/login");
+    if (resp.status === 401 && authMode !== "external") window.location.assign("/login");
     let detail = resp.statusText;
     try {
       const data = await resp.json();

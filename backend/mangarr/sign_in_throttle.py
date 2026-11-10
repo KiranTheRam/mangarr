@@ -35,18 +35,18 @@ def _peer_key(host: str | None) -> bytes | None:
 class SignInThrottle:
     def __init__(self) -> None:
         self._windows: OrderedDict[bytes | None, AttemptWindow] = OrderedDict()
-        self._salt: bytes | None = None
+        self._revision: bytes | None = None
         self._pending = 0
         self._lock = Lock()
 
-    def reserve(self, host: str | None, salt: bytes) -> AttemptWindow | int:
+    def reserve(self, host: str | None, revision: bytes) -> AttemptWindow | int:
         """Reserve an attempt before verification or return Retry-After seconds."""
         peer = _peer_key(host)
         with self._lock:
             now = monotonic()
-            if self._salt != salt:
+            if self._revision != revision:
                 self._windows.clear()
-                self._salt = salt
+                self._revision = revision
             while self._windows:
                 oldest = next(iter(self._windows.values()))
                 if oldest.expires_at > now:

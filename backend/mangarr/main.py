@@ -72,8 +72,8 @@ app.mount("/api/v1", api)
 @app.get("/initialize.json")
 async def initialize(request: Request):
     """Browser bootstrap, protected by the browser access boundary."""
-    mode = "managed" if request.state.browser_session else "environment" if config.auth_username else "external"
-    return {"apiKey": "" if mode == "managed" else get_api_key(), "authMode": mode,
+    mode = "environment" if config.auth_username else "managed" if request.state.browser_session else "external"
+    return {"apiKey": get_api_key() if mode == "external" else "", "authMode": mode,
             "version": __version__, "urlBase": ""}
 
 
