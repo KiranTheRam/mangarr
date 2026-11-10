@@ -60,12 +60,13 @@ from ..models import (
 from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
 from ..titles import (
+    alternate_titles,
     compute_title_variants,
+    metadata_title_queries,
+    metadata_titles,
     pick_title,
     plausible_title_match,
-    split_alt_titles,
-    title_queries,
-    unique_titles,
+    set_display_title,
 )
 from ..torrent_selection import select_best_torrent
 from ..util import is_transient_error, normalize_title, safe_error_reason
@@ -226,47 +227,10 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
     )
     if meta is not None:
         series.provider_title = meta.title
-        all_meta_titles = [meta.title, *meta.alt_titles, *getattr(meta, "titles", {}).values()]
-        eng_norm = normalize_title(series.title_english) or series.title_english.casefold()
-        hint = series.title_english if (
-            eng_norm and any(
-                (normalize_title(t) or t.casefold()) == eng_norm
-                for t in all_meta_titles if t
-            )
-        ) else ""
-        variants = compute_title_variants(
-            getattr(meta, "titles", None),
-            meta.title,
-            meta.alt_titles,
-            english_hint=hint,
-        )
-        series.title_english = variants.get("english", "")
-        series.title_romaji = variants.get("romaji", "")
-        series.title_native = variants.get("native", "")
-
-        if not series.title_locked:
-            values = await settings_service.get_all(session)
-            pref = values.get("preferred_title_language", "provider")
-            target_title = pick_title(pref, variants, series.provider_title)
-            if target_title != series.title:
-                if not series.folder_name:
-                    series.folder_name = series_folder(series.title)
-                series.title = target_title
-                series.sort_title = target_title.lower()
-
-        known = [
-            series.title,
-            series.provider_title,
-            series.title_english,
-            series.title_romaji,
-            series.title_native,
-            *meta.alt_titles,
-        ]
-        target_norm = normalize_title(series.title) or series.title.casefold()
-        series.alt_titles = "\n".join([
-            t for t in unique_titles(known)
-            if (normalize_title(t) or t.casefold()) != target_norm
-        ])
+        variants = compute_title_variants(getattr(meta, "titles", None), meta.title, meta.alt_titles)
+        series.title_english = variants["english"]
+        series.title_romaji = variants["romaji"]
+        series.title_native = variants["native"]
         series.description = meta.description
         series.status = SeriesStatus(meta.status)
         series.year = meta.year
@@ -283,19 +247,27 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
             series.total_chapters = max(mu_meta.total_chapters, series.total_chapters or 0)
         if mu_meta.total_volumes:
             series.total_volumes = max(mu_meta.total_volumes, series.total_volumes or 0)
-        # MangaUpdates' associated titles help cross-source matching
-        if meta is None or meta is not mu_meta:
-            known = [
-                series.title,
-                *split_alt_titles(series.alt_titles),
-                *mu_meta.alt_titles,
-            ]
-            target_norm = normalize_title(series.title) or series.title.casefold()
-            series.alt_titles = "\n".join([
-                t for t in unique_titles(known)
-                if (normalize_title(t) or t.casefold()) != target_norm
-            ])
     series.metadata_refreshed_at = datetime.now(timezone.utc)
+    represented_title = ""
+    if meta is not None:
+        # Flush the metadata to take the SQLite writer lock, then read the
+        # title fields again. They may have changed during the provider call.
+        await session.flush()
+        await session.refresh(series, ["title", "title_locked", "folder_name", "sort_title"])
+        if not series.title_locked:
+            values = await settings_service.get_all(session)
+            pref = values.get("preferred_title_language", "provider")
+            set_display_title(series, pick_title(pref, variants, series.provider_title))
+        represented_titles = [meta.title, *variants.values()]
+        if series.title in represented_titles:
+            represented_title = series.title
+        aliases = [*represented_titles, *meta.alt_titles]
+    else:
+        aliases = metadata_titles(series)
+    if mu_meta is not None and mu_meta is not meta:
+        aliases.extend(mu_meta.alt_titles)
+    if meta is not None or mu_meta is not None:
+        series.alt_titles = alternate_titles(represented_title, aliases)
     await session.commit()
 
 
@@ -331,7 +303,7 @@ async def link_mangaupdates(series: Series) -> bool:
 # ---------------------------------------------------------- source linking
 
 def _titles_of(series: Series) -> list[str]:
-    return title_queries(series.title, split_alt_titles(series.alt_titles))
+    return metadata_title_queries(series)
 
 
 # (series_id, source_name) → monotonic time before which auto-linking should

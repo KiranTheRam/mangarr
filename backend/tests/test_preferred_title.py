@@ -1,5 +1,7 @@
 """Tests for preferred title language (issue #17)."""
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -7,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from mangarr import db, settings_service
-from mangarr.adding import AddOptions, create_series
+from mangarr.adding import AddOptions, LibraryIndex, create_series
 from mangarr.api import series as series_api
 from mangarr.jobs import tasks
 from mangarr.library.naming import series_folder
@@ -65,17 +67,17 @@ class TestTitleVariantsAndPicks:
         assert pick_title("native", variants, "Sousou no Frieren") == "Sousou no Frieren"
 
     def test_mangaupdates_unlabeled_provider_variants(self):
-        # English from hint, romaji = canonical Latin, native picks kana over Chinese
+        # Romaji is the canonical Latin title, and native picks kana over Chinese.
         canonical = "Sousou no Frieren"
         alt_titles = [
             "Chinese Title 葬送的芙莉莲",
             "Japanese Kana Title 葬送のフリーレン",
+            "Frieren: Beyond Journey's End",
         ]
         variants = compute_title_variants(
             None,
             canonical,
             alt_titles,
-            english_hint="Frieren: Beyond Journey's End",
         )
         assert variants["english"] == "Frieren: Beyond Journey's End"
         assert variants["romaji"] == "Sousou no Frieren"
@@ -86,7 +88,6 @@ class TestTitleVariantsAndPicks:
             None,
             "Attack on Titan",
             ["Shingeki no Kyojin"],
-            english_hint="Attack on Titan",
         )
         assert variants["english"] == "Attack on Titan"
         assert variants["romaji"] == ""
@@ -147,7 +148,7 @@ class TestCreateSeriesUnderPreferences:
 
 
 class TestRefreshMetadata:
-    async def test_refresh_unlocked_series_follows_preference_and_keeps_english_hint(
+    async def test_refresh_unlocked_series_follows_preference(
         self, session, monkeypatch
     ):
         series = Series(
@@ -541,3 +542,89 @@ class TestMetadataResultsPreferredTitle:
         assert len(results) == 1
         assert results[0].preferred_title == "Shingeki no Kyojin"
         assert results[0].english_title == "Attack on Titan"
+
+
+async def test_custom_display_titles_do_not_become_identity_aliases(session, monkeypatch):
+    series = Series(anilist_id=1, title="Bleach", provider_title="Bleach")
+    session.add(series)
+    await session.commit()
+    await series_api.update_series(series.id, SeriesUpdateIn(title="One Piece"), session)
+    await series_api.update_series(series.id, SeriesUpdateIn(title="Naruto"), session)
+
+    async def search(query, limit):
+        ids = {"Naruto": "99", "One Piece": "98", "Bleach": "42"}
+        return [SeriesMetadata("mangaupdates", ids[query], query)]
+
+    monkeypatch.setattr(mu_provider, "search", search)
+    assert await tasks.link_mangaupdates(series)
+    assert series.mangaupdates_id == 42
+    assert "One Piece" not in series.alt_titles
+    await session.commit()
+    index = await LibraryIndex.load(session)
+    assert index.find(titles=["Bleach"]) == series.id
+    assert index.find(titles=["One Piece", "Naruto"]) is None
+
+
+async def test_metadata_refresh_preserves_title_locked_during_provider_request(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'concurrent.db'}")
+    started, resume = asyncio.Event(), asyncio.Event()
+
+    async def metadata(_):
+        started.set()
+        await resume.wait()
+        return SeriesMetadata("mangaupdates", "42", "Updated Provider Title")
+
+    monkeypatch.setattr(mu_provider, "get_series", metadata)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with maker() as refresh_session, maker() as edit_session:
+            series = Series(id=1, mangaupdates_id=42, title="Provider Title")
+            refresh_session.add(series)
+            await refresh_session.commit()
+            job = asyncio.create_task(tasks.refresh_series_metadata(refresh_session, series))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=5)
+                await series_api.update_series(1, SeriesUpdateIn(title="My Locked Title"), edit_session)
+            finally:
+                resume.set()
+                await job
+        async with maker() as session:
+            saved = await session.get(Series, 1)
+            assert saved.title == "My Locked Title"
+            assert saved.title_locked
+            assert saved.provider_title == "Updated Provider Title"
+    finally:
+        await engine.dispose()
+
+
+async def test_english_preference_ignores_matching_foreign_search_alias(session, monkeypatch):
+    from mangarr.api.search import metadata_results
+
+    await session.merge(Setting(key="preferred_title_language", value="english"))
+    await session.commit()
+    french = "L Attaque des Titans"
+    meta = SeriesMetadata(
+        "mangaupdates", "42", "Shingeki no Kyojin",
+        alt_titles=[french, "Attack on Titan"],
+    )
+
+    async def search(query, limit):
+        assert query == french
+        return [meta]
+
+    async def metadata(_):
+        return meta
+
+    monkeypatch.setattr(mu_provider, "search", search)
+    monkeypatch.setattr(mu_provider, "get_series", metadata)
+    result, = await metadata_results(session, "mangaupdates", french)
+    assert result.preferred_title == "Attack on Titan"
+    assert result.english_title == "Attack on Titan"
+    assert result.matched_title == french
+    series = await create_series(
+        session, AddOptions(root_folder_id=None, english_title=french), mangaupdates_id=42,
+    )
+    assert series.title == "Attack on Titan"
+    assert french in series.alt_titles.splitlines()

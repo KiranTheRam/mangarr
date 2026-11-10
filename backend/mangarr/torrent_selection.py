@@ -12,7 +12,7 @@ from .download.torrent import magnet_btih_hex, torrent_info_hash
 from .filename import parse_filename
 from .models import Chapter, Series
 from .sources.base import TorrentIndexer, TorrentRelease
-from .titles import split_alt_titles, title_queries
+from .titles import metadata_title_queries
 from .util import (
     is_special_chapter,
     normalize_title,
@@ -169,7 +169,7 @@ def release_matches_series(release_title: str, series: Series) -> bool:
     release = normalize_title(release_title)
     if not release:
         return False
-    aliases = title_queries(series.title, split_alt_titles(series.alt_titles))
+    aliases = metadata_title_queries(series)
     if getattr(series, "search_title", ""):
         aliases.insert(0, series.search_title)
     normalized = [normalize_title(alias) for alias in aliases]

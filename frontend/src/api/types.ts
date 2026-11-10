@@ -122,6 +122,7 @@ export interface MetadataResult {
   title: string;
   preferred_title: string;
   english_title: string;
+  matched_title: string;
   alt_titles: string[];
   description: string;
   status: string;

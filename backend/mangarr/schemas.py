@@ -266,6 +266,7 @@ class MetadataResult(BaseModel):
     title: str
     preferred_title: str = ""
     english_title: str = ""
+    matched_title: str = ""
     alt_titles: list[str]
     description: str
     status: str

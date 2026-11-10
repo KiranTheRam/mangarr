@@ -14,7 +14,7 @@ from .metadata.anilist import STATUS_MAP
 from .metadata.anilist import provider as anilist
 from .metadata.mangaupdates import provider as mangaupdates
 from .models import Series
-from .titles import split_alt_titles, title_queries
+from .titles import metadata_title_queries, metadata_titles
 from .util import normalize_title
 
 log = logging.getLogger(__name__)
@@ -108,10 +108,10 @@ async def _resolve_anilist_id(series: Series) -> int | None:
     if series.anilist_id is not None:
         return series.anilist_id
     wanted = {
-        n for t in [series.title, *split_alt_titles(series.alt_titles)]
+        n for t in metadata_titles(series)
         if (n := normalize_title(t))
     }
-    for query in title_queries(series.title, split_alt_titles(series.alt_titles), limit=2):
+    for query in metadata_title_queries(series, limit=2):
         for cand in await anilist.search(query, limit=5):
             keys = {n for t in [cand.title, *cand.alt_titles] if (n := normalize_title(t))}
             if wanted & keys:
@@ -203,7 +203,7 @@ async def related_titles(series: Series) -> Related:
     if len(errors) == 2:
         raise errors[0]
     (al_rel, al_recs), (mu_rel, mu_recs) = results
-    own = {n for t in [series.title, *split_alt_titles(series.alt_titles)]
+    own = {n for t in metadata_titles(series)
            if (n := normalize_title(t))}
     relations = _merge(al_rel, mu_rel, own)
     relations.sort(key=lambda r: _RELATION_ORDER.get(r.relation, len(_RELATION_ORDER)))

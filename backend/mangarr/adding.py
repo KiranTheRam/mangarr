@@ -15,7 +15,7 @@ from . import settings_service
 from .metadata.anilist import provider as anilist
 from .metadata.mangaupdates import provider as mangaupdates
 from .models import RootFolder, Series, SeriesFolder, SeriesStatus
-from .titles import compute_title_variants, pick_title, split_alt_titles, unique_titles
+from .titles import alternate_titles, compute_title_variants, pick_title, split_alt_titles
 from .util import normalize_title, sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -84,10 +84,11 @@ class LibraryIndex:
         index = cls()
         rows = await session.execute(
             select(Series.id, Series.anilist_id, Series.mangaupdates_id,
-                   Series.title, Series.alt_titles)
+                   Series.provider_title, Series.title, Series.alt_titles,
+                   Series.title_english, Series.title_romaji, Series.title_native)
         )
-        for series_id, anilist_id, mu_id, title, alt_titles in rows.all():
-            index.add(series_id, anilist_id, mu_id, [title, *split_alt_titles(alt_titles)])
+        for series_id, anilist_id, mu_id, provider_title, title, alt_titles, *variants in rows.all():
+            index.add(series_id, anilist_id, mu_id, [provider_title or title, *variants, *split_alt_titles(alt_titles)])
         return index
 
     def add(self, series_id: int, anilist_id: int | None, mangaupdates_id: int | None,
@@ -144,8 +145,7 @@ async def create_series(
     variants = compute_title_variants(
         getattr(meta, "titles", None),
         meta.title,
-        alt_candidates,
-        english_hint=opts.english_title,
+        meta.alt_titles,
     )
     chosen_title = pick_title(pref, variants, meta.title)
     all_known = [
@@ -154,11 +154,6 @@ async def create_series(
         variants.get("romaji", ""),
         variants.get("native", ""),
         *alt_candidates,
-    ]
-    chosen_norm = normalize_title(chosen_title) or chosen_title.casefold()
-    alt_titles = [
-        t for t in unique_titles(all_known)
-        if (normalize_title(t) or t.casefold()) != chosen_norm
     ]
     series = Series(
         anilist_id=anilist_id,
@@ -170,7 +165,7 @@ async def create_series(
         title_native=variants.get("native", ""),
         title_locked=False,
         sort_title=chosen_title.lower(),
-        alt_titles="\n".join(alt_titles),
+        alt_titles=alternate_titles(chosen_title, all_known),
         description=meta.description,
         status=SeriesStatus(meta.status),
         year=meta.year,
