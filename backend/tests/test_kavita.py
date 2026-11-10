@@ -357,6 +357,31 @@ async def test_import_path_notifies_kavita_with_the_series_own_names(monkeypatch
     assert lib_scan.calls[0].request.url.params["libraryId"] == "3"
 
 
+@respx.mock
+async def test_import_path_notifies_kavita_with_provider_title(monkeypatch):
+    from mangarr.jobs import tasks
+    from mangarr.models import RootFolder, Series
+
+    monkeypatch.setattr(kavita, "DEBOUNCE_SECONDS", 0.05)
+    mock_auth()
+    mock_libraries()
+    search = respx.get(f"{BASE}/api/Search/search").mock(
+        return_value=Response(200, json={"series": []})
+    )
+    respx.post(f"{BASE}/api/Library/scan").mock(return_value=Response(200))
+
+    series = Series(
+        id=2, title="Frieren: Beyond Journey's End", provider_title="Sousou no Frieren",
+        folder_name="Frieren", alt_titles="葬送のフリーレン", root_folder_id=1,
+    )
+    series.root_folder = RootFolder(id=1, path="/library/manga")
+    tasks._notify_kavita(ENABLED, series)
+    await asyncio.sleep(0.3)
+
+    queried = {call.request.url.params["queryString"] for call in search.calls}
+    assert queried == {"Frieren: Beyond Journey's End", "Frieren", "Sousou no Frieren"}
+
+
 async def test_series_without_a_root_folder_notifies_nothing():
     from mangarr.jobs import tasks
     from mangarr.models import Series

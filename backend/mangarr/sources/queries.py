@@ -3,7 +3,7 @@
 import re
 from string import Formatter
 
-from ..titles import split_alt_titles, title_queries
+from ..titles import metadata_title_queries
 
 _FIELDS = {"series", "chapter", "volume", "year"}
 _NUMERIC_FIELDS = {"chapter", "volume"}
@@ -44,7 +44,7 @@ def search_queries(series, chapters, values: dict[str, str]) -> list[str]:
     chosen search title. Coverage is checked separately before automatic grabs.
     """
     titles = ([series.search_title] if getattr(series, "search_title", "") else
-              title_queries(series.title, split_alt_titles(series.alt_titles)))
+              metadata_title_queries(series))
     templates = (getattr(series, "search_templates", "") or
                  values.get("torrent_query_templates", "{series}"))
     queries = []

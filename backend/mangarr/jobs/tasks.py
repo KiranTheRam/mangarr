@@ -59,7 +59,15 @@ from ..models import (
 )
 from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
-from ..titles import plausible_title_match, split_alt_titles, title_queries
+from ..titles import (
+    alternate_titles,
+    compute_title_variants,
+    metadata_title_queries,
+    metadata_titles,
+    pick_title,
+    plausible_title_match,
+    set_display_title,
+)
 from ..torrent_selection import select_best_torrent
 from ..util import is_transient_error, normalize_title, safe_error_reason
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
@@ -218,8 +226,11 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
         await anilist.get_series(str(series.anilist_id)) if series.anilist_id else None
     )
     if meta is not None:
-        series.title = meta.title
-        series.alt_titles = "\n".join(meta.alt_titles)
+        series.provider_title = meta.title
+        variants = compute_title_variants(getattr(meta, "titles", None), meta.title, meta.alt_titles)
+        series.title_english = variants["english"]
+        series.title_romaji = variants["romaji"]
+        series.title_native = variants["native"]
         series.description = meta.description
         series.status = SeriesStatus(meta.status)
         series.year = meta.year
@@ -236,12 +247,27 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
             series.total_chapters = max(mu_meta.total_chapters, series.total_chapters or 0)
         if mu_meta.total_volumes:
             series.total_volumes = max(mu_meta.total_volumes, series.total_volumes or 0)
-        # MangaUpdates' associated titles help cross-source matching
-        if meta is None or meta is not mu_meta:
-            known = set(series.alt_titles.split("\n"))
-            extra = [t for t in mu_meta.alt_titles if t and t not in known]
-            series.alt_titles = "\n".join(filter(None, [series.alt_titles, *extra]))
     series.metadata_refreshed_at = datetime.now(timezone.utc)
+    represented_title = ""
+    if meta is not None:
+        # Flush the metadata to take the SQLite writer lock, then read the
+        # title fields again. They may have changed during the provider call.
+        await session.flush()
+        await session.refresh(series, ["title", "title_locked", "folder_name", "sort_title"])
+        if not series.title_locked:
+            values = await settings_service.get_all(session)
+            pref = values.get("preferred_title_language", "provider")
+            set_display_title(series, pick_title(pref, variants, series.provider_title))
+        represented_titles = [meta.title, *variants.values()]
+        if series.title in represented_titles:
+            represented_title = series.title
+        aliases = [*represented_titles, *meta.alt_titles]
+    else:
+        aliases = metadata_titles(series)
+    if mu_meta is not None and mu_meta is not meta:
+        aliases.extend(mu_meta.alt_titles)
+    if meta is not None or mu_meta is not None:
+        series.alt_titles = alternate_titles(represented_title, aliases)
     await session.commit()
 
 
@@ -277,7 +303,7 @@ async def link_mangaupdates(series: Series) -> bool:
 # ---------------------------------------------------------- source linking
 
 def _titles_of(series: Series) -> list[str]:
-    return title_queries(series.title, split_alt_titles(series.alt_titles))
+    return metadata_title_queries(series)
 
 
 # (series_id, source_name) → monotonic time before which auto-linking should
@@ -882,15 +908,23 @@ def _notify_kavita(values: dict[str, str], series: Series) -> None:
     """Ask Kavita to scan the library this series' files live in.
 
     Kavita names a series from the ComicInfo <Series> mangarr writes (the
-    series title) or else from the folder name, so only those two are offered.
-    Alternate titles are not: a series Kavita has not seen yet matches nothing
-    under its own name, and an alternate such as "Berserk" (for "Berserk of
-    Gluttony") would then pick an unrelated series and scan it instead of the
-    library that holds the new folder.
+    series title), older files' provider title, or else from the folder name,
+    so only those are offered. Alternate titles are deliberately NOT
+    offered: a series Kavita has not seen yet matches nothing under its own
+    name, and an alternate such as "Berserk" (for "Berserk of Gluttony") would
+    then pick an unrelated series and scan it instead of the library that
+    holds the new folder.
     """
     if series.root_folder is None:
         return
-    titles = [series.title, series.folder_name]
+    candidates = [series.title, series.folder_name, getattr(series, "provider_title", "")]
+    titles: list[str] = []
+    seen: set[str] = set()
+    for t in candidates:
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            titles.append(t)
     kavita.notify_import(values, series.root_folder_id, series.root_folder.path, titles)
 
 
@@ -2013,12 +2047,18 @@ async def merge_complete_volumes(
     merged: list[int] = []
     for volume, members in mergeable_volumes(series, series.chapters, busy).items():
         dest = folders[0] / volume_filename(series_folder(series.title), volume)
+        localized_series = (
+            series.provider_title
+            if series.provider_title and series.title != series.provider_title
+            else None
+        )
         try:
             await asyncio.to_thread(
                 merge_chapter_archives,
                 [(c.number, Path(c.file_path)) for c in members],
                 dest, series.title, volume,
                 series.description if volume == 1 else "",
+                localized_series=localized_series,
             )
         except Exception as exc:
             log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)

@@ -264,6 +264,8 @@ async def download_chapter_to_cbz(
     # The final cancellation/library check and atomic write stay together,
     # with no await after the check.
     await check_cancelled()
+    provider_title = getattr(series, "provider_title", "")
+    localized_series = provider_title if provider_title and series.title != provider_title else None
     comicinfo = build_comicinfo(
         series=series.title,
         number=chapter.number,
@@ -272,6 +274,7 @@ async def download_chapter_to_cbz(
         summary=series.description if chapter.number in (0, 1) else "",
         web=web_url,
         page_count=len(pages),
+        localized_series=localized_series,
     )
     if original_signature is None:
         write_cbz(dest_path, complete_pages, comicinfo)

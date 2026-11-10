@@ -11,10 +11,11 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import settings_service
 from .metadata.anilist import provider as anilist
 from .metadata.mangaupdates import provider as mangaupdates
 from .models import RootFolder, Series, SeriesFolder, SeriesStatus
-from .titles import split_alt_titles, unique_titles
+from .titles import alternate_titles, compute_title_variants, pick_title, split_alt_titles
 from .util import normalize_title, sanitize_filename
 
 log = logging.getLogger(__name__)
@@ -83,10 +84,11 @@ class LibraryIndex:
         index = cls()
         rows = await session.execute(
             select(Series.id, Series.anilist_id, Series.mangaupdates_id,
-                   Series.title, Series.alt_titles)
+                   Series.provider_title, Series.title, Series.alt_titles,
+                   Series.title_english, Series.title_romaji, Series.title_native)
         )
-        for series_id, anilist_id, mu_id, title, alt_titles in rows.all():
-            index.add(series_id, anilist_id, mu_id, [title, *split_alt_titles(alt_titles)])
+        for series_id, anilist_id, mu_id, provider_title, title, alt_titles, *variants in rows.all():
+            index.add(series_id, anilist_id, mu_id, [provider_title or title, *variants, *split_alt_titles(alt_titles)])
         return index
 
     def add(self, series_id: int, anilist_id: int | None, mangaupdates_id: int | None,
@@ -137,13 +139,33 @@ async def create_series(
     meta = await provider.get_series(str(provider_id))
     if meta is None:
         raise MetadataNotFound(f"{provider.name} series not found")
-    alt_titles = unique_titles([*meta.alt_titles, opts.english_title, *opts.alt_titles])
+    values = await settings_service.get_all(session)
+    pref = values.get("preferred_title_language", "provider")
+    alt_candidates = [*meta.alt_titles, opts.english_title, *opts.alt_titles]
+    variants = compute_title_variants(
+        getattr(meta, "titles", None),
+        meta.title,
+        meta.alt_titles,
+    )
+    chosen_title = pick_title(pref, variants, meta.title)
+    all_known = [
+        meta.title,
+        variants.get("english", ""),
+        variants.get("romaji", ""),
+        variants.get("native", ""),
+        *alt_candidates,
+    ]
     series = Series(
         anilist_id=anilist_id,
         mangaupdates_id=mangaupdates_id,
-        title=meta.title,
-        sort_title=meta.title.lower(),
-        alt_titles="\n".join(alt_titles),
+        title=chosen_title,
+        provider_title=meta.title,
+        title_english=variants.get("english", ""),
+        title_romaji=variants.get("romaji", ""),
+        title_native=variants.get("native", ""),
+        title_locked=False,
+        sort_title=chosen_title.lower(),
+        alt_titles=alternate_titles(chosen_title, all_known),
         description=meta.description,
         status=SeriesStatus(meta.status),
         year=meta.year,
@@ -156,7 +178,7 @@ async def create_series(
         monitor_mode=opts.monitor_mode,
         monitor_from=opts.monitor_from if opts.monitor_mode == "from_chapter" else None,
         root_folder_id=opts.root_folder_id,
-        folder_name=sanitize_filename(meta.title),
+        folder_name=sanitize_filename(chosen_title),
         folder_pinned=opts.folder_pinned,
     )
     if opts.folder_name.strip():

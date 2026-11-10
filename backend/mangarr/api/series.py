@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import Integer, case, cast, func, select, update as sa_update
+from sqlalchemy import Integer, case, cast, func, select, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -34,6 +34,7 @@ from ..models import Chapter, Download, DownloadKind, DownloadStatus, RootFolder
 from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
     AddSeriesIn,
+    ApplyTitlePreferenceOut,
     ChapterMetadataIn,
     ChapterMonitorIn,
     ChapterOut,
@@ -52,7 +53,13 @@ from ..schemas import (
     VolumeMergeOut,
 )
 from ..sources import registry
-from ..titles import english_title, split_alt_titles
+from ..titles import (
+    compute_title_variants,
+    english_title,
+    pick_title,
+    set_display_title,
+    split_alt_titles,
+)
 from ..util import is_special_chapter
 
 router = APIRouter(prefix="/series", tags=["series"])
@@ -87,7 +94,9 @@ def _apply_counts(out: SeriesOut, counts: _Counts) -> None:
 
 def _series_out(series: Series, counts: _Counts) -> SeriesOut:
     out = SeriesOut.model_validate(series)
-    out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
+    out.english_title = series.title_english or english_title(
+        series.provider_title or series.title, split_alt_titles(series.alt_titles)
+    )
     _apply_counts(out, counts)
     return out
 
@@ -355,7 +364,9 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     if series is None:
         raise HTTPException(404, "Series not found")
     out = SeriesDetailOut.model_validate(series)
-    out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
+    out.english_title = series.title_english or english_title(
+        series.provider_title or series.title, split_alt_titles(series.alt_titles)
+    )
     _apply_counts(out, _count_chapters(series.chapters))
     out.refreshing = series_id in REFRESHING
     out.global_source_order = _content_source_names(await settings_service.get_all(session))
@@ -368,16 +379,64 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     return out
 
 
+def _retitle(series: Series, title: str) -> bool:
+    if not series.provider_title:
+        series.provider_title = series.title
+    return set_display_title(series, title)
+
+
+def _apply_title_preference(series: Series, preference: str) -> bool:
+    variants = {
+        "english": series.title_english,
+        "romaji": series.title_romaji,
+        "native": series.title_native,
+    }
+    provider_title = series.provider_title or series.title
+    if not any(variants.values()):
+        variants = compute_title_variants(None, provider_title, split_alt_titles(series.alt_titles))
+        series.title_english = variants["english"]
+        series.title_romaji = variants["romaji"]
+        series.title_native = variants["native"]
+    return _retitle(series, pick_title(preference, variants, provider_title))
+
+
+@router.post("/apply-title-preference", response_model=ApplyTitlePreferenceOut)
+async def apply_title_preference(session: AsyncSession = Depends(get_session)):
+    """Apply the preferred title language to all unlocked series."""
+    # Serialize with edits and refreshes before reading title locks.
+    await session.execute(text("BEGIN IMMEDIATE"))
+    values = await settings_service.get_all(session)
+    pref = values.get("preferred_title_language", "provider")
+    unlocked = await session.scalars(select(Series).where(Series.title_locked.is_(False)))
+    changed = sum(_apply_title_preference(series, pref) for series in unlocked)
+    await session.commit()
+    return ApplyTitlePreferenceOut(count=changed, updated=changed)
+
+
 @router.put("/{series_id}", response_model=SeriesDetailOut)
 async def update_series(
     series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
 ):
+    new_title = body.title.strip() if body.title is not None else None
+    if new_title == "":
+        raise HTTPException(422, "Title cannot be empty")
+    if new_title is not None or body.title_locked is not None:
+        await session.execute(text("BEGIN IMMEDIATE"))
     result = await session.execute(
         select(Series).options(selectinload(Series.chapters)).where(Series.id == series_id)
     )
     series = result.scalar_one_or_none()
     if series is None:
         raise HTTPException(404, "Series not found")
+    if new_title is not None:
+        _retitle(series, new_title)
+        series.title_locked = True
+    elif body.title_locked is False:
+        series.title_locked = False
+        values = await settings_service.get_all(session)
+        _apply_title_preference(series, values.get("preferred_title_language", "provider"))
+    elif body.title_locked is True:
+        series.title_locked = True
     if body.search_templates is not None:
         from ..sources.queries import validate_templates
 

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..chapter_metadata import apply_title
 from ..models import Chapter, Series
+from ..titles import metadata_titles
 from ..util import BRACKET_GROUPS, normalize_title
 from .matcher import (
     MediaFile,
@@ -138,9 +139,7 @@ def find_existing_folder(root: Path, series: Series) -> str | None:
     root = Path(root)
     if not root.is_dir():
         return None
-    wanted = {normalize_title(series.title)}
-    wanted.update(normalize_title(t) for t in series.alt_titles.split("\n") if t)
-    wanted.discard("")
+    wanted = {key for title in metadata_titles(series) if (key := normalize_title(title))}
     best = None
     for child in sorted(root.iterdir()):
         if not child.is_dir():

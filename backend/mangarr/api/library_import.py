@@ -21,7 +21,7 @@ from ..schemas import (
     LibraryImportIn,
     LibraryImportResultOut,
 )
-from ..titles import plausible_title_match
+from ..titles import metadata_titles, plausible_title_match
 from ..util import BRACKET_GROUPS, normalize_title
 from .search import metadata_results
 
@@ -200,7 +200,7 @@ async def import_library(body: LibraryImportIn, session: AsyncSession = Depends(
             continue
         added.append(series.id)
         # two folders of one batch matched to the same manga
-        library.add(series.id, anilist_id, mangaupdates_id, [series.title, *titles])
+        library.add(series.id, anilist_id, mangaupdates_id, metadata_titles(series))
         results.append(LibraryImportResultOut(
             folder_name=item.folder_name, status="added", series_id=series.id,
         ))

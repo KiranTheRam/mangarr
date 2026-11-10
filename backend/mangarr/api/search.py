@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from .. import settings_service
 from ..automation import select_for_series
 from ..db import get_session
 from ..metadata.anilist import provider as anilist
@@ -16,7 +17,13 @@ from ..models import Chapter, Series
 from ..schemas import MetadataResult, ReleaseOut
 from ..sources import registry
 from ..sources.base import DirectSource
-from ..titles import english_title, plausible_title_match, split_alt_titles, title_queries
+from ..titles import (
+    compute_title_variants,
+    matched_alias,
+    metadata_title_queries,
+    pick_title,
+    plausible_title_match,
+)
 from ..util import normalize_title, safe_error_reason
 
 log = logging.getLogger(__name__)
@@ -55,24 +62,36 @@ async def metadata_results(
         for row in (await session.execute(select(id_column))).all()
         if row[0] is not None
     }
-    return [
-        MetadataResult(
-            provider=r.provider,
-            provider_id=r.provider_id,
-            title=r.title,
-            english_title=english_title(r.title, r.alt_titles, query),
-            alt_titles=r.alt_titles,
-            description=r.description,
-            status=r.status,
-            year=r.year,
-            cover_url=r.cover_url,
-            genres=r.genres,
-            total_chapters=r.total_chapters,
-            total_volumes=r.total_volumes,
-            in_library=int(r.provider_id) in in_library,
+    values = await settings_service.get_all(session)
+    pref = values.get("preferred_title_language", "provider")
+    out = []
+    for r in results:
+        variants = compute_title_variants(
+            getattr(r, "titles", None),
+            r.title,
+            r.alt_titles,
         )
-        for r in results
-    ]
+        pref_title = pick_title(pref, variants, r.title)
+        out.append(
+            MetadataResult(
+                provider=r.provider,
+                provider_id=r.provider_id,
+                title=r.title,
+                preferred_title=pref_title,
+                english_title=variants["english"],
+                matched_title=matched_alias(r.alt_titles, query),
+                alt_titles=r.alt_titles,
+                description=r.description,
+                status=r.status,
+                year=r.year,
+                cover_url=r.cover_url,
+                genres=r.genres,
+                total_chapters=r.total_chapters,
+                total_volumes=r.total_volumes,
+                in_library=int(r.provider_id) in in_library,
+            )
+        )
+    return out
 
 
 @router.get("/metadata", response_model=list[MetadataResult])
@@ -175,8 +194,7 @@ async def search_releases(
     values = await registry.apply_settings(session)
     releases: list[ReleaseOut] = []
     links = {sl.source_name: sl for sl in series.source_links}
-    alt_titles = split_alt_titles(series.alt_titles)
-    queries = title_queries(series.title, alt_titles)
+    queries = metadata_title_queries(series)
     local_chapters = {ch.number: ch for ch in series.chapters if not ch.excluded}
 
     async def direct_releases_for_source(src: DirectSource) -> list[ReleaseOut]:

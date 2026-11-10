@@ -773,6 +773,7 @@ export default function Settings() {
   });
 
   const [webhookTest, setWebhookTest] = useState<string | null>(null);
+  const [applyingTitlePref, setApplyingTitlePref] = useState(false);
   const testWebhook = useMutation({
     mutationFn: () =>
       api.post("/settings/webhook/test", {
@@ -826,6 +827,55 @@ export default function Settings() {
             Naming uses {"{series}"}, {"{volume:02d}"} and {"{chapter:04.1f}"} placeholders. Output
             is Komga/Kavita-friendly CBZ.
           </p>
+          <div className="form-row">
+            <label>Preferred title</label>
+            <select
+              value={form.preferred_title_language ?? "provider"}
+              onChange={set("preferred_title_language")}
+            >
+              <option value="provider">Provider (default)</option>
+              <option value="english">English</option>
+              <option value="romaji">Romaji</option>
+              <option value="native">Native</option>
+            </select>
+          </div>
+          <p className="section-hint">
+            Preferred title language when adding series and for future download filenames.
+          </p>
+          <div className="form-row">
+            <label>Apply to existing</label>
+            <button
+              type="button"
+              className="btn"
+              disabled={applyingTitlePref || dirty}
+              onClick={async () => {
+                if (
+                  !window.confirm(
+                    "Apply the preferred title language to all unlocked existing series? Existing folders and files are NOT renamed."
+                  )
+                ) {
+                  return;
+                }
+                setApplyingTitlePref(true);
+                try {
+                  const res = await api.post<{ count: number }>("/series/apply-title-preference");
+                  window.alert(`Updated ${res.count} series.`);
+                  queryClient.invalidateQueries({ queryKey: ["series"] });
+                } catch (err) {
+                  window.alert(`Failed to apply title preference: ${(err as Error).message}`);
+                } finally {
+                  setApplyingTitlePref(false);
+                }
+              }}
+            >
+              {applyingTitlePref ? "Applying…" : "Apply to existing series"}
+            </button>
+          </div>
+          {dirty && (
+            <p className="section-hint">
+              Save your settings before applying the preferred title to existing series.
+            </p>
+          )}
           <div className="form-row">
             <label>Chapter naming (with volume)</label>
             {text("naming_template")}

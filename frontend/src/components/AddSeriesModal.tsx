@@ -13,7 +13,9 @@ import { Modal, Toggle } from "./common";
 export type AddTarget = Pick<
   MetadataResult,
   "provider" | "provider_id" | "title" | "english_title" | "alt_titles"
->;
+> & {
+  preferred_title?: string;
+};
 
 export function AddSeriesModal({
   result,
@@ -37,12 +39,14 @@ export function AddSeriesModal({
   const [extraFolders, setExtraFolders] = useState<string[]>([]);
   const [browsing, setBrowsing] = useState<"primary" | "extra" | null>(null);
 
+  const displayTitle = result.preferred_title || result.english_title || result.title;
+
   const { data: preview, isFetching: previewLoading } = useQuery({
     queryKey: ["folder-preview", rootFolderId, result.provider, result.provider_id],
     queryFn: () =>
       api.post<FolderPreview>("/library/folder-preview", {
         root_folder_id: rootFolderId,
-        title: result.title,
+        title: result.preferred_title || result.title,
         alt_titles: [result.english_title, ...result.alt_titles].filter(Boolean),
       }),
   });
@@ -82,8 +86,8 @@ export function AddSeriesModal({
   const usingDetected = !folderTouched && preview?.matched;
 
   return (
-    <Modal title={`Add — ${result.english_title || result.title}`} onClose={onClose}>
-      {result.english_title && result.english_title !== result.title && (
+    <Modal title={`Add — ${displayTitle}`} onClose={onClose}>
+      {result.title !== displayTitle && (
         <div style={{ color: "var(--text-dim)", marginBottom: 12 }}>{result.title}</div>
       )}
 
@@ -229,7 +233,7 @@ export function AddSeriesModal({
           }
           onClick={() => addMutation.mutate()}
         >
-          {addMutation.isPending ? "Adding…" : `Add ${result.english_title || result.title}`}
+          {addMutation.isPending ? "Adding…" : `Add ${displayTitle}`}
         </button>
       </div>
 

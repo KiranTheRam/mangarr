@@ -91,6 +91,11 @@ class SeriesOut(BaseModel):
     special_downloaded_count: int = 0
     monitor_mode: str = "all"
     monitor_from: float | None = None
+    provider_title: str = ""
+    title_english: str = ""
+    title_romaji: str = ""
+    title_native: str = ""
+    title_locked: bool = False
 
 
 class SeriesDetailOut(SeriesOut):
@@ -165,6 +170,8 @@ class FolderPreviewOut(BaseModel):
 
 
 class SeriesUpdateIn(BaseModel):
+    title: str | None = None
+    title_locked: bool | None = None
     search_title: str | None = None
     search_templates: str | None = None
     monitored: bool | None = None
@@ -223,6 +230,11 @@ class SeriesBulkOut(BaseModel):
     count: int
 
 
+class ApplyTitlePreferenceOut(BaseModel):
+    count: int
+    updated: int = 0
+
+
 class SeriesGroupOut(BaseModel):
     """A scanlation group a linked source offers for the series."""
     source_name: str
@@ -252,7 +264,9 @@ class MetadataResult(BaseModel):
     provider: str
     provider_id: str
     title: str
+    preferred_title: str = ""
     english_title: str = ""
+    matched_title: str = ""
     alt_titles: list[str]
     description: str
     status: str

@@ -120,6 +120,9 @@ export default function AddSeries() {
                   {r.english_title && r.english_title !== r.title && (
                     <div className="alt-title-line">English: {r.english_title}</div>
                   )}
+                  {r.matched_title && r.matched_title !== r.title && r.matched_title !== r.english_title && (
+                    <div className="alt-title-line">Matched title: {r.matched_title}</div>
+                  )}
                   <span className={`pill ${statusPill[r.status] ?? "gray"}`}>{r.status}</span>{" "}
                   {r.total_chapters && <span className="tag">{r.total_chapters} chapters</span>}
                   {r.genres.slice(0, 4).map((g) => (

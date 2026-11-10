@@ -70,6 +70,11 @@ export interface Series {
   special_downloaded_count: number;
   monitor_mode: MonitorMode;
   monitor_from: number | null;
+  provider_title: string;
+  title_english: string;
+  title_romaji: string;
+  title_native: string;
+  title_locked: boolean;
 }
 
 export type MonitorMode = "all" | "missing" | "future" | "from_chapter" | "latest_volume" | "none";
@@ -115,7 +120,9 @@ export interface MetadataResult {
   provider: string;
   provider_id: string;
   title: string;
+  preferred_title: string;
   english_title: string;
+  matched_title: string;
   alt_titles: string[];
   description: string;
   status: string;

@@ -76,6 +76,11 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("series_folders", "volume_offset", "INTEGER", None),
     # existing failures keep their 7-day block (they were never classified)
     ("downloads", "transient_error", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("series", "provider_title", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_english", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_romaji", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_native", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
 ]
 
 # Chapters mangarr downloaded before file provenance was tracked: the latest
@@ -89,6 +94,13 @@ UPDATE chapters SET file_source = COALESCE((
     ORDER BY h.id DESC LIMIT 1
 ), '')
 WHERE downloaded = 1 AND file_path != ''
+"""
+
+# Existing series titles all originated from the metadata provider. Runs once
+# when provider_title is first added.
+_BACKFILL_PROVIDER_TITLE = """
+UPDATE series SET provider_title = title
+WHERE provider_title = ''
 """
 
 
@@ -106,6 +118,8 @@ async def init_db() -> None:
                 )
                 if (table, column) == ("chapters", "file_source"):
                     await conn.exec_driver_sql(_BACKFILL_FILE_SOURCE)
+                if (table, column) == ("series", "provider_title"):
+                    await conn.exec_driver_sql(_BACKFILL_PROVIDER_TITLE)
             if index:
                 await conn.exec_driver_sql(
                     f"CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table} ({column})"
