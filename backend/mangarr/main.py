@@ -21,7 +21,7 @@ from .api import (
     system,
 )
 from .api.deps import get_api_key, require_api_access
-from .browser_setup import load_browser_login
+from .browser_setup import load_browser_login, prepare_environment_login
 from .config import config
 from .db import init_db
 from .jobs import scheduler
@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI):
         else:
             log.info("Open Mangarr on a trusted network to create the browser login.")
     await init_db()
+    app.state.environment_login = await prepare_environment_login()
     await scheduler.start()
     log.info("Mangarr %s ready on %s:%d", __version__, config.host, config.port)
     yield

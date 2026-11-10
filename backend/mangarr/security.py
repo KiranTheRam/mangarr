@@ -7,7 +7,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from .browser_setup import (
-    SESSION_COOKIE, BrowserLogin, EnvironmentLogin, change_password, load_active_login, same_origin, setup_page,
+    BrowserLogin, EnvironmentLogin, change_password, load_active_login, same_origin, session_cookie_name, setup_page,
     submit_browser_setup, submit_sign_in,
 )
 from .config import config
@@ -54,7 +54,7 @@ async def access_boundary(request: Request, call_next):
     # API keys and browser sessions are independent.
     if is_api and request.headers.get("x-api-key"):
         return await call_next(request)
-    login = load_active_login()
+    login = load_active_login(request)
     signed_in = login is not None and login.has_session(request)
     request.state.browser_session = signed_in
     if is_api:
@@ -96,7 +96,7 @@ async def access_boundary(request: Request, call_next):
             else:
                 response = Response(status_code=204, headers={"Cache-Control": "no-store"})
             if response.status_code == 204:
-                response.delete_cookie(SESSION_COOKIE, path=home, httponly=True, samesite="lax",
+                response.delete_cookie(session_cookie_name(request), path=home, httponly=True, samesite="lax",
                                        secure=request.headers["origin"].startswith("https://"))
             return response
         if needs_setup:

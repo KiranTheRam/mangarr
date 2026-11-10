@@ -312,7 +312,8 @@ boundary during setup. Existing API-key integrations continue to work.
 Use **Settings → Browser Security** to sign out or change an app-managed
 password. A password change requires the current password and signs out all
 browser sessions. API keys continue to work. Browser sessions expire after
-seven days.
+seven days. After upgrading from an older release, sign in again to create a
+session scoped to the instance's address and port.
 
 Mangarr stores the password hash in `browser_login.json` in the data directory.
 If you forget the password, run the local reset command from an interactive
@@ -362,9 +363,8 @@ add every DNS name used by browsers, reverse proxies and integration clients to
 Names match exactly, ignoring case, without a trailing dot; paths, schemes,
 ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
 with configuration instructions; direct IP access remains available for recovery.
-For browser setup, sign-in, and requests that change state, reverse proxies
-must preserve the browser's Host header.
-For other requests, proxies can preserve an allowed Host or set it explicitly.
+Reverse proxies must preserve the browser's Host header for browser traffic.
+For API-key clients, proxies can preserve an allowed Host or set it explicitly.
 Forwarded headers never establish trust. Host validation limits DNS rebinding.
 
 Existing named API keys and `X-Api-Key` clients continue to work independently
