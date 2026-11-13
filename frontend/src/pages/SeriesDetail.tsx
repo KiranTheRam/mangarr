@@ -5,6 +5,8 @@ import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import type {
   Chapter,
+  ComicInfo,
+  LibraryIssue,
   QueueItem,
   Release,
   ScanResult,
@@ -31,6 +33,7 @@ import {
 } from "../components/LibraryTools";
 import { AutomationModal, monitorModeLabel } from "../components/SeriesAutomation";
 import { RelatedTitles } from "../components/RelatedTitles";
+import { SeriesIssues } from "../components/MetadataIssues";
 import { sanitizeDescription } from "../sanitize";
 import { sourceLabel } from "../sources";
 
@@ -513,11 +516,13 @@ function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: 
 
 function ChapterMetadataModal({
   seriesId,
+  seriesTitle,
   chapter,
   onClose,
   onSaved,
 }: {
   seriesId: number;
+  seriesTitle: string;
   chapter: Chapter;
   onClose: () => void;
   onSaved: () => void;
@@ -527,14 +532,53 @@ function ChapterMetadataModal({
   const [titleLocked, setTitleLocked] = useState(chapter.title_locked);
   const [volumeLocked, setVolumeLocked] = useState(chapter.volume_locked);
   const [excluded, setExcluded] = useState(chapter.excluded);
+  const [fileSeries, setFileSeries] = useState("");
+  const [fileNumber, setFileNumber] = useState("");
+  const [fileVolume, setFileVolume] = useState("");
+  const [fileTitle, setFileTitle] = useState("");
+  const [filePageCount, setFilePageCount] = useState("");
+  const [comicInfoDirty, setComicInfoDirty] = useState(false);
+  const canInspectArchive = Boolean(
+    chapter.downloaded && chapter.file_path && /\.(cbz|zip)$/i.test(chapter.file_path),
+  );
+  const comicInfo = useQuery({
+    queryKey: ["comicinfo", seriesId, chapter.id],
+    queryFn: () => api.get<ComicInfo>(`/series/${seriesId}/chapters/${chapter.id}/comicinfo`),
+    enabled: canInspectArchive,
+    retry: false,
+  });
+  useEffect(() => {
+    if (!comicInfo.data || comicInfoDirty) return;
+    setFileSeries(comicInfo.data.series ?? "");
+    setFileNumber(comicInfo.data.number ?? "");
+    setFileVolume(comicInfo.data.volume ?? "");
+    setFileTitle(comicInfo.data.title ?? "");
+    setFilePageCount(comicInfo.data.page_count ?? "");
+  }, [comicInfo.data, comicInfoDirty]);
+  const changeFile = (setter: (value: string) => void) =>
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      setter(event.target.value);
+      setComicInfoDirty(true);
+    };
   const save = useMutation({
-    mutationFn: () => api.put(`/series/${seriesId}/chapters/${chapter.id}/metadata`, {
-      title,
-      volume: volume.trim() === "" ? null : Number(volume),
-      title_locked: titleLocked,
-      volume_locked: volumeLocked,
-      excluded,
-    }),
+    mutationFn: async () => {
+      await api.put(`/series/${seriesId}/chapters/${chapter.id}/metadata`, {
+        title,
+        volume: volume.trim() === "" ? null : Number(volume),
+        title_locked: titleLocked,
+        volume_locked: volumeLocked,
+        excluded,
+      });
+      if (comicInfoDirty && comicInfo.data) {
+        await api.put(`/series/${seriesId}/chapters/${chapter.id}/comicinfo`, {
+          series: fileSeries.trim() || null,
+          number: fileNumber.trim() || null,
+          volume: fileVolume.trim() === "" ? null : Number(fileVolume),
+          title: fileTitle.trim() || null,
+          page_count: filePageCount.trim() === "" ? null : Number(filePageCount),
+        });
+      }
+    },
     onSuccess: () => {
       onSaved();
       onClose();
@@ -542,6 +586,7 @@ function ChapterMetadataModal({
   });
   return (
     <Modal title={`Edit ${chapterLabel(chapter.number, chapter.volume)}`} onClose={onClose}>
+      <div className="metadata-section-title">Mangarr chapter metadata</div>
       <div className="form-row">
         <label>Title</label>
         <input
@@ -598,10 +643,44 @@ function ChapterMetadataModal({
           <span>Keep this volume during future refreshes/resyncs</span>
         </label>
       </div>
+      {canInspectArchive && comicInfo.isLoading && (
+        <p className="form-hint">Reading ComicInfo.xml from the chapter archive…</p>
+      )}
+      {comicInfo.data && (
+        <div className="comicinfo-editor">
+          <div className="metadata-section-title">
+            ComicInfo.xml inside the file
+            <span className={`pill ${comicInfo.data.exists ? "blue" : "gray"}`}>
+              {comicInfo.data.exists ? "Present" : "Not present"}
+            </span>
+          </div>
+          <p className="form-hint">
+            These embedded fields control how Kavita and other comic readers group and label
+            the archive. Leave a field blank to remove it.
+          </p>
+          <div className="comicinfo-fields">
+            <div className="form-row"><label>Series</label><input value={fileSeries} placeholder={seriesTitle} onChange={changeFile(setFileSeries)} /></div>
+            <div className="form-row"><label>Number</label><input value={fileNumber} placeholder={String(chapter.number)} onChange={changeFile(setFileNumber)} /></div>
+            <div className="form-row"><label>Volume</label><input type="number" min="1" value={fileVolume} onChange={changeFile(setFileVolume)} /></div>
+            <div className="form-row"><label>Title</label><input value={fileTitle} onChange={changeFile(setFileTitle)} /></div>
+            <div className="form-row">
+              <label>Page count</label>
+              <input type="number" min="1" value={filePageCount} onChange={changeFile(setFilePageCount)} />
+              <small>{comicInfo.data.actual_page_count} image pages in archive</small>
+            </div>
+          </div>
+          <div className="filepath" title={comicInfo.data.file_path}>{comicInfo.data.file_path}</div>
+        </div>
+      )}
+      {comicInfo.error && (
+        <p className="form-hint">
+          Archive metadata is not editable here: {(comicInfo.error as Error).message}
+        </p>
+      )}
       {save.isError && <div className="error-banner">{(save.error as Error).message}</div>}
       <div className="modal-actions chapter-edit-actions">
         <button className="btn" onClick={onClose}>Cancel</button>
-        <button className="btn primary" disabled={save.isPending || (volume !== "" && Number(volume) < 1)} onClick={() => save.mutate()}>
+        <button className="btn primary" disabled={save.isPending || (volume !== "" && Number(volume) < 1) || (fileVolume !== "" && Number(fileVolume) < 1) || (filePageCount !== "" && Number(filePageCount) < 1)} onClick={() => save.mutate()}>
           {save.isPending ? "Saving…" : "Save"}
         </button>
       </div>
@@ -817,9 +896,18 @@ export default function SeriesDetail() {
     refetchInterval: 2000,
   });
 
+  const { data: seriesIssues = [] } = useQuery({
+    queryKey: ["series-issues", seriesId],
+    queryFn: () => api.get<LibraryIssue[]>(`/issues?ignored=false&series_id=${seriesId}`),
+    enabled: Number.isFinite(seriesId),
+    refetchInterval: 30000,
+  });
+
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["series", seriesId] });
     queryClient.invalidateQueries({ queryKey: ["series"] });
+    queryClient.invalidateQueries({ queryKey: ["series-issues", seriesId] });
+    queryClient.invalidateQueries({ queryKey: ["issues"] });
   };
 
   const toggleMonitor = useMutation({
@@ -1407,6 +1495,8 @@ export default function SeriesDetail() {
 
         <RelatedTitles seriesId={seriesId} />
 
+        <SeriesIssues issues={seriesIssues} onChanged={invalidate} />
+
         {series.chapters.length > 0 && (
           <div className="chapter-selection">
             <span className="selection-count">
@@ -1551,6 +1641,7 @@ export default function SeriesDetail() {
       {editingChapter && (
         <ChapterMetadataModal
           seriesId={seriesId}
+          seriesTitle={series.title}
           chapter={editingChapter}
           onClose={() => setEditingChapter(null)}
           onSaved={invalidate}

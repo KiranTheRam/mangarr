@@ -260,6 +260,63 @@ class ChapterMetadataIn(BaseModel):
     excluded: bool | None = None
 
 
+class ComicInfoOut(BaseModel):
+    file_path: str
+    exists: bool
+    series: str | None
+    number: str | None
+    volume: str | None
+    title: str | None
+    page_count: str | None
+    actual_page_count: int
+
+
+class ComicInfoUpdateIn(BaseModel):
+    series: str | None
+    number: str | None
+    volume: int | None
+    title: str | None
+    page_count: int | None
+
+    @field_validator("series", "number", "title")
+    @classmethod
+    def _trim_optional_text(cls, value):
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        return value or None
+
+    @field_validator("volume", "page_count")
+    @classmethod
+    def _positive_optional_integer(cls, value, info):
+        if value is not None and value < 1:
+            raise ValueError(f"{info.field_name} must be at least 1")
+        return value
+
+
+class LibraryIssueOut(BaseModel):
+    id: int
+    series_id: int
+    series_title: str
+    chapter_id: int | None
+    chapter_number: float | None
+    kind: str
+    file_path: str
+    field: str
+    current_value: str | None
+    suggested_value: str | None
+    title: str
+    detail: str
+    ignored: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class IssueScanOut(BaseModel):
+    active: int
+    ignored: int
+
+
 class MetadataResult(BaseModel):
     provider: str
     provider_id: str

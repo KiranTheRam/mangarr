@@ -2,7 +2,7 @@ import { Icon, type IconName } from "./Icon";
 import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, appVersion } from "../api/client";
-import type { QueueItem } from "../api/types";
+import type { LibraryIssue, QueueItem } from "../api/types";
 import { paletteShortcut } from "./CommandPalette";
 
 const items: { to: string; label: string; icon: IconName }[] = [
@@ -11,6 +11,7 @@ const items: { to: string; label: string; icon: IconName }[] = [
   { to: "/calendar", label: "Calendar", icon: "calendar" },
   { to: "/activity", label: "Activity", icon: "activity" },
   { to: "/wanted", label: "Wanted", icon: "wanted" },
+  { to: "/issues", label: "Issues", icon: "warning" },
   { to: "/settings", label: "Settings", icon: "settings" },
 ];
 
@@ -19,6 +20,11 @@ export default function Sidebar({ onSearch }: { onSearch: () => void }) {
     queryKey: ["queue"],
     queryFn: () => api.get<QueueItem[]>("/queue"),
     refetchInterval: 3000,
+  });
+  const { data: issues } = useQuery({
+    queryKey: ["issues", false],
+    queryFn: () => api.get<LibraryIssue[]>("/issues?ignored=false"),
+    refetchInterval: 30000,
   });
 
   return (
@@ -44,6 +50,9 @@ export default function Sidebar({ onSearch }: { onSearch: () => void }) {
             {item.label}
             {item.to === "/activity" && queue && queue.length > 0 && (
               <span className="nav-badge">{queue.length}</span>
+            )}
+            {item.to === "/issues" && issues && issues.length > 0 && (
+              <span className="nav-badge warning">{issues.length}</span>
             )}
           </NavLink>
         ))}

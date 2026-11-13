@@ -798,6 +798,9 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
         root=Path(series.root_folder.path),
         expect_content=await root_expects_content(session, series),
     )
+    from ..metadata_issues import detect_series_issues
+
+    await detect_series_issues(session, series)
     await session.commit()
 
 

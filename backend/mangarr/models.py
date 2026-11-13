@@ -116,6 +116,9 @@ class Series(Base):
     extra_folders: Mapped[list[SeriesFolder]] = relationship(
         back_populates="series", cascade="all, delete-orphan"
     )
+    issues: Mapped[list[LibraryIssue]] = relationship(
+        back_populates="series", cascade="all, delete-orphan"
+    )
 
 
 class SeriesFolder(Base):
@@ -262,6 +265,39 @@ class HistoryEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     series: Mapped[Series | None] = relationship()
+    chapter: Mapped[Chapter | None] = relationship()
+
+
+class LibraryIssue(Base):
+    """A currently reproducible library metadata problem.
+
+    Detection upserts these rows by ``key`` and deletes them when the file no
+    longer reproduces the problem. Ignoring an issue is therefore durable
+    while the problem exists, without leaving resolved history in the UI.
+    """
+
+    __tablename__ = "library_issues"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
+    chapter_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chapters.id"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String)
+    file_path: Mapped[str] = mapped_column(Text)
+    field: Mapped[str] = mapped_column(String)
+    current_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(String)
+    detail: Mapped[str] = mapped_column(Text)
+    ignored: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    series: Mapped[Series] = relationship(back_populates="issues")
     chapter: Mapped[Chapter | None] = relationship()
 
 

@@ -20,6 +20,7 @@ from ..library.scanner import (
     scan_series,
     series_dir,
 )
+from ..metadata_issues import detect_series_issues
 from ..models import Chapter, RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     CleanupApplyIn,
@@ -161,6 +162,7 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
         )
         if result.root_unavailable:
             raise HTTPException(409, result.root_unavailable)
+        await detect_series_issues(session, series)
         await session.commit()
         return ScanResultOut(
             folder=", ".join(str(f) for f in folders),
