@@ -158,11 +158,12 @@ async def test_other_403s_are_not_retried():
 # globals the real one does and is written as an ES module chunk.
 FAKE_SIGNING_MODULE = """
 var calls = 0;
-globalThis.getProtectionToken = function (path, params) {
+globalThis.vmc_test = {prefix: navigator.appCodeName};
+globalThis.vmc_test.getProtectionToken = function (path, params) {
   calls++;
   var query = Object.keys(params).sort().map(function (k) { return k + '=' + params[k]; });
   var bytes = new TextEncoder().encode(path + '?' + query.join('&'));
-  return navigator.appCodeName + ':' + btoa(String.fromCharCode.apply(null, bytes));
+  return this.prefix + ':' + btoa(String.fromCharCode.apply(null, bytes));
 };
 export{calls as t};
 """
@@ -201,6 +202,22 @@ async def test_signer_finds_and_runs_the_sites_signing_module():
     assert again == "Mozilla:L2NoYXB0ZXJzLzE/"
     # the loaded module is cached between calls
     assert module_route.call_count == 1
+
+
+@respx.mock
+async def test_signer_keeps_supporting_a_global_token_function():
+    respx.get(f"{BASE_URL}/").mock(
+        return_value=httpx.Response(200, text='<script src="/main.js"></script>')
+    )
+    respx.get(f"{BASE_URL}/main.js").mock(
+        return_value=httpx.Response(
+            200,
+            text='globalThis.getProtectionToken = function(path){return "legacy:" + path;};',
+        )
+    )
+    signer = MangaFireSigner(BASE_URL)
+    async with httpx.AsyncClient() as client:
+        assert await signer.sign(client, "/titles", {}) == "legacy:/titles"
 
 
 @respx.mock
