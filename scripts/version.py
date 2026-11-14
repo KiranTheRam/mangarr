@@ -57,16 +57,89 @@ def set_version(root: Path, value: str) -> None:
         path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
+def check_versions(root: Path) -> str:
+    """Verify that backend and frontend version manifests agree with the baseline.
+
+    Catch accidental drift between backend/VERSION and frontend npm packages in the
+    working tree before commits land.
+    """
+    version_path = root / VERSION_FILE
+    if not version_path.is_file():
+        raise ValueError(f"Version baseline file not found: {VERSION_FILE}")
+    try:
+        content = version_path.read_text()
+    except OSError as exc:
+        raise ValueError(f"Cannot read {VERSION_FILE}: {exc}")
+
+    if content.endswith("\r\n"):
+        version = content[:-2]
+    elif content.endswith("\n"):
+        version = content[:-1]
+    else:
+        version = content
+
+    parse_version(version)
+
+    package_path = root / "frontend/package.json"
+    if not package_path.is_file():
+        raise ValueError("Missing file: frontend/package.json")
+    try:
+        package_data = json.loads(package_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Failed to parse frontend/package.json: {exc}")
+    if not isinstance(package_data, dict) or "version" not in package_data:
+        raise ValueError("Missing 'version' key in frontend/package.json")
+
+    lock_path = root / "frontend/package-lock.json"
+    if not lock_path.is_file():
+        raise ValueError("Missing file: frontend/package-lock.json")
+    try:
+        lock_data = json.loads(lock_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Failed to parse frontend/package-lock.json: {exc}")
+    if not isinstance(lock_data, dict) or "version" not in lock_data:
+        raise ValueError("Missing top-level 'version' key in frontend/package-lock.json")
+    packages = lock_data.get("packages")
+    if not isinstance(packages, dict) or "" not in packages:
+        raise ValueError("Missing packages[''] entry in frontend/package-lock.json")
+    if not isinstance(packages[""], dict) or "version" not in packages[""]:
+        raise ValueError("Missing 'version' key in frontend/package-lock.json packages['']")
+
+    pkg_version = package_data["version"]
+    lock_version = lock_data["version"]
+    lock_pkg_version = packages[""]["version"]
+
+    discrepancies = []
+    if pkg_version != version:
+        discrepancies.append(f"frontend/package.json version is {pkg_version!r}")
+    if lock_version != version:
+        discrepancies.append(f"frontend/package-lock.json top-level version is {lock_version!r}")
+    if lock_pkg_version != version:
+        discrepancies.append(f"frontend/package-lock.json packages[\"\"].version is {lock_pkg_version!r}")
+
+    if discrepancies:
+        drift = ", ".join(discrepancies)
+        raise ValueError(
+            f"Version mismatch (expected {version!r} from {VERSION_FILE}): {drift}. "
+            f"Run 'python3 scripts/version.py set {version}' to fix."
+        )
+
+    return version
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("check", help="Verify backend and frontend version manifests agree.")
     show = commands.add_parser("show", help="Print the build version for a committed revision.")
     show.add_argument("--revision", default="HEAD")
     set_command = commands.add_parser("set", help="Set a manual version baseline; commit the resulting files.")
     set_command.add_argument("version")
     args = parser.parse_args()
     try:
-        if args.command == "set":
+        if args.command == "check":
+            print(check_versions(ROOT))
+        elif args.command == "set":
             set_version(ROOT, args.version)
             print(args.version)
         else:
