@@ -262,7 +262,7 @@ commit count determines the patch increment.
 
 ## Backend dependency lock
 
-`backend/requirements.txt` is the pinned dependency lock file for the backend.
+`backend/requirements.txt` is the pinned dependency lock file for the backend, which also pins the build backend.
 The Docker image installs only from this lock file with hashes to ensure reproducible
 builds. Local and development installs (`pip install -e '.[dev]'`) and CI continue
 to resolve dependencies directly from the ranges in `pyproject.toml`.

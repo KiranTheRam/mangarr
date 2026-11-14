@@ -99,7 +99,15 @@ def test_dependency_lock():
             f"Distribution '{dist_name}' from project.dependencies is not pinned in {lock_path.name}"
         )
 
-    # 4. Dev-only dependencies are not required and not in the lock
+    # 4. Every [build-system].requires entry has a pinned name==version in the lock
+    build_deps = pyproject.get("build-system", {}).get("requires", [])
+    for dep in build_deps:
+        dist_name = extract_distribution_name(dep)
+        assert dist_name in locked_packages, (
+            f"Distribution '{dist_name}' from build-system.requires is not pinned in {lock_path.name}"
+        )
+
+    # 5. Dev-only dependencies are not required and not in the lock
     dev_deps = pyproject.get("project", {}).get("optional-dependencies", {}).get("dev", [])
     for dev_dep in dev_deps:
         dev_name = extract_distribution_name(dev_dep)

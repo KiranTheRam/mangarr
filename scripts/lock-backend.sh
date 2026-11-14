@@ -22,7 +22,7 @@ if "${CONTAINER}" run --rm \
         cp -a /src /tmp/backend
         cd /tmp/backend
         pip install --quiet --no-warn-script-location pip-tools==7.6.2 >&2
-        python -m piptools compile --quiet --generate-hashes --strip-extras --allow-unsafe --output-file requirements.txt pyproject.toml
+        python -m piptools compile --quiet --generate-hashes --strip-extras --allow-unsafe --all-build-deps --output-file requirements.txt pyproject.toml
         cat requirements.txt
     ' > "${TMP_FILE}" && [ -s "${TMP_FILE}" ]; then
     chmod 0644 "${TMP_FILE}"
