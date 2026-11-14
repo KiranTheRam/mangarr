@@ -98,3 +98,63 @@ def test_shallow_history_fails_instead_of_reusing_a_version(repo, tmp_path):
     subprocess.run(["git", "clone", "--quiet", "--depth=1", repo.as_uri(), str(shallow)], check=True)
     with pytest.raises(ValueError, match="full Git history"):
         app_version.build_version(shallow)
+
+
+def test_check_versions_passes_on_fixture(repo):
+    assert app_version.check_versions(repo) == "0.1.1"
+
+
+def test_check_versions_fails_on_package_json_version_drift(repo):
+    path = repo / "frontend/package.json"
+    manifest = json.loads(path.read_text())
+    manifest["version"] = "0.9.9"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=r"frontend/package\.json version") as exc_info:
+        app_version.check_versions(repo)
+    assert "0.9.9" in str(exc_info.value)
+    assert "python3 scripts/version.py set 0.1.1" in str(exc_info.value)
+
+
+def test_check_versions_fails_on_lock_top_level_version_drift(repo):
+    path = repo / "frontend/package-lock.json"
+    manifest = json.loads(path.read_text())
+    manifest["version"] = "0.9.9"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=r"frontend/package-lock\.json top-level version") as exc_info:
+        app_version.check_versions(repo)
+    assert "0.9.9" in str(exc_info.value)
+    assert "python3 scripts/version.py set 0.1.1" in str(exc_info.value)
+
+
+def test_check_versions_fails_on_lock_packages_version_drift(repo):
+    path = repo / "frontend/package-lock.json"
+    manifest = json.loads(path.read_text())
+    manifest["packages"][""]["version"] = "0.9.9"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=r'frontend/package-lock\.json packages\[""\]\.version') as exc_info:
+        app_version.check_versions(repo)
+    assert "0.9.9" in str(exc_info.value)
+    assert "python3 scripts/version.py set 0.1.1" in str(exc_info.value)
+
+
+def test_check_versions_fails_cleanly_for_invalid_baseline(repo):
+    (repo / "backend/VERSION").write_text("invalid\n")
+    with pytest.raises(ValueError, match="MAJOR.MINOR.PATCH"):
+        app_version.check_versions(repo)
+
+
+def test_check_versions_fails_cleanly_for_missing_package_json(repo):
+    (repo / "frontend/package.json").unlink()
+    with pytest.raises(ValueError, match="frontend/package.json"):
+        app_version.check_versions(repo)
+
+
+def test_check_versions_returns_updated_version_after_set(repo):
+    app_version.set_version(repo, "2.0.0")
+    assert app_version.check_versions(repo) == "2.0.0"
+
+
+def test_check_versions_real_repository_is_consistent():
+    repo_root = Path(__file__).resolve().parents[2]
+    expected = (repo_root / "backend/VERSION").read_text().strip()
+    assert app_version.check_versions(repo_root) == expected
