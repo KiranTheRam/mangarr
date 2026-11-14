@@ -260,6 +260,10 @@ Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
 CI checks out the complete history. Avoid rewriting `main` history, since the
 commit count determines the patch increment.
 
+The Dockerfile pins `node:22-alpine` and `python:3.12-slim` by digest so rebuilds
+are reproducible; to update, run `docker buildx imagetools inspect <image:tag>`
+and replace the `@sha256:` value.
+
 ## Configuration
 
 Environment variables (all optional):
