@@ -260,6 +260,8 @@ Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
 CI checks out the complete history. Avoid rewriting `main` history, since the
 commit count determines the patch increment.
 
+Dependabot opens weekly update PRs for backend, frontend, Docker base images and GitHub Actions; they are merged by hand after review and CI.
+
 ## Configuration
 
 Environment variables (all optional):
