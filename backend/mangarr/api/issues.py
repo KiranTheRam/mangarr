@@ -17,7 +17,7 @@ from ..db import get_session
 from ..jobs.tasks import series_lock
 from ..metadata_issues import (
     ArchiveIneligible, chapter_paths, current_candidates, detect_series_issues,
-    inspect_chapter_archive, manual_archive_lock, reconcile_candidates,
+    inspect_chapter_archive, load_archive_ownership, manual_archive_lock, reconcile_candidates,
 )
 from ..models import Chapter, LibraryIssue, Series
 from ..schemas import (
@@ -161,12 +161,13 @@ async def list_issues(
 @router.post("/issues/scan", response_model=IssueScanOut)
 async def scan_issues(session: AsyncSession = Depends(get_session)):
     series_ids = list((await session.scalars(select(Series.id))).all())
+    ownership = await load_archive_ownership(session)
     await session.commit()
     for series_id in series_ids:
         async with series_lock(series_id):
             series = await _series(session, series_id)
             if series is not None:
-                await detect_series_issues(session, series)
+                await detect_series_issues(session, series, ownership)
             await session.commit()
     counts = dict((await session.execute(
         select(LibraryIssue.ignored, func.count(LibraryIssue.id)).group_by(LibraryIssue.ignored)

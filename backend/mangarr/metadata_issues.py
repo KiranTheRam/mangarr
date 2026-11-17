@@ -86,6 +86,10 @@ async def chapter_paths(session: AsyncSession) -> list[tuple[int, str]]:
     return [(chapter_id, path) for chapter_id, path in rows]
 
 
+async def load_archive_ownership(session: AsyncSession) -> ArchiveOwnership:
+    return await asyncio.to_thread(ArchiveOwnership, await chapter_paths(session))
+
+
 def _archive_folders(series: Series) -> list[Path]:
     if series.root_folder is None:
         return []
@@ -113,7 +117,10 @@ def _inspect_chapter_archive(
     file_stat = path.stat()
     if not stat.S_ISREG(file_stat.st_mode):
         raise ArchiveIneligible("Chapter archive must be a regular file")
-    if ownership.owners.get((file_stat.st_dev, file_stat.st_ino)) != {chapter.id}:
+    owners = ownership.owners.get((file_stat.st_dev, file_stat.st_ino), set())
+    if chapter.id not in owners:
+        raise ArchiveChanged("The chapter archive or its mapping changed; scan again")
+    if len(owners) != 1:
         raise ArchiveIneligible("This archive has shared or uncertain chapter ownership")
 
     titles = {normalize_title(title) for title in metadata_titles(series)}
@@ -141,7 +148,7 @@ def inspect_chapter_archive(
 
 
 def find_candidates(
-    series: Series, paths: list[tuple[int, str]], expect_content: bool = True
+    series: Series, ownership: ArchiveOwnership, expect_content: bool = True
 ) -> list[Candidate] | None:
     """Return None when an unavailable archive prevents a trustworthy scan."""
     if series.root_folder is None:
@@ -151,7 +158,6 @@ def find_candidates(
     files: list[tuple[Chapter, Path, ComicInfoMetadata]] = []
     try:
         folders = _archive_folders(series)
-        ownership = ArchiveOwnership(paths)
         for chapter in series.chapters:
             if chapter.excluded or not chapter.downloaded or not chapter.file_path:
                 continue
@@ -174,7 +180,7 @@ def find_candidates(
         return None
 
     candidates: list[Candidate] = []
-    claimed: set[tuple[str, str]] = set()
+    uncertain_volume_sources = {"", "legacy", "disk-inferred", "comicinfo"}
     valid_titles = {normalized for value in metadata_titles(series) if (normalized := normalize_title(value))}
 
     for chapter, path, info in files:
@@ -194,7 +200,6 @@ def find_candidates(
                 "Readers may sort or label this file incorrectly.",
                 info.revision,
             ))
-            claimed.add((str(path), "number"))
 
         if info.page_count is not None:
             page_count = _numeric(info.page_count)
@@ -207,7 +212,6 @@ def find_candidates(
                     f"{info.actual_page_count} image pages.",
                     info.revision,
                 ))
-                claimed.add((str(path), "page_count"))
 
         if info.series and valid_titles and normalize_title(info.series) not in valid_titles:
             candidates.append(Candidate(
@@ -218,11 +222,10 @@ def find_candidates(
                 "series name is not one of Mangarr's known titles.",
                 info.revision,
             ))
-            claimed.add((str(path), "series"))
 
         if info.volume is not None:
             volume = _numeric(info.volume)
-            reliable = chapter.volume_source not in {"", "legacy", "disk-inferred", "comicinfo"}
+            reliable = chapter.volume_source not in uncertain_volume_sources
             if volume is None or not volume.is_integer():
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_invalid", str(path), "volume",
@@ -232,7 +235,6 @@ def find_candidates(
                     "tag keeps the chapter available without inventing a volume.",
                     info.revision,
                 ))
-                claimed.add((str(path), "volume"))
             elif chapter.volume is None:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_unexpected", str(path), "volume",
@@ -242,7 +244,6 @@ def find_candidates(
                     "makes readers create one. The recommended change removes only the tag.",
                     info.revision,
                 ))
-                claimed.add((str(path), "volume"))
             elif reliable and int(volume) != chapter.volume:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_mismatch", str(path), "volume",
@@ -252,7 +253,6 @@ def find_candidates(
                     f"places chapter {chapter.number:g} in Volume {chapter.volume}.",
                     info.revision,
                 ))
-                claimed.add((str(path), "volume"))
 
     # A single loose-chapter archive declaring a volume is especially risky:
     # Kavita creates that volume even if every sibling file is untagged. This
@@ -263,11 +263,15 @@ def find_candidates(
         if item[0].volume is not None:
             by_volume.setdefault(item[0].volume, []).append(item)
     for volume, peers in by_volume.items():
-        declared = [item for item in peers if _numeric(item[2].volume) == float(volume)]
+        declared = [item for item in peers if item[2].volume is not None]
         if len(peers) < 2 or len(declared) != 1:
             continue
         chapter, path, info = declared[0]
-        if (str(path), "volume") in claimed:
+        if (
+            _numeric(info.volume) != volume
+            or chapter.volume_locked
+            or chapter.volume_source not in uncertain_volume_sources
+        ):
             continue
         untagged = len(peers) - 1
         candidates.append(Candidate(
@@ -284,7 +288,9 @@ def find_candidates(
     return candidates
 
 
-async def current_candidates(session: AsyncSession, series: Series) -> list[Candidate] | None:
+async def current_candidates(
+    session: AsyncSession, series: Series, ownership: ArchiveOwnership | None = None,
+) -> list[Candidate] | None:
     # A scan can infer new chapter rows immediately before detection; assign
     # their ids so issues link to remediation on the first pass.
     from .jobs.tasks import root_expects_content
@@ -296,13 +302,16 @@ async def current_candidates(session: AsyncSession, series: Series) -> list[Cand
     if series.root_folder is None:
         return None
     expect_content = await root_expects_content(session, series)
-    paths = await chapter_paths(session)
-    return await asyncio.to_thread(find_candidates, series, paths, expect_content)
+    if ownership is None:
+        ownership = await load_archive_ownership(session)
+    return await asyncio.to_thread(find_candidates, series, ownership, expect_content)
 
 
-async def detect_series_issues(session: AsyncSession, series: Series) -> list[LibraryIssue]:
+async def detect_series_issues(
+    session: AsyncSession, series: Series, ownership: ArchiveOwnership | None = None,
+) -> list[LibraryIssue]:
     """Reconcile under the caller's series lock, held through the commit."""
-    candidates = await current_candidates(session, series)
+    candidates = await current_candidates(session, series, ownership)
     if candidates is None:
         return []
     return await reconcile_candidates(session, series.id, candidates)

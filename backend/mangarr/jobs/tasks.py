@@ -783,14 +783,16 @@ async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> i
     return missing
 
 
-async def scan_series_folder(session: AsyncSession, series: Series) -> None:
+async def scan_series_folder(
+    session: AsyncSession, series: Series, *, scan_issues: bool = True,
+) -> bool:
     """Adopt existing library folders for the series and mark chapters that are
     already on disk as owned (so they aren't re-downloaded)."""
     from ..library.scanner import resolve_volume_offsets, scan_series
 
     folders = _series_folders(series)
     if not folders:
-        return
+        return False
     offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
     result = scan_series(
         series, [chapter for chapter in series.chapters if not chapter.excluded],
@@ -800,9 +802,10 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     )
     from ..metadata_issues import detect_series_issues
 
-    if not result.root_unavailable:
+    if scan_issues and not result.root_unavailable:
         await detect_series_issues(session, series)
     await session.commit()
+    return not result.root_unavailable
 
 
 # series ids with a full refresh in flight, so the UI can show what's
@@ -896,16 +899,35 @@ async def refresh_series_full(
 
 async def scan_all_series() -> None:
     """Scan every series' folder to adopt on-disk files (background job)."""
+    from ..metadata_issues import detect_series_issues, load_archive_ownership
+
     async with session_scope() as session:
         series_ids = [row[0] for row in (await session.execute(select(Series.id))).all()]
+    scanned_ids = []
     for series_id in series_ids:
         async with series_lock(series_id), session_scope() as session:
             series = await _load_series(session, series_id)
             if series is not None:
                 try:
-                    await scan_series_folder(session, series)
+                    if await scan_series_folder(session, series, scan_issues=False):
+                        scanned_ids.append(series_id)
                 except Exception as exc:
                     log.warning("library scan failed for series %d: %s", series_id, exc)
+    if not scanned_ids:
+        return
+    # Build the index after adoption so newly mapped chapters, including
+    # shared archives across series, are visible in this pass.
+    async with session_scope() as session:
+        ownership = await load_archive_ownership(session)
+    for series_id in scanned_ids:
+        async with series_lock(series_id), session_scope() as session:
+            try:
+                series = await _load_series(session, series_id)
+                if series is not None:
+                    await detect_series_issues(session, series, ownership)
+                    await session.commit()
+            except Exception as exc:
+                log.warning("metadata scan failed for series %d: %s", series_id, exc)
 
 
 def _notify_kavita(values: dict[str, str], series: Series) -> None:

@@ -228,11 +228,15 @@ def update_comicinfo(
                                     raise ComicInfoError("ZIP member is shorter than its declared size")
                     if member is None:
                         target.writestr("ComicInfo.xml", payload, compress_type=zipfile.ZIP_DEFLATED)
-                os.chmod(temp_path, stat.S_IMODE(source_stat.st_mode))
                 # Adding a metadata entry can push a ZIP directory past the
                 # reader's limit even when its expanded content still fits.
                 with _archive_reader(temp_path, check_suffix=False) as completed, zipfile.ZipFile(completed):
-                    pass
+                    fd = completed.fileno()
+                    temp_stat = os.fstat(fd)
+                    if (temp_stat.st_uid, temp_stat.st_gid) != (source_stat.st_uid, source_stat.st_gid):
+                        os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
+                    # chown can clear mode bits, so restore the mode afterward.
+                    os.fchmod(fd, stat.S_IMODE(source_stat.st_mode))
                 # Renaming changes the inode, so a second writer holding the old
                 # revision can never replace this result after its copy finishes.
                 result = _metadata(validated, pages, _revision(temp_path.stat()))

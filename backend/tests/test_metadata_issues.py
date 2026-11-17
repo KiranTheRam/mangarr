@@ -19,7 +19,7 @@ from mangarr.jobs import tasks
 from mangarr.schemas import (
     ChapterMetadataIn, ComicInfoUpdateIn, FileMapIn, FileMapRangeIn, IssueResolveIn,
 )
-from mangarr.metadata_issues import detect_series_issues, find_candidates
+from mangarr.metadata_issues import ArchiveOwnership, detect_series_issues, find_candidates
 from mangarr.models import Base, Chapter, LibraryIssue, RootFolder, Series
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
@@ -59,7 +59,41 @@ def test_comicinfo_editor_preserves_pages_and_unknown_metadata(tmp_path):
         assert b"<Writer>Someone</Writer>" in zf.read("ComicInfo.xml")
 
 
-def test_detects_isolated_volume_tag_and_recommends_removing_it(tmp_path):
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires changing file owner")
+def test_comicinfo_update_preserves_file_owner_and_aborts_on_chown_failure(tmp_path, monkeypatch):
+    path = tmp_path / "chapter.cbz"
+    archive(path, "<ComicInfo><Number>2</Number></ComicInfo>")
+    os.chown(path, 1234, 2345)
+    os.chmod(path, 0o640)
+    update_comicinfo(path, {"number": 1})
+    file_stat = path.stat()
+    assert (file_stat.st_uid, file_stat.st_gid, file_stat.st_mode & 0o777) == (1234, 2345, 0o640)
+
+    def denied(*_args):
+        raise PermissionError("cannot preserve archive ownership")
+
+    before = path.read_bytes()
+    monkeypatch.setattr(os, "fchown", denied)
+    with pytest.raises(ComicInfoError, match="cannot preserve archive ownership"):
+        update_comicinfo(path, {"number": 3})
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize(
+    "source, locked, peer_tag, expect_removal",
+    [
+        ("disk-inferred", False, None, True),
+        ("disk-inferred", False, "9", False),
+        ("disk-inferred", False, "invalid", False),
+        ("disk-inferred", True, None, False),
+        ("manual", False, None, False),
+        ("manual", False, "9", False),
+    ],
+)
+def test_isolated_volume_requires_an_untrusted_tag_and_untagged_peers(
+    tmp_path, source, locked, peer_tag, expect_removal,
+):
     tagged = tmp_path / "Kagurabachi - Ch. 0092.1.cbz"
     plain = tmp_path / "Kagurabachi - Ch. 0092.cbz"
     archive(
@@ -67,21 +101,28 @@ def test_detects_isolated_volume_tag_and_recommends_removing_it(tmp_path):
         "<ComicInfo><Series>Kagurabachi</Series><Number>92.1</Number>"
         "<Volume>10</Volume><PageCount>1</PageCount></ComicInfo>",
     )
-    archive(plain, None)
+    archive(plain, None if peer_tag is None else f"<ComicInfo><Volume>{peer_tag}</Volume></ComicInfo>")
     series = Series(id=1, title="Kagurabachi", provider_title="Kagurabachi", alt_titles="")
     series.chapters = [
-        Chapter(id=1, number=92.0, volume=10, downloaded=True, file_path=str(plain)),
+        Chapter(id=1, number=92.0, volume=10, volume_source="manual", downloaded=True, file_path=str(plain)),
         Chapter(
-            id=2, number=92.1, volume=10, volume_source="disk-inferred",
+            id=2, number=92.1, volume=10, volume_source=source, volume_locked=locked,
             downloaded=True, file_path=str(tagged),
         ),
     ]
 
     series.root_folder = RootFolder(path=str(tmp_path.parent))
     series.folder_name = tmp_path.name
-    issues = find_candidates(series, [(ch.id, ch.file_path) for ch in series.chapters])
+    ownership = ArchiveOwnership([(ch.id, ch.file_path) for ch in series.chapters])
+    issues = find_candidates(series, ownership)
 
-    issue = next(item for item in issues if item.field == "volume")
+    if peer_tag == "9":
+        assert any(item.kind == "comicinfo_volume_mismatch" and item.suggested_value == "10" for item in issues)
+    isolated = [item for item in issues if item.kind == "comicinfo_volume_isolated"]
+    assert len(isolated) == int(expect_removal)
+    if not expect_removal:
+        return
+    [issue] = isolated
     assert issue.kind == "comicinfo_volume_isolated"
     assert issue.current_value == "10" and issue.suggested_value is None
     assert "Kavita" in issue.detail
@@ -103,7 +144,7 @@ def test_detects_wrong_number_page_count_and_authoritative_volume(tmp_path):
 
     series.root_folder = RootFolder(path=str(tmp_path.parent))
     series.folder_name = tmp_path.name
-    issues = {item.field: item for item in find_candidates(series, [(3, str(path))])}
+    issues = {item.field: item for item in find_candidates(series, ArchiveOwnership([(3, str(path))]))}
 
     assert issues["number"].suggested_value == "3"
     assert issues["page_count"].suggested_value == "2"
@@ -499,6 +540,56 @@ async def test_shared_archive_ownership_blocks_detection_and_editing(repair_db, 
         await issues_api.get_chapter_comicinfo(series.id, series.chapters[0].id, session)
     assert exc.value.status_code == 400
     assert "shared" in exc.value.detail
+
+
+@pytest.mark.parametrize("adopt_files", [False, True])
+async def test_bulk_scans_build_one_ownership_index(repair_db, monkeypatch, adopt_files):
+    session, _, series, path = repair_db
+    other_folder = path.parent.with_name("Other")
+    other_folder.mkdir()
+    other_path = other_folder / "Other Ch. 1.cbz"
+    archive(other_path, "<ComicInfo><Number>2</Number></ComicInfo>")
+    session.add(Series(
+        title="Other", folder_name="Other", root_folder=series.root_folder,
+        chapters=[Chapter(
+            number=1, downloaded=not adopt_files, file_path="" if adopt_files else str(other_path),
+        )],
+    ))
+    await session.commit()
+
+    snapshots = []
+    original = metadata_issues.chapter_paths
+
+    async def record_paths(session):
+        rows = await original(session)
+        snapshots.append({path for _, path in rows})
+        return rows
+
+    monkeypatch.setattr(metadata_issues, "chapter_paths", record_paths)
+    if adopt_files:
+        await tasks.scan_all_series()
+    else:
+        await issues_api.scan_issues(session)
+    assert snapshots == [{str(path), str(other_path)}]
+    assert {issue.file_path for issue in await session.scalars(select(LibraryIssue))} == snapshots[0]
+
+
+async def test_repair_rechecks_ownership_after_a_bulk_scan(repair_db):
+    session, _, series, path = repair_db
+    await issues_api.scan_issues(session)
+    issue = (await session.scalars(select(LibraryIssue))).one()
+    alias = path.with_name("Shared.cbz")
+    os.link(path, alias)
+    session.add(Series(
+        title="Other", folder_name="Tracked", root_folder=series.root_folder,
+        chapters=[Chapter(number=1, downloaded=True, file_path=str(alias))],
+    ))
+    await session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await issues_api.resolve_issue(issue.public_id, IssueResolveIn(revision=issue.revision), session)
+    assert exc.value.status_code == 409
+    assert read_comicinfo(path).volume == "9"
 
 
 async def test_outside_symlink_is_never_opened_for_detection_or_editing(repair_db, monkeypatch):
