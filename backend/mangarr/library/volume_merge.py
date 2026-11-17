@@ -9,34 +9,22 @@ for the cleanup tool, never chapters without a file."""
 import json
 import logging
 import zipfile
-from io import BufferedReader
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from ..download.cbz import build_comicinfo
 from ..util import NEW_FILE_MODE, natural_key
 from .matcher import IMAGE_EXTS, PAGE_PROVENANCE_NAME, read_archive_source_page_signature
+from .zip_limits import (
+    BoundedZipReader, COPY_CHUNK_BYTES, MAX_EXPANDED_BYTES, MAX_MEMBER_BYTES,
+    MAX_ZIP_DIRECTORY_BYTES, MAX_ZIP_ENTRIES, SAFE_ZIP_COMPRESSION,
+)
 
 log = logging.getLogger(__name__)
 
 MAX_MERGE_PAGES = 10_000
-MAX_MERGE_PAGE_BYTES = 32 * 1024 * 1024
-MAX_MERGE_BYTES = 2 * 1024 * 1024 * 1024
-MAX_ZIP_DIRECTORY_BYTES = 4 * 1024 * 1024
-MAX_ZIP_ENTRIES = 12_000
-COPY_CHUNK_BYTES = 64 * 1024
-
-
-class _MergeArchiveReader(BufferedReader):
-    def read(self, size: int = -1) -> bytes:
-        # ZipFile loads the central directory in one read, before it exposes
-        # entry counts. Bound that allocation as well as streamed page reads.
-        if size > MAX_ZIP_DIRECTORY_BYTES:
-            raise ValueError("chapter ZIP directory exceeds the size limit")
-        data = super().read(MAX_ZIP_DIRECTORY_BYTES + 1 if size < 0 else size)
-        if len(data) > MAX_ZIP_DIRECTORY_BYTES:
-            raise ValueError("chapter ZIP directory exceeds the size limit")
-        return data
+MAX_MERGE_PAGE_BYTES = MAX_MEMBER_BYTES
+MAX_MERGE_BYTES = MAX_EXPANDED_BYTES
 
 
 def _page_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
@@ -78,7 +66,7 @@ def merge_chapter_archives(
         provenance_valid = True
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as out:
             for index, (_number, path) in enumerate(ordered, start=1):
-                with _MergeArchiveReader(path.open("rb", buffering=0)) as handle, zipfile.ZipFile(handle) as archive:
+                with BoundedZipReader(path.open("rb", buffering=0), MAX_ZIP_DIRECTORY_BYTES) as handle, zipfile.ZipFile(handle) as archive:
                     if len(archive.infolist()) > MAX_ZIP_ENTRIES:
                         raise ValueError("chapter ZIP exceeds the entry count limit")
                     members = _page_members(archive)
@@ -97,7 +85,7 @@ def merge_chapter_archives(
                     for page, info in enumerate(members, start=1):
                         # BZIP2 and LZMA can expand a large block inside
                         # ZipExtFile before returning a bounded read.
-                        if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                        if info.compress_type not in SAFE_ZIP_COMPRESSION:
                             raise ValueError(f"unsupported page compression in {path}")
                         if info.file_size > MAX_MERGE_PAGE_BYTES or expanded_bytes + info.file_size > MAX_MERGE_BYTES:
                             raise ValueError("volume merge exceeds the expanded size limit")

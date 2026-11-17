@@ -44,6 +44,7 @@ export interface Chapter {
 
 export interface ComicInfo {
   file_path: string;
+  revision: string;
   exists: boolean;
   series: string | null;
   number: string | null;
@@ -54,7 +55,8 @@ export interface ComicInfo {
 }
 
 export interface LibraryIssue {
-  id: number;
+  id: string;
+  revision: string;
   series_id: number;
   series_title: string;
   chapter_id: number | null;

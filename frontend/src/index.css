@@ -2792,6 +2792,7 @@ select:not([multiple])[size="1"] {
 .series-issues-header p { margin: 2px 0 0; color: var(--text-dim); font-size: 13px; }
 .series-issues .issue-card { border-width: 1px 0 0; border-radius: 0; }
 .metadata-section-title { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; font-weight: 650; }
+.chapter-metadata-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
 .comicinfo-editor { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
 .comicinfo-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
 .comicinfo-fields .form-row { display: grid; grid-template-columns: 86px minmax(0, 1fr); }

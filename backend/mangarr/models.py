@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -10,6 +11,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -277,8 +279,11 @@ class LibraryIssue(Base):
     """
 
     __tablename__ = "library_issues"
+    __table_args__ = (Index("ux_library_issues_public_id", "public_id", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String, default=lambda: uuid4().hex)
+    revision: Mapped[str] = mapped_column(String, default="")
     key: Mapped[str] = mapped_column(String, unique=True, index=True)
     series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
     chapter_id: Mapped[int | None] = mapped_column(

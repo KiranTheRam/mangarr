@@ -27,6 +27,7 @@ from ..jobs.tasks import (
     acquire_series_lock,
     merge_complete_volumes,
     refresh_series_full,
+    series_lock,
     try_acquire_series_lock,
 )
 from ..library.move import MoveError, anchor_extra_folders, move_series_folder
@@ -526,25 +527,26 @@ async def update_chapter_metadata(
     body: ChapterMetadataIn,
     session: AsyncSession = Depends(get_session),
 ):
-    chapter = await session.get(Chapter, chapter_id)
-    if chapter is None or chapter.series_id != series_id:
-        raise HTTPException(404, "Chapter not found")
-    # only an actual edit becomes "manual" provenance; saving an unchanged
-    # value (e.g. locking a wikipedia title in place) keeps its real source
-    title = body.title.strip()
-    if title != chapter.title:
-        chapter.title = title
-        chapter.title_source = "manual" if title else ""
-    if body.volume != chapter.volume:
-        chapter.volume = body.volume
-        chapter.volume_source = "manual" if body.volume is not None else ""
-    chapter.title_locked = body.title_locked
-    chapter.volume_locked = body.volume_locked
-    if body.excluded is not None:
-        chapter.excluded = body.excluded
-    await session.commit()
-    await session.refresh(chapter)
-    return chapter
+    async with series_lock(series_id):
+        chapter = await session.get(Chapter, chapter_id)
+        if chapter is None or chapter.series_id != series_id:
+            raise HTTPException(404, "Chapter not found")
+        # Only an actual edit changes provenance. Locking an unchanged value
+        # keeps its source.
+        title = body.title.strip()
+        if title != chapter.title:
+            chapter.title = title
+            chapter.title_source = "manual" if title else ""
+        if body.volume != chapter.volume:
+            chapter.volume = body.volume
+            chapter.volume_source = "manual" if body.volume is not None else ""
+        chapter.title_locked = body.title_locked
+        chapter.volume_locked = body.volume_locked
+        if body.excluded is not None:
+            chapter.excluded = body.excluded
+        await session.commit()
+        await session.refresh(chapter)
+        return chapter
 
 
 @router.get("/{series_id}/groups", response_model=list[SeriesGroupOut])

@@ -339,9 +339,10 @@ def find_series_media_files(
         if not folder.exists():
             continue
         try:
-            key = str(folder.resolve(strict=False))
-        except OSError:
-            key = str(folder.absolute())
+            resolved_folder = folder.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        key = str(resolved_folder)
         scoped = key in offsets
         offset = offsets.get(key, 0)
         for media in find_media_files(folder):
@@ -364,10 +365,11 @@ def find_series_media_files(
                     continue
                 media = replace(media, coverage=replace(media.coverage, volume=local))
             try:
-                media_key = str(media.path.resolve(strict=False))
-            except OSError:
-                media_key = str(media.path.absolute())
-            found.setdefault(media_key, media)
+                resolved_media = media.path.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if resolved_media.is_relative_to(resolved_folder):
+                found.setdefault(str(resolved_media), media)
     return list(found.values())
 
 

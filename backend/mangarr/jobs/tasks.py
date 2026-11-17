@@ -792,7 +792,7 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     if not folders:
         return
     offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
-    scan_series(
+    result = scan_series(
         series, [chapter for chapter in series.chapters if not chapter.excluded],
         folders, offsets,
         root=Path(series.root_folder.path),
@@ -800,7 +800,8 @@ async def scan_series_folder(session: AsyncSession, series: Series) -> None:
     )
     from ..metadata_issues import detect_series_issues
 
-    await detect_series_issues(session, series)
+    if not result.root_unavailable:
+        await detect_series_issues(session, series)
     await session.commit()
 
 
@@ -812,7 +813,7 @@ REFRESHING: set[int] = set()
 _SERIES_LOCKS: dict[int, asyncio.Lock] = {}
 
 
-def _series_lock(series_id: int) -> asyncio.Lock:
+def series_lock(series_id: int) -> asyncio.Lock:
     lock = _SERIES_LOCKS.get(series_id)
     if lock is None:
         lock = asyncio.Lock()
@@ -821,13 +822,13 @@ def _series_lock(series_id: int) -> asyncio.Lock:
 
 
 async def acquire_series_lock(series_id: int) -> asyncio.Lock:
-    lock = _series_lock(series_id)
+    lock = series_lock(series_id)
     await lock.acquire()
     return lock
 
 
 async def try_acquire_series_lock(series_id: int) -> asyncio.Lock | None:
-    lock = _series_lock(series_id)
+    lock = series_lock(series_id)
     if lock.locked():
         return None
     await lock.acquire()
@@ -898,7 +899,7 @@ async def scan_all_series() -> None:
     async with session_scope() as session:
         series_ids = [row[0] for row in (await session.execute(select(Series.id))).all()]
     for series_id in series_ids:
-        async with session_scope() as session:
+        async with series_lock(series_id), session_scope() as session:
             series = await _load_series(session, series_id)
             if series is not None:
                 try:

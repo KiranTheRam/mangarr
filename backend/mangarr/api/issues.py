@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from starlette.concurrency import run_in_threadpool
 
 from .. import settings_service
-from ..comicinfo import ComicInfoError, read_comicinfo, update_comicinfo
+from ..comicinfo import ArchiveChanged, ComicInfoError, ComicInfoMetadata, update_comicinfo
 from ..db import get_session
-from ..library.scanner import resolve_folders
-from ..metadata_issues import detect_series_issues
+from ..jobs.tasks import series_lock
+from ..metadata_issues import (
+    ArchiveIneligible, chapter_paths, current_candidates, detect_series_issues,
+    inspect_chapter_archive, reconcile_candidates,
+)
 from ..models import Chapter, LibraryIssue, Series
 from ..schemas import (
     ComicInfoOut,
     ComicInfoUpdateIn,
+    IssueResolveIn,
     IssueScanOut,
     LibraryIssueOut,
 )
@@ -25,8 +31,8 @@ from ..schemas import (
 router = APIRouter(tags=["issues"])
 
 
-async def _series(session: AsyncSession, series_id: int) -> Series:
-    series = (await session.execute(
+async def _series(session: AsyncSession, series_id: int) -> Series | None:
+    return (await session.execute(
         select(Series)
         .options(
             selectinload(Series.chapters),
@@ -35,45 +41,38 @@ async def _series(session: AsyncSession, series_id: int) -> Series:
         )
         .where(Series.id == series_id)
     )).scalar_one_or_none()
-    if series is None:
-        raise HTTPException(404, "Series not found")
-    return series
 
 
-def _contained_file(series: Series, chapter: Chapter) -> Path:
-    if series.root_folder is None or not chapter.file_path:
-        raise HTTPException(400, "Chapter has no editable file")
+async def _inspect(
+    session: AsyncSession, series: Series, chapter_id: int
+) -> tuple[Path, ComicInfoMetadata]:
+    chapter = next((item for item in series.chapters if item.id == chapter_id), None)
+    if chapter is None:
+        raise HTTPException(404, "Chapter not found")
     try:
-        path = Path(chapter.file_path).resolve(strict=True)
-        folders = resolve_folders(
-            Path(series.root_folder.path), series, [folder.path for folder in series.extra_folders]
-        )
-        if not any(path.is_relative_to(folder.resolve(strict=False)) for folder in folders):
-            raise HTTPException(400, "Chapter file is outside the series folders")
-    except OSError as exc:
-        raise HTTPException(400, "Chapter file is not available") from exc
-    if path.suffix.lower() not in {".cbz", ".zip"}:
-        raise HTTPException(400, "ComicInfo editing is supported for CBZ and ZIP files")
-    sharing = [
-        item for item in series.chapters
-        if not item.excluded and item.file_path == chapter.file_path
-    ]
-    if len(sharing) != 1:
-        raise HTTPException(400, "Edit whole-volume archive metadata from its volume workflow")
-    return path
-
-
-def _comicinfo_out(path: Path) -> ComicInfoOut:
-    try:
-        info = read_comicinfo(path)
+        return await run_in_threadpool(inspect_chapter_archive, series, chapter, await chapter_paths(session))
+    except ArchiveIneligible as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ArchiveChanged as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ComicInfoError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return ComicInfoOut(file_path=str(path), **info.__dict__)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(400, "Chapter file is not available") from exc
+
+
+async def _write_archive(
+    path: Path, revision: str, updates: dict[str, str | int | None]
+) -> ComicInfoMetadata:
+    try:
+        return await run_in_threadpool(update_comicinfo, path, updates, expected_revision=revision)
+    except ArchiveChanged as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ComicInfoError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 async def _notify_reader(session: AsyncSession, series: Series) -> None:
-    # Reuse the normal debounced Kavita notification path; a disabled or
-    # unconfigured integration is a no-op.
     from ..jobs.tasks import _notify_kavita
 
     values = await settings_service.get_all(session)
@@ -87,11 +86,12 @@ async def _notify_reader(session: AsyncSession, series: Series) -> None:
 async def get_chapter_comicinfo(
     series_id: int, chapter_id: int, session: AsyncSession = Depends(get_session)
 ):
-    series = await _series(session, series_id)
-    chapter = next((item for item in series.chapters if item.id == chapter_id), None)
-    if chapter is None:
-        raise HTTPException(404, "Chapter not found")
-    return _comicinfo_out(_contained_file(series, chapter))
+    async with series_lock(series_id):
+        series = await _series(session, series_id)
+        if series is None:
+            raise HTTPException(404, "Series not found")
+        path, info = await _inspect(session, series, chapter_id)
+        return ComicInfoOut(file_path=str(path), **info.__dict__)
 
 
 @router.put(
@@ -104,24 +104,22 @@ async def update_chapter_comicinfo(
     body: ComicInfoUpdateIn,
     session: AsyncSession = Depends(get_session),
 ):
-    series = await _series(session, series_id)
-    chapter = next((item for item in series.chapters if item.id == chapter_id), None)
-    if chapter is None:
-        raise HTTPException(404, "Chapter not found")
-    path = _contained_file(series, chapter)
-    try:
-        update_comicinfo(path, body.model_dump())
-    except ComicInfoError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    await detect_series_issues(session, series)
-    await session.commit()
-    await _notify_reader(session, series)
-    return _comicinfo_out(path)
+    async with series_lock(series_id):
+        series = await _series(session, series_id)
+        if series is None:
+            raise HTTPException(404, "Series not found")
+        path, _ = await _inspect(session, series, chapter_id)
+        info = await _write_archive(path, body.revision, body.model_dump(exclude={"revision"}))
+        await detect_series_issues(session, series)
+        await session.commit()
+        await _notify_reader(session, series)
+        return ComicInfoOut(file_path=str(path), **info.__dict__)
 
 
 def _issue_out(issue: LibraryIssue, series_title: str, chapter_number: float | None):
     return LibraryIssueOut(
-        id=issue.id,
+        id=issue.public_id,
+        revision=issue.revision,
         series_id=issue.series_id,
         series_title=series_title,
         chapter_id=issue.chapter_id,
@@ -162,57 +160,76 @@ async def list_issues(
 
 @router.post("/issues/scan", response_model=IssueScanOut)
 async def scan_issues(session: AsyncSession = Depends(get_session)):
-    result = await session.execute(
-        select(Series).options(selectinload(Series.chapters))
-    )
-    for series in result.scalars().unique():
-        await detect_series_issues(session, series)
+    series_ids = list((await session.scalars(select(Series.id))).all())
     await session.commit()
+    for series_id in series_ids:
+        async with series_lock(series_id):
+            series = await _series(session, series_id)
+            if series is not None:
+                await detect_series_issues(session, series)
+            await session.commit()
     counts = dict((await session.execute(
         select(LibraryIssue.ignored, func.count(LibraryIssue.id)).group_by(LibraryIssue.ignored)
     )).all())
     return IssueScanOut(active=counts.get(False, 0), ignored=counts.get(True, 0))
 
 
-@router.post("/issues/{issue_id}/ignore", status_code=204)
-async def ignore_issue(issue_id: int, session: AsyncSession = Depends(get_session)):
-    issue = await session.get(LibraryIssue, issue_id)
-    if issue is None:
+@asynccontextmanager
+async def _locked_issue(session: AsyncSession, issue_id: str):
+    series_id = await session.scalar(
+        select(LibraryIssue.series_id).where(LibraryIssue.public_id == issue_id)
+    )
+    if series_id is None:
         raise HTTPException(404, "Issue not found")
-    issue.ignored = True
-    await session.commit()
+    async with series_lock(series_id):
+        issue = await session.scalar(
+            select(LibraryIssue).where(LibraryIssue.public_id == issue_id)
+        )
+        if issue is None:
+            raise HTTPException(404, "Issue not found")
+        yield issue
+
+
+@router.post("/issues/{issue_id}/ignore", status_code=204)
+async def ignore_issue(issue_id: str, session: AsyncSession = Depends(get_session)):
+    async with _locked_issue(session, issue_id) as issue:
+        issue.ignored = True
+        await session.commit()
 
 
 @router.post("/issues/{issue_id}/restore", status_code=204)
-async def restore_issue(issue_id: int, session: AsyncSession = Depends(get_session)):
-    issue = await session.get(LibraryIssue, issue_id)
-    if issue is None:
-        raise HTTPException(404, "Issue not found")
-    issue.ignored = False
-    await session.commit()
+async def restore_issue(issue_id: str, session: AsyncSession = Depends(get_session)):
+    async with _locked_issue(session, issue_id) as issue:
+        issue.ignored = False
+        await session.commit()
 
 
 @router.post("/issues/{issue_id}/resolve", status_code=204)
-async def resolve_issue(issue_id: int, session: AsyncSession = Depends(get_session)):
-    issue = await session.get(LibraryIssue, issue_id)
-    if issue is None:
-        raise HTTPException(404, "Issue not found")
-    series = await _series(session, issue.series_id)
-    chapter = next((item for item in series.chapters if item.id == issue.chapter_id), None)
-    if chapter is None:
-        raise HTTPException(409, "The affected chapter no longer exists")
-    path = _contained_file(series, chapter)
-    if str(path) != str(Path(issue.file_path).resolve(strict=False)):
-        raise HTTPException(409, "The affected file changed; scan issues again")
-    try:
-        info = read_comicinfo(path)
-        if info.value(issue.field) != issue.current_value:
-            await detect_series_issues(session, series)
+async def resolve_issue(
+    issue_id: str, body: IssueResolveIn, session: AsyncSession = Depends(get_session)
+):
+    async with _locked_issue(session, issue_id) as issue:
+        if issue.ignored or body.revision != issue.revision:
+            raise HTTPException(409, "The issue changed; review the current recommendation")
+        series = await _series(session, issue.series_id)
+        if series is None:
+            raise HTTPException(409, "The affected series no longer exists")
+        candidates = await current_candidates(session, series)
+        if candidates is None:
+            raise HTTPException(409, "The library files are unavailable; try again when they are accessible")
+        candidate = next((
+            item for item in candidates if item.chapter_id == issue.chapter_id
+            and item.file_path == issue.file_path and item.field == issue.field
+        ), None)
+        if candidate is None or candidate.revision != body.revision:
+            await reconcile_candidates(session, series.id, candidates)
             await session.commit()
-            raise HTTPException(409, "The metadata changed; review the refreshed issue")
-        update_comicinfo(path, {issue.field: issue.suggested_value})
-    except ComicInfoError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    await detect_series_issues(session, series)
-    await session.commit()
-    await _notify_reader(session, series)
+            raise HTTPException(409, "The issue changed; review the current recommendation")
+        path, info = await _inspect(session, series, candidate.chapter_id)
+        if info.revision != candidate.archive_revision:
+            raise HTTPException(409, "The chapter archive changed; scan issues again")
+        await _write_archive(path, info.revision, {candidate.field: candidate.suggested_value})
+        await session.delete(issue)
+        await detect_series_issues(session, series)
+        await session.commit()
+        await _notify_reader(session, series)

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import type { LibraryIssue } from "../api/types";
 import { chapterLabel, ErrorNotice, Modal } from "./common";
 import { Icon } from "./Icon";
@@ -17,8 +17,11 @@ function IssueReview({ issue, onClose, onChanged }: {
   onChanged: () => void;
 }) {
   const resolve = useMutation({
-    mutationFn: () => api.post(`/issues/${issue.id}/resolve`),
+    mutationFn: () => api.post(`/issues/${issue.id}/resolve`, { revision: issue.revision }),
     onSuccess: () => { onChanged(); onClose(); },
+    onError: (error) => {
+      if (error instanceof ApiError && [404, 409].includes(error.status)) onChanged();
+    },
   });
   return (
     <Modal title="Review recommended metadata change" onClose={onClose}>
@@ -55,7 +58,7 @@ export function IssueCard({ issue, onChanged, compact = false }: {
   onChanged: () => void;
   compact?: boolean;
 }) {
-  const [reviewing, setReviewing] = useState(false);
+  const [reviewed, setReviewed] = useState<LibraryIssue | null>(null);
   const state = useMutation({
     mutationFn: () => api.post(`/issues/${issue.id}/${issue.ignored ? "restore" : "ignore"}`),
     onSuccess: onChanged,
@@ -84,7 +87,7 @@ export function IssueCard({ issue, onChanged, compact = false }: {
       </div>
       <div className="issue-actions">
         {!issue.ignored && (
-          <button className="btn primary sm" onClick={() => setReviewing(true)}>
+          <button className="btn primary sm" onClick={() => setReviewed(issue)}>
             Review fix
           </button>
         )}
@@ -93,8 +96,8 @@ export function IssueCard({ issue, onChanged, compact = false }: {
         </button>
       </div>
       {state.error && <ErrorNotice error={state.error} />}
-      {reviewing && (
-        <IssueReview issue={issue} onClose={() => setReviewing(false)} onChanged={onChanged} />
+      {reviewed && (
+        <IssueReview issue={reviewed} onClose={() => setReviewed(null)} onChanged={onChanged} />
       )}
     </div>
   );

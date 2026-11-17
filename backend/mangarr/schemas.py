@@ -262,6 +262,7 @@ class ChapterMetadataIn(BaseModel):
 
 class ComicInfoOut(BaseModel):
     file_path: str
+    revision: str
     exists: bool
     series: str | None
     number: str | None
@@ -272,6 +273,7 @@ class ComicInfoOut(BaseModel):
 
 
 class ComicInfoUpdateIn(BaseModel):
+    revision: str
     series: str | None
     number: str | None
     volume: int | None
@@ -295,7 +297,8 @@ class ComicInfoUpdateIn(BaseModel):
 
 
 class LibraryIssueOut(BaseModel):
-    id: int
+    id: str
+    revision: str
     series_id: int
     series_title: str
     chapter_id: int | None
@@ -310,6 +313,10 @@ class LibraryIssueOut(BaseModel):
     ignored: bool
     created_at: datetime
     updated_at: datetime
+
+
+class IssueResolveIn(BaseModel):
+    revision: str
 
 
 class IssueScanOut(BaseModel):

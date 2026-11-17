@@ -514,7 +514,18 @@ function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: 
     .map(([volume, chs]) => ({ volume, chapters: chs.sort((a, b) => b.number - a.number) }));
 }
 
-function ChapterMetadataModal({
+function archiveDraft(info: ComicInfo) {
+  return {
+    revision: info.revision,
+    series: info.series ?? "",
+    number: info.number ?? "",
+    volume: info.volume ?? "",
+    title: info.title ?? "",
+    page_count: info.page_count ?? "",
+  };
+}
+
+export function ChapterMetadataModal({
   seriesId,
   seriesTitle,
   chapter,
@@ -532,122 +543,128 @@ function ChapterMetadataModal({
   const [titleLocked, setTitleLocked] = useState(chapter.title_locked);
   const [volumeLocked, setVolumeLocked] = useState(chapter.volume_locked);
   const [excluded, setExcluded] = useState(chapter.excluded);
-  const [fileSeries, setFileSeries] = useState("");
-  const [fileNumber, setFileNumber] = useState("");
-  const [fileVolume, setFileVolume] = useState("");
-  const [fileTitle, setFileTitle] = useState("");
-  const [filePageCount, setFilePageCount] = useState("");
-  const [comicInfoDirty, setComicInfoDirty] = useState(false);
+  const [draft, setDraft] = useState<ReturnType<typeof archiveDraft> | null>(null);
+  const queryClient = useQueryClient();
+  const archiveKey = ["comicinfo", seriesId, chapter.id];
+  const chapterPath = `/series/${seriesId}/chapters/${chapter.id}`;
   const canInspectArchive = Boolean(
     chapter.downloaded && chapter.file_path && /\.(cbz|zip)$/i.test(chapter.file_path),
   );
   const comicInfo = useQuery({
-    queryKey: ["comicinfo", seriesId, chapter.id],
-    queryFn: () => api.get<ComicInfo>(`/series/${seriesId}/chapters/${chapter.id}/comicinfo`),
+    queryKey: archiveKey,
+    queryFn: () => api.get<ComicInfo>(`${chapterPath}/comicinfo`),
     enabled: canInspectArchive,
     retry: false,
   });
-  useEffect(() => {
-    if (!comicInfo.data || comicInfoDirty) return;
-    setFileSeries(comicInfo.data.series ?? "");
-    setFileNumber(comicInfo.data.number ?? "");
-    setFileVolume(comicInfo.data.volume ?? "");
-    setFileTitle(comicInfo.data.title ?? "");
-    setFilePageCount(comicInfo.data.page_count ?? "");
-  }, [comicInfo.data, comicInfoDirty]);
-  const changeFile = (setter: (value: string) => void) =>
-    (event: React.ChangeEvent<HTMLInputElement>) => {
-      setter(event.target.value);
-      setComicInfoDirty(true);
-    };
-  const save = useMutation({
-    mutationFn: async () => {
-      await api.put(`/series/${seriesId}/chapters/${chapter.id}/metadata`, {
-        title,
-        volume: volume.trim() === "" ? null : Number(volume),
-        title_locked: titleLocked,
-        volume_locked: volumeLocked,
-        excluded,
-      });
-      if (comicInfoDirty && comicInfo.data) {
-        await api.put(`/series/${seriesId}/chapters/${chapter.id}/comicinfo`, {
-          series: fileSeries.trim() || null,
-          number: fileNumber.trim() || null,
-          volume: fileVolume.trim() === "" ? null : Number(fileVolume),
-          title: fileTitle.trim() || null,
-          page_count: filePageCount.trim() === "" ? null : Number(filePageCount),
-        });
-      }
-    },
+  const fields = draft ?? (comicInfo.data ? archiveDraft(comicInfo.data) : null);
+  const saveChapter = useMutation({
+    mutationFn: () => api.put(`${chapterPath}/metadata`, {
+      title,
+      volume: volume.trim() === "" ? null : Number(volume),
+      title_locked: titleLocked,
+      volume_locked: volumeLocked,
+      excluded,
+    }),
     onSuccess: () => {
       onSaved();
-      onClose();
+      void queryClient.invalidateQueries({ queryKey: archiveKey });
     },
   });
+  const saveArchive = useMutation({
+    mutationFn: (reviewed: ReturnType<typeof archiveDraft>) => api.put<ComicInfo>(`${chapterPath}/comicinfo`, {
+      revision: reviewed.revision,
+      series: reviewed.series.trim() || null,
+      number: reviewed.number.trim() || null,
+      volume: reviewed.volume.trim() === "" ? null : Number(reviewed.volume),
+      title: reviewed.title.trim() || null,
+      page_count: reviewed.page_count.trim() === "" ? null : Number(reviewed.page_count),
+    }),
+    onSuccess: (info) => {
+      queryClient.setQueryData(archiveKey, info);
+      setDraft(null);
+      onSaved();
+    },
+  });
+  const saving = saveChapter.isPending || saveArchive.isPending;
+  const close = () => { if (!saving) onClose(); };
+  const changeFile = (field: keyof Omit<ReturnType<typeof archiveDraft>, "revision">) =>
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      if (fields) setDraft({ ...fields, [field]: event.target.value });
+      saveArchive.reset();
+    };
   return (
-    <Modal title={`Edit ${chapterLabel(chapter.number, chapter.volume)}`} onClose={onClose}>
-      <div className="metadata-section-title">Mangarr chapter metadata</div>
-      <div className="form-row">
-        <label>Title</label>
-        <input
-          value={title}
-          onChange={(event) => {
-            setTitle(event.target.value);
-            setTitleLocked(true);
-          }}
-        />
-      </div>
-      <div className="form-row">
-        <label>Volume</label>
-        <input
-          type="number"
-          min="1"
-          value={volume}
-          onChange={(event) => {
-            setVolume(event.target.value);
-            setVolumeLocked(true);
-          }}
-        />
-      </div>
-      <div className={`chapter-exclusion${excluded ? " active" : ""}`}>
-        <label className="chapter-edit-option chapter-exclusion-toggle">
+    <Modal title={`Edit ${chapterLabel(chapter.number, chapter.volume)}`} onClose={close}>
+      <fieldset className="chapter-metadata-fields" disabled={saving} onChange={() => saveChapter.reset()}>
+        <div className="metadata-section-title">Mangarr chapter metadata</div>
+        <div className="form-row">
+          <label>Title</label>
           <input
-            type="checkbox"
-            checked={excluded}
-            onChange={(event) => setExcluded(event.target.checked)}
+            value={title}
+            onChange={(event) => {
+              setTitle(event.target.value);
+              setTitleLocked(true);
+            }}
           />
-          <span>
-            <strong>Exclude this chapter</strong>
-            <small>
-              Keep it visible so it can be restored, but skip it when calculating missing
-              chapters and during refreshes, searches, scans, and downloads.
-            </small>
-          </span>
-        </label>
-      </div>
-      <div className="chapter-lock-options" aria-label="Metadata refresh options">
-        <label className="chapter-edit-option">
+        </div>
+        <div className="form-row">
+          <label>Volume</label>
           <input
-            type="checkbox"
-            checked={titleLocked}
-            onChange={(event) => setTitleLocked(event.target.checked)}
+            type="number"
+            min="1"
+            value={volume}
+            onChange={(event) => {
+              setVolume(event.target.value);
+              setVolumeLocked(true);
+            }}
           />
-          <span>Keep this title during future refreshes</span>
-        </label>
-        <label className="chapter-edit-option">
-          <input
-            type="checkbox"
-            checked={volumeLocked}
-            onChange={(event) => setVolumeLocked(event.target.checked)}
-          />
-          <span>Keep this volume during future refreshes/resyncs</span>
-        </label>
+        </div>
+        <div className={`chapter-exclusion${excluded ? " active" : ""}`}>
+          <label className="chapter-edit-option chapter-exclusion-toggle">
+            <input
+              type="checkbox"
+              checked={excluded}
+              onChange={(event) => setExcluded(event.target.checked)}
+            />
+            <span>
+              <strong>Exclude this chapter</strong>
+              <small>
+                Keep it visible so it can be restored, but skip it when calculating missing
+                chapters and during refreshes, searches, scans, and downloads.
+              </small>
+            </span>
+          </label>
+        </div>
+        <div className="chapter-lock-options" aria-label="Metadata refresh options">
+          <label className="chapter-edit-option">
+            <input
+              type="checkbox"
+              checked={titleLocked}
+              onChange={(event) => setTitleLocked(event.target.checked)}
+            />
+            <span>Keep this title during future refreshes</span>
+          </label>
+          <label className="chapter-edit-option">
+            <input
+              type="checkbox"
+              checked={volumeLocked}
+              onChange={(event) => setVolumeLocked(event.target.checked)}
+            />
+            <span>Keep this volume during future refreshes/resyncs</span>
+          </label>
+        </div>
+      </fieldset>
+      <ErrorNotice error={saveChapter.error} />
+      <div className="modal-actions chapter-edit-actions">
+        {saveChapter.isSuccess && <span role="status">Mangarr metadata saved</span>}
+        <button className="btn primary" disabled={saving || (volume !== "" && Number(volume) < 1)} onClick={() => saveChapter.mutate()}>
+          {saveChapter.isPending ? "Saving…" : "Save Mangarr metadata"}
+        </button>
       </div>
       {canInspectArchive && comicInfo.isLoading && (
         <p className="form-hint">Reading ComicInfo.xml from the chapter archive…</p>
       )}
-      {comicInfo.data && (
-        <div className="comicinfo-editor">
+      {comicInfo.data && fields && (
+        <fieldset className="comicinfo-editor chapter-metadata-fields" disabled={saving || comicInfo.isError}>
           <div className="metadata-section-title">
             ComicInfo.xml inside the file
             <span className={`pill ${comicInfo.data.exists ? "blue" : "gray"}`}>
@@ -659,30 +676,36 @@ function ChapterMetadataModal({
             the archive. Leave a field blank to remove it.
           </p>
           <div className="comicinfo-fields">
-            <div className="form-row"><label>Series</label><input value={fileSeries} placeholder={seriesTitle} onChange={changeFile(setFileSeries)} /></div>
-            <div className="form-row"><label>Number</label><input value={fileNumber} placeholder={String(chapter.number)} onChange={changeFile(setFileNumber)} /></div>
-            <div className="form-row"><label>Volume</label><input type="number" min="1" value={fileVolume} onChange={changeFile(setFileVolume)} /></div>
-            <div className="form-row"><label>Title</label><input value={fileTitle} onChange={changeFile(setFileTitle)} /></div>
+            <div className="form-row"><label>Series</label><input value={fields.series} placeholder={seriesTitle} onChange={changeFile("series")} /></div>
+            <div className="form-row"><label>Number</label><input value={fields.number} placeholder={String(chapter.number)} onChange={changeFile("number")} /></div>
+            <div className="form-row"><label>Volume</label><input type="number" min="1" value={fields.volume} onChange={changeFile("volume")} /></div>
+            <div className="form-row"><label>Title</label><input value={fields.title} onChange={changeFile("title")} /></div>
             <div className="form-row">
               <label>Page count</label>
-              <input type="number" min="1" value={filePageCount} onChange={changeFile(setFilePageCount)} />
+              <input type="number" min="1" value={fields.page_count} onChange={changeFile("page_count")} />
               <small>{comicInfo.data.actual_page_count} image pages in archive</small>
             </div>
           </div>
           <div className="filepath" title={comicInfo.data.file_path}>{comicInfo.data.file_path}</div>
-        </div>
+          <ErrorNotice error={saveArchive.error} />
+          <div className="modal-actions chapter-edit-actions">
+            {saveArchive.isSuccess && <span role="status">ComicInfo saved</span>}
+            <button
+              className="btn primary"
+              disabled={!draft || (fields.volume !== "" && Number(fields.volume) < 1)
+                || (fields.page_count !== "" && Number(fields.page_count) < 1)}
+              onClick={() => { if (draft) saveArchive.mutate(draft); }}
+            >
+              {saveArchive.isPending ? "Saving…" : "Save ComicInfo"}
+            </button>
+          </div>
+        </fieldset>
       )}
       {comicInfo.error && (
-        <p className="form-hint">
-          Archive metadata is not editable here: {(comicInfo.error as Error).message}
-        </p>
+        <p className="form-hint">ComicInfo editor unavailable. {comicInfo.error.message}</p>
       )}
-      {save.isError && <div className="error-banner">{(save.error as Error).message}</div>}
-      <div className="modal-actions chapter-edit-actions">
-        <button className="btn" onClick={onClose}>Cancel</button>
-        <button className="btn primary" disabled={save.isPending || (volume !== "" && Number(volume) < 1) || (fileVolume !== "" && Number(fileVolume) < 1) || (filePageCount !== "" && Number(filePageCount) < 1)} onClick={() => save.mutate()}>
-          {save.isPending ? "Saving…" : "Save"}
-        </button>
+      <div className="modal-actions">
+        <button className="btn" disabled={saving} onClick={close}>Close</button>
       </div>
     </Modal>
   );

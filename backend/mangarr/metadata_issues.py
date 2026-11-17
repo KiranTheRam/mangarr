@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import math
-from dataclasses import dataclass
+import stat
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .comicinfo import ComicInfoError, ComicInfoMetadata, read_comicinfo
+from .comicinfo import ArchiveChanged, ComicInfoError, ComicInfoMetadata, read_comicinfo
+from .filename import parse_filename
+from .library.scanner import resolve_folders, root_unavailable
 from .models import Chapter, LibraryIssue, Series
 from .titles import metadata_titles
 from .util import normalize_title
@@ -27,6 +33,11 @@ class Candidate:
     suggested_value: str | None
     title: str
     detail: str
+    archive_revision: str
+
+    @property
+    def revision(self) -> str:
+        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
 
 
 def _key(series_id: int, file_path: str, field: str) -> str:
@@ -42,30 +53,124 @@ def _numeric(value: str | None) -> float | None:
         return None
 
 
-def _exact_files(series: Series) -> list[tuple[Chapter, Path, ComicInfoMetadata]]:
-    by_path: dict[str, list[Chapter]] = {}
-    for chapter in series.chapters:
-        if chapter.excluded or not chapter.downloaded or not chapter.file_path:
-            continue
-        by_path.setdefault(chapter.file_path, []).append(chapter)
-    found: list[tuple[Chapter, Path, ComicInfoMetadata]] = []
-    for raw_path, chapters in by_path.items():
-        if len(chapters) != 1:
-            continue  # whole-volume archives need volume-level remediation
-        path = Path(raw_path)
-        if path.suffix.lower() not in {".cbz", ".zip"} or not path.is_file():
-            continue
-        try:
-            found.append((chapters[0], path, read_comicinfo(path)))
-        except ComicInfoError:
-            continue
-    return found
+class ArchiveIneligible(ComicInfoError):
+    """The file cannot be edited as a single chapter."""
 
 
-def find_candidates(series: Series) -> list[Candidate]:
-    files = _exact_files(series)
+class ArchiveOwnership:
+    """Index the owners of each physical file, including aliases and hardlinks."""
+
+    def __init__(self, paths: list[tuple[int, str]]):
+        by_path = defaultdict(set)
+        for chapter_id, raw_path in paths:
+            by_path[raw_path].add(chapter_id)
+        self.owners = defaultdict(set)
+        self.unavailable: dict[str, OSError] = {}
+        for raw_path, chapter_ids in by_path.items():
+            try:
+                file_stat = Path(raw_path).stat()
+                self.owners[file_stat.st_dev, file_stat.st_ino].update(chapter_ids)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self.unavailable[raw_path] = exc
+
+
+async def chapter_paths(session: AsyncSession) -> list[tuple[int, str]]:
+    rows = await session.execute(select(Chapter.id, Chapter.file_path).where(Chapter.file_path != ""))
+    return [(chapter_id, path) for chapter_id, path in rows]
+
+
+def _archive_folders(series: Series) -> list[Path]:
+    if series.root_folder is None:
+        return []
+    root = Path(series.root_folder.path)
+    folders = resolve_folders(root, series, [folder.path for folder in series.extra_folders])
+    absolute_extras = {Path(folder.path) for folder in series.extra_folders if Path(folder.path).is_absolute()}
+    resolved_root = root.resolve()
+    return [
+        folder for raw in folders
+        if (folder := raw.resolve()).is_relative_to(resolved_root) or raw in absolute_extras
+    ]
+
+
+def _inspect_chapter_archive(
+    series: Series, chapter: Chapter, folders: list[Path], ownership: ArchiveOwnership
+) -> tuple[Path, ComicInfoMetadata]:
+    raw = Path(chapter.file_path)
+    if chapter.excluded or not chapter.downloaded or raw.suffix.lower() not in {".cbz", ".zip"}:
+        raise ArchiveIneligible("Chapter has no editable CBZ or ZIP archive")
+    # Resolve the path before opening the ZIP, including when an alias points
+    # to a file owned by another chapter or series.
+    path = raw.resolve(strict=True)
+    if not any(path.is_relative_to(folder) for folder in folders):
+        raise ArchiveIneligible("Chapter file is outside the series folders")
+    file_stat = path.stat()
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ArchiveIneligible("Chapter archive must be a regular file")
+    if ownership.owners.get((file_stat.st_dev, file_stat.st_ino)) != {chapter.id}:
+        raise ArchiveIneligible("This archive has shared or uncertain chapter ownership")
+
+    titles = {normalize_title(title) for title in metadata_titles(series)}
+    for name in {raw.stem, path.stem}:
+        coverage = parse_filename(name)
+        if (
+            coverage.ambiguous or coverage.is_range
+            or (coverage.volume is not None and coverage.chapter is None)
+            or (series.total_volumes == 1 and normalize_title(name) in titles)
+        ):
+            raise ArchiveIneligible("Whole-volume or multi-chapter archives need volume-level editing")
+    info = read_comicinfo(path)
+    if info.labels_multiple_chapters or (
+        info.volume is not None and _numeric(info.number) is None
+        and all(parse_filename(name).chapter_number is None for name in {raw.stem, path.stem})
+    ):
+        raise ArchiveIneligible("Whole-volume or multi-chapter archives need volume-level editing")
+    return path, info
+
+
+def inspect_chapter_archive(
+    series: Series, chapter: Chapter, paths: list[tuple[int, str]]
+) -> tuple[Path, ComicInfoMetadata]:
+    return _inspect_chapter_archive(series, chapter, _archive_folders(series), ArchiveOwnership(paths))
+
+
+def find_candidates(
+    series: Series, paths: list[tuple[int, str]], expect_content: bool = True
+) -> list[Candidate] | None:
+    """Return None when an unavailable archive prevents a trustworthy scan."""
+    if series.root_folder is None:
+        return None
+    if root_unavailable(Path(series.root_folder.path), expect_content):
+        return None
+    files: list[tuple[Chapter, Path, ComicInfoMetadata]] = []
+    try:
+        folders = _archive_folders(series)
+        ownership = ArchiveOwnership(paths)
+        for chapter in series.chapters:
+            if chapter.excluded or not chapter.downloaded or not chapter.file_path:
+                continue
+            try:
+                if chapter.file_path in ownership.unavailable:
+                    raise ownership.unavailable[chapter.file_path]
+                _, info = _inspect_chapter_archive(series, chapter, folders, ownership)
+                files.append((chapter, Path(chapter.file_path), info))
+            except FileNotFoundError:
+                # An accessible parent lets us distinguish a deleted archive
+                # from a missing mount. A configured extra may be its own mount.
+                if not Path(chapter.file_path).parent.is_dir():
+                    return None
+            except ArchiveChanged:
+                return None
+            except ComicInfoError as exc:
+                if isinstance(exc.__cause__, OSError):
+                    return None
+    except (OSError, RuntimeError):
+        return None
+
     candidates: list[Candidate] = []
     claimed: set[tuple[str, str]] = set()
+    valid_titles = {normalized for value in metadata_titles(series) if (normalized := normalize_title(value))}
 
     for chapter, path, info in files:
         if not info.exists:
@@ -82,6 +187,7 @@ def find_candidates(series: Series) -> list[Candidate]:
                 f"ComicInfo chapter number does not match chapter {suggested}",
                 "The archive filename and Mangarr mapping identify a different chapter. "
                 "Readers may sort or label this file incorrectly.",
+                info.revision,
             ))
             claimed.add((str(path), "number"))
 
@@ -94,14 +200,10 @@ def find_candidates(series: Series) -> list[Candidate]:
                     "ComicInfo page count does not match the archive",
                     f"ComicInfo declares {info.page_count!r}, but the archive contains "
                     f"{info.actual_page_count} image pages.",
+                    info.revision,
                 ))
                 claimed.add((str(path), "page_count"))
 
-        valid_titles = {
-            normalized
-            for value in metadata_titles(series)
-            if (normalized := normalize_title(value))
-        }
         if info.series and valid_titles and normalize_title(info.series) not in valid_titles:
             candidates.append(Candidate(
                 chapter.id, "comicinfo_series_mismatch", str(path), "series",
@@ -109,6 +211,7 @@ def find_candidates(series: Series) -> list[Candidate]:
                 "ComicInfo series name does not match this series",
                 "Readers can split this archive into a separate series because its embedded "
                 "series name is not one of Mangarr's known titles.",
+                info.revision,
             ))
             claimed.add((str(path), "series"))
 
@@ -122,6 +225,7 @@ def find_candidates(series: Series) -> list[Candidate]:
                     "ComicInfo volume is not a whole number",
                     "Readers expect the Volume field to be a whole number. Removing the bad "
                     "tag keeps the chapter available without inventing a volume.",
+                    info.revision,
                 ))
                 claimed.add((str(path), "volume"))
             elif chapter.volume is None:
@@ -131,6 +235,7 @@ def find_candidates(series: Series) -> list[Candidate]:
                     f"ComicInfo creates Volume {info.volume} for an unassigned chapter",
                     "Mangarr has no volume assignment for this chapter, but the archive tag "
                     "makes readers create one. The recommended change removes only the tag.",
+                    info.revision,
                 ))
                 claimed.add((str(path), "volume"))
             elif reliable and int(volume) != chapter.volume:
@@ -140,6 +245,7 @@ def find_candidates(series: Series) -> list[Candidate]:
                     f"ComicInfo volume disagrees with {chapter.volume_source}",
                     f"The archive says Volume {info.volume}, while {chapter.volume_source} "
                     f"places chapter {chapter.number:g} in Volume {chapter.volume}.",
+                    info.revision,
                 ))
                 claimed.add((str(path), "volume"))
 
@@ -167,39 +273,61 @@ def find_candidates(series: Series) -> list[Candidate]:
             f"to Volume {volume} that embeds a Volume tag; {untagged} sibling file"
             f"{'s are' if untagged != 1 else ' is'} untagged. Kavita will create Volume "
             f"{volume} from this file alone. Remove the tag unless that grouping is intentional.",
+            info.revision,
         ))
 
     return candidates
 
 
-async def detect_series_issues(session: AsyncSession, series: Series) -> list[LibraryIssue]:
+async def current_candidates(session: AsyncSession, series: Series) -> list[Candidate] | None:
     # A scan can infer new chapter rows immediately before detection; assign
     # their ids so issues link to remediation on the first pass.
+    from .jobs.tasks import root_expects_content
+
     await session.flush()
-    candidates = find_candidates(series)
+    unloaded = inspect(series).unloaded & {"chapters", "root_folder", "extra_folders"}
+    if unloaded:
+        await session.refresh(series, list(unloaded))
+    if series.root_folder is None:
+        return None
+    expect_content = await root_expects_content(session, series)
+    paths = await chapter_paths(session)
+    return await asyncio.to_thread(find_candidates, series, paths, expect_content)
+
+
+async def detect_series_issues(session: AsyncSession, series: Series) -> list[LibraryIssue]:
+    """Reconcile under the caller's series lock, held through the commit."""
+    candidates = await current_candidates(session, series)
+    if candidates is None:
+        return []
+    return await reconcile_candidates(session, series.id, candidates)
+
+
+async def reconcile_candidates(
+    session: AsyncSession, series_id: int, candidates: list[Candidate]
+) -> list[LibraryIssue]:
     existing = list((await session.execute(
-        select(LibraryIssue).where(LibraryIssue.series_id == series.id)
+        select(LibraryIssue).where(LibraryIssue.series_id == series_id)
     )).scalars())
     by_key = {issue.key: issue for issue in existing}
     active_keys: set[str] = set()
     now = datetime.now(timezone.utc)
     result: list[LibraryIssue] = []
     for candidate in candidates:
-        key = _key(series.id, candidate.file_path, candidate.field)
+        key = _key(series_id, candidate.file_path, candidate.field)
         active_keys.add(key)
         issue = by_key.get(key)
         if issue is None:
-            issue = LibraryIssue(key=key, series_id=series.id, ignored=False)
+            issue = LibraryIssue(key=key, series_id=series_id, ignored=False)
             session.add(issue)
-        issue.chapter_id = candidate.chapter_id
-        issue.kind = candidate.kind
-        issue.file_path = candidate.file_path
-        issue.field = candidate.field
-        issue.current_value = candidate.current_value
-        issue.suggested_value = candidate.suggested_value
-        issue.title = candidate.title
-        issue.detail = candidate.detail
-        issue.updated_at = now
+        revision = candidate.revision
+        if issue.revision != revision:
+            values = asdict(candidate)
+            values.pop("archive_revision")
+            for name, value in values.items():
+                setattr(issue, name, value)
+            issue.revision = revision
+            issue.updated_at = now
         result.append(issue)
     for issue in existing:
         if issue.key not in active_keys:
