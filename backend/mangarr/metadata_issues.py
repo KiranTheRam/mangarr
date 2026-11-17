@@ -23,6 +23,11 @@ from .titles import metadata_titles
 from .util import normalize_title
 
 
+# Manual mappings can share archives across series. Acquire this after the
+# series lock and hold it from ownership validation through archive replacement.
+manual_archive_lock = asyncio.Lock()
+
+
 @dataclass(frozen=True)
 class Candidate:
     chapter_id: int

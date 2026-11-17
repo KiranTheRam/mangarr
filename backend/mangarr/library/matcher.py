@@ -145,7 +145,7 @@ def _read_comicinfo(path: Path) -> ElementTree.Element | None:
             if len(data) > MAX_COMICINFO_BYTES:
                 return None
             return ElementTree.fromstring(data)
-    except (OSError, KeyError, ValueError, RuntimeError, EOFError,
+    except (OSError, LookupError, ValueError, RuntimeError, EOFError,
             zipfile.BadZipFile, zlib.error, ElementTree.ParseError):
         return None
 

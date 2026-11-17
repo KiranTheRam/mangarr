@@ -110,7 +110,10 @@ def _read_root(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> ElementTree
         data = stream.read(MAX_COMICINFO_BYTES + 1)
     if len(data) > MAX_COMICINFO_BYTES or len(data) != member.file_size:
         raise ComicInfoError("ComicInfo.xml has an invalid size")
-    root = ElementTree.fromstring(data)
+    try:
+        root = ElementTree.fromstring(data)
+    except LookupError as exc:
+        raise ComicInfoError(f"Cannot read ComicInfo.xml: {exc}") from exc
     if root.tag != "ComicInfo":
         raise ComicInfoError("ComicInfo.xml has an unexpected root element")
     return root
@@ -130,6 +133,10 @@ def _chapter_labels_span(pages: list[Path]) -> bool:
     return False
 
 
+def number_spans_chapters(number: str | None) -> bool:
+    return bool(_NUMBER_SPAN.fullmatch(number or ""))
+
+
 def _metadata(
     root: ElementTree.Element | None, pages: list[Path], revision: str
 ) -> ComicInfoMetadata:
@@ -140,7 +147,7 @@ def _metadata(
     return ComicInfoMetadata(
         root is not None, text("Series"), text("Number"), text("Volume"),
         text("Title"), text("PageCount"), len(pages), revision,
-        bool(_NUMBER_SPAN.fullmatch(text("Number") or "")) or _chapter_labels_span(pages),
+        number_spans_chapters(text("Number")) or _chapter_labels_span(pages),
     )
 
 

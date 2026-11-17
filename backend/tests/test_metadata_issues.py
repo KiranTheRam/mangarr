@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -15,7 +16,9 @@ from mangarr import comicinfo, db as db_module, metadata_issues
 from mangarr.api import issues as issues_api, library as library_api, series as series_api
 from mangarr.comicinfo import ArchiveChanged, ComicInfoError, read_comicinfo, update_comicinfo
 from mangarr.jobs import tasks
-from mangarr.schemas import ChapterMetadataIn, ComicInfoUpdateIn, IssueResolveIn
+from mangarr.schemas import (
+    ChapterMetadataIn, ComicInfoUpdateIn, FileMapIn, FileMapRangeIn, IssueResolveIn,
+)
 from mangarr.metadata_issues import detect_series_issues, find_candidates
 from mangarr.models import Base, Chapter, LibraryIssue, RootFolder, Series
 
@@ -249,6 +252,9 @@ async def repair_db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(issues_api, "_notify_reader", no_notify)
     monkeypatch.setattr(tasks, "_SERIES_LOCKS", {})
+    lock = asyncio.Lock()
+    monkeypatch.setattr(issues_api, "manual_archive_lock", lock)
+    monkeypatch.setattr(library_api, "manual_archive_lock", lock)
     monkeypatch.setattr(db_module, "SessionLocal", maker)
     async with maker() as session:
         series = Series(title="Tracked", folder_name="Tracked", root_folder=RootFolder(path=str(root)))
@@ -353,6 +359,97 @@ async def test_invalid_xml_keeps_archive_and_valid_write_runs_off_event_loop(rep
     with pytest.raises(HTTPException) as exc:
         await issues_api.update_chapter_comicinfo(series.id, chapter_id, body, session)
     assert exc.value.status_code == 409
+
+
+async def test_unsupported_xml_encoding_does_not_abort_scans(repair_db):
+    session, _, series, path = repair_db
+    archive(path, '<?xml version="1.0" encoding="bogus"?><ComicInfo/>')
+    other_folder = path.parent.parent / "Other"
+    other_folder.mkdir()
+    other = other_folder / "Other Ch. 1.cbz"
+    archive(other, "<ComicInfo><Number>2</Number></ComicInfo>")
+    session.add(Series(
+        title="Other", folder_name="Other", root_folder=series.root_folder,
+        chapters=[Chapter(number=1, downloaded=True, file_path=str(other))],
+    ))
+    await session.commit()
+
+    await library_api.scan(series.id, session)
+    result = await issues_api.scan_issues(session)
+    assert result.active == 1
+    issue = (await session.scalars(select(LibraryIssue))).one()
+    assert issue.file_path == str(other) and issue.field == "number"
+    with pytest.raises(HTTPException) as exc:
+        await issues_api.get_chapter_comicinfo(series.id, series.chapters[0].id, session)
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.parametrize("number", ["1-2", "1 – 2", "1, 2"])
+def test_comicinfo_edit_rejects_chapter_spans(number):
+    with pytest.raises(ValidationError, match="Number must describe a single chapter"):
+        ComicInfoUpdateIn(
+            revision="revision", series="Tracked", number=number,
+            title=None, volume=None, page_count=None,
+        )
+
+
+@pytest.mark.parametrize("mapping", ["chapter", "range"])
+async def test_archive_edit_serializes_cross_series_manual_mapping(repair_db, monkeypatch, mapping):
+    session, maker, series, path = repair_db
+    sid, chapter_id = series.id, series.chapters[0].id
+    other = Series(
+        title="Other", folder_name=series.folder_name, root_folder=series.root_folder,
+        chapters=[Chapter(number=1), Chapter(number=2)],
+    )
+    session.add(other)
+    await session.commit()
+    other_id, other_chapter_id = other.id, other.chapters[0].id
+    entered, release, mapping_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = issues_api._write_archive
+
+    async def pause_write(*args):
+        entered.set()
+        await release.wait()
+        return await original(*args)
+
+    monkeypatch.setattr(issues_api, "_write_archive", pause_write)
+
+    async def edit():
+        async with maker() as db:
+            body = ComicInfoUpdateIn(
+                revision=read_comicinfo(path).revision, series="Tracked", number="1",
+                title="New title", volume=None, page_count=None,
+            )
+            return await issues_api.update_chapter_comicinfo(sid, chapter_id, body, db)
+
+    async def map_archive():
+        async with maker() as db:
+            mapping_started.set()
+            if mapping == "chapter":
+                await library_api.map_file(
+                    other_id, FileMapIn(chapter_id=other_chapter_id, file_path=str(path)), db,
+                )
+            else:
+                await library_api.map_file_range(
+                    other_id, FileMapRangeIn(from_number=1, to_number=2, file_path=str(path)), db,
+                )
+
+    async with asyncio.timeout(10):
+        saving = asyncio.create_task(edit())
+        await entered.wait()
+        mapping_task = asyncio.create_task(map_archive())
+        await mapping_started.wait()
+        try:
+            assert not mapping_task.done()
+            async with maker() as db:
+                assert not (await db.get(Chapter, other_chapter_id)).downloaded
+        finally:
+            release.set()
+            await asyncio.gather(saving, mapping_task)
+    assert read_comicinfo(path).title == "New title"
+    async with maker() as db:
+        with pytest.raises(HTTPException, match="shared"):
+            await issues_api.get_chapter_comicinfo(sid, chapter_id, db)
 
 
 @pytest.mark.parametrize("evidence", ["volume filename", "title only", "chapter span", "XML span", "page labels"])

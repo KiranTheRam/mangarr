@@ -20,7 +20,8 @@ from ..library.scanner import (
     scan_series,
     series_dir,
 )
-from ..metadata_issues import detect_series_issues
+from ..jobs.tasks import series_lock
+from ..metadata_issues import detect_series_issues, manual_archive_lock
 from ..models import Chapter, RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     CleanupApplyIn,
@@ -256,14 +257,15 @@ async def series_files(series_id: int, session: AsyncSession = Depends(get_sessi
 async def map_file(
     series_id: int, body: FileMapIn, session: AsyncSession = Depends(get_session)
 ):
-    series = await _load(session, series_id)
-    chapter = next((c for c in _active_chapters(series) if c.id == body.chapter_id), None)
-    if chapter is None:
-        raise HTTPException(404, "Chapter not found")
-    media_path = _require_series_media_path(series, body.file_path)
-    chapter.downloaded = True
-    chapter.file_path = str(media_path)
-    await session.commit()
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        chapter = next((c for c in _active_chapters(series) if c.id == body.chapter_id), None)
+        if chapter is None:
+            raise HTTPException(404, "Chapter not found")
+        media_path = _require_series_media_path(series, body.file_path)
+        chapter.downloaded = True
+        chapter.file_path = str(media_path)
+        await session.commit()
 
 
 @router.get("/series/{series_id}/cleanup", response_model=CleanupPlanOut)
@@ -323,24 +325,25 @@ async def map_file_range(
     parsed volume onto those chapters so future scans/renames keep working."""
     from ..util import parse_volume_number
 
-    series = await _load(session, series_id)
-    media_path = _require_series_media_path(series, body.file_path)
-    lo, hi = sorted((body.from_number, body.to_number))
-    volume = parse_volume_number(media_path.stem)
-    mapped = 0
-    for ch in _active_chapters(series):
-        if lo <= ch.number <= hi:
-            ch.downloaded = True
-            ch.file_path = str(media_path)
-            if volume is not None:
-                ch.volume = volume
-                ch.volume_source = "manual"
-                ch.volume_locked = True
-            mapped += 1
-    if mapped == 0:
-        raise HTTPException(400, "No tracked chapters in that range")
-    await session.commit()
-    return FileMapRangeOut(mapped=mapped, volume=volume)
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        media_path = _require_series_media_path(series, body.file_path)
+        lo, hi = sorted((body.from_number, body.to_number))
+        volume = parse_volume_number(media_path.stem)
+        mapped = 0
+        for ch in _active_chapters(series):
+            if lo <= ch.number <= hi:
+                ch.downloaded = True
+                ch.file_path = str(media_path)
+                if volume is not None:
+                    ch.volume = volume
+                    ch.volume_source = "manual"
+                    ch.volume_locked = True
+                mapped += 1
+        if mapped == 0:
+            raise HTTPException(400, "No tracked chapters in that range")
+        await session.commit()
+        return FileMapRangeOut(mapped=mapped, volume=volume)
 
 
 # --------------------------------------------------------------- folders

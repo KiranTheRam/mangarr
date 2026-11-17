@@ -17,7 +17,7 @@ from ..db import get_session
 from ..jobs.tasks import series_lock
 from ..metadata_issues import (
     ArchiveIneligible, chapter_paths, current_candidates, detect_series_issues,
-    inspect_chapter_archive, reconcile_candidates,
+    inspect_chapter_archive, manual_archive_lock, reconcile_candidates,
 )
 from ..models import Chapter, LibraryIssue, Series
 from ..schemas import (
@@ -104,7 +104,7 @@ async def update_chapter_comicinfo(
     body: ComicInfoUpdateIn,
     session: AsyncSession = Depends(get_session),
 ):
-    async with series_lock(series_id):
+    async with series_lock(series_id), manual_archive_lock:
         series = await _series(session, series_id)
         if series is None:
             raise HTTPException(404, "Series not found")
@@ -208,7 +208,7 @@ async def restore_issue(issue_id: str, session: AsyncSession = Depends(get_sessi
 async def resolve_issue(
     issue_id: str, body: IssueResolveIn, session: AsyncSession = Depends(get_session)
 ):
-    async with _locked_issue(session, issue_id) as issue:
+    async with _locked_issue(session, issue_id) as issue, manual_archive_lock:
         if issue.ignored or body.revision != issue.revision:
             raise HTTPException(409, "The issue changed; review the current recommendation")
         series = await _series(session, issue.series_id)

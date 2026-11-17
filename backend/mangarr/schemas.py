@@ -288,6 +288,15 @@ class ComicInfoUpdateIn(BaseModel):
         value = " ".join(value.split())
         return value or None
 
+    @field_validator("number")
+    @classmethod
+    def _single_chapter_number(cls, value):
+        from .comicinfo import number_spans_chapters
+
+        if number_spans_chapters(value):
+            raise ValueError("Number must describe a single chapter")
+        return value
+
     @field_validator("volume", "page_count")
     @classmethod
     def _positive_optional_integer(cls, value, info):
