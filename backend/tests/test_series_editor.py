@@ -1,6 +1,7 @@
 """The library mass editor: bulk monitoring, moving series to another root
 folder, bulk refresh/search and bulk delete."""
 
+import asyncio
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -22,7 +23,7 @@ from mangarr.models import (
     Series,
     SeriesFolder,
 )
-from mangarr.schemas import IssueResolveIn, SeriesBulkIn, SeriesBulkRefreshIn, SeriesEditorIn
+from mangarr.schemas import IssueResolveIn, RenameApplyIn, SeriesBulkIn, SeriesBulkRefreshIn, SeriesEditorIn
 
 
 @pytest.fixture
@@ -173,6 +174,66 @@ async def test_move_carries_ignored_archive_warning_to_new_root(session, roots, 
     await issues_api.restore_issue(rescanned.id, session)
     await issues_api.resolve_issue(rescanned.id, IssueResolveIn(revision=rescanned.revision), session)
     assert read_comicinfo(moved_path).page_count == "1"
+
+
+async def test_move_reloads_paths_after_a_concurrent_rename(tmp_path, roots, monkeypatch):
+    old, new = roots
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'concurrent-move.db'}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    entered = asyncio.Event()
+    renamed = asyncio.Event()
+    original_get_settings = series_api.settings_service.get_all
+
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with maker() as setup:
+            new_root = RootFolder(path=str(new))
+            setup.add(new_root)
+            series = await _add(setup, "Alpha", RootFolder(path=str(old)), numbers=(1,))
+            series_id, new_root_id = series.id, new_root.id
+            library = old / "Alpha"
+            library.mkdir()
+            with ZipFile(library / "Ch 1.cbz", "w") as archive:
+                archive.writestr("001.jpg", b"page")
+                archive.writestr("ComicInfo.xml", "<ComicInfo><PageCount>2</PageCount></ComicInfo>")
+            await library_api.scan(series_id, setup)
+            [warning] = await issues_api.list_issues(ignored=False, series_id=series_id, session=setup)
+            await issues_api.ignore_issue(warning.id, setup)
+
+        async with maker() as moving, maker() as renaming:
+            async def pause_bulk_settings(session):
+                if session is moving and not entered.is_set():
+                    entered.set()
+                    await renamed.wait()
+                return await original_get_settings(session)
+
+            monkeypatch.setattr(series_api.settings_service, "get_all", pause_bulk_settings)
+            move_task = asyncio.create_task(_edit(
+                moving, series_ids=[series_id], root_folder_id=new_root_id, move_files=True,
+                monitor_mode="none",
+            ))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                [outcome] = await library_api.rename_apply(series_id, RenameApplyIn(), renaming)
+                assert outcome.status == "renamed"
+            finally:
+                renamed.set()
+                move = await asyncio.wait_for(move_task, timeout=5)
+
+        assert move.moved == 1 and not move.problems
+        moved_path = new / "Alpha" / outcome.new_name
+        assert moved_path.is_file() and not library.exists()
+        async with maker() as check:
+            chapter = await check.scalar(select(Chapter).where(Chapter.series_id == series_id))
+            assert chapter.file_path == str(moved_path)
+            assert not chapter.monitored
+            [ignored] = await issues_api.list_issues(ignored=True, series_id=series_id, session=check)
+            assert ignored.id == warning.id and ignored.file_path == str(moved_path)
+            await library_api.scan(series_id, check)
+            assert await issues_api.list_issues(ignored=False, series_id=series_id, session=check) == []
+    finally:
+        await engine.dispose()
 
 
 async def test_move_never_overwrites_and_reports_blocked_series(session, roots):

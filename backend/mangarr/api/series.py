@@ -239,26 +239,52 @@ async def _series_in_order(session: AsyncSession, series_ids: list[int], *option
 
 
 async def _change_root_folder(
-    session: AsyncSession, series: Series, new_root: RootFolder, move_files: bool
+    session: AsyncSession, series: Series, new_root: RootFolder, body: SeriesEditorIn,
 ) -> bool:
-    """Point the series at another root folder, optionally moving its folder
-    there first. Returns whether files moved; raises MoveError (with nothing
-    changed) when the move can't happen."""
-    if not move_files or series.root_folder is None:
+    """Apply monitoring edits and change the root, moving files when requested.
+
+    Returns whether files moved. A MoveError leaves the root and files in place.
+    """
+    if not body.move_files:
+        _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
+        if series.root_folder_id == new_root.id:
+            return False
         if series.root_folder is not None:
             anchor_extra_folders(series, Path(series.root_folder.path))
         series.root_folder = new_root
         return False
     lock = await try_acquire_series_lock(series.id)
     if lock is None:
+        _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
+        if series.root_folder_id == new_root.id:
+            return False
         raise MoveError("the series is refreshing; try again once it finishes")
     try:
         async with manual_archive_lock:
             # Defer writes from bulk monitoring edits until the move commits.
             with session.no_autoflush:
+                # The bulk editor's preloaded paths can predate a rename or a
+                # scan. Re-read the series and its mappings before changing them.
+                current = await session.scalar(
+                    select(Series)
+                    .options(
+                        selectinload(Series.chapters), selectinload(Series.extra_folders),
+                        selectinload(Series.root_folder),
+                    )
+                    .where(Series.id == series.id)
+                    .execution_options(populate_existing=True)
+                )
+                if current is None:
+                    raise MoveError("the series no longer exists")
+                _apply_monitoring(current, body.monitored, body.monitor_mode, body.monitor_from)
+                if current.root_folder_id == new_root.id:
+                    return False
+                if current.root_folder is None:
+                    current.root_folder = new_root
+                    return False
                 in_flight = await session.scalar(
                     select(Download.id).where(
-                        Download.series_id == series.id,
+                        Download.series_id == current.id,
                         Download.status.in_([
                             DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
                         ]),
@@ -267,19 +293,19 @@ async def _change_root_folder(
             if in_flight is not None:
                 raise MoveError("downloads are in progress; move it once they finish")
 
-            old_root = Path(series.root_folder.path)
-            old_paths = {chapter.id: chapter.file_path for chapter in series.chapters}
-            moved = await move_series_folder(series, new_root)
-            anchor_extra_folders(series, old_root)
-            series.root_folder = new_root
+            old_root = Path(current.root_folder.path)
+            old_paths = {chapter.id: chapter.file_path for chapter in current.chapters}
+            moved = await move_series_folder(current, new_root)
+            anchor_extra_folders(current, old_root)
+            current.root_folder = new_root
             if moved:
                 renames = list(dict.fromkeys(
                     (old_paths[chapter.id], chapter.file_path)
-                    for chapter in series.chapters
+                    for chapter in current.chapters
                     if old_paths[chapter.id] and old_paths[chapter.id] != chapter.file_path
                 ))
-                if await relocate_archive_issues(session, series.id, renames):
-                    await detect_series_issues(session, series)
+                if await relocate_archive_issues(session, current.id, renames):
+                    await detect_series_issues(session, current)
             await session.commit()
     finally:
         lock.release()
@@ -306,10 +332,9 @@ async def edit_series_bulk(body: SeriesEditorIn, session: AsyncSession = Depends
     values = await settings_service.get_all(session) if new_root and body.move_files else {}
     out = SeriesEditorOut(updated=0)
     for series in series_list:
-        _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
-        if new_root is not None and series.root_folder_id != new_root.id:
+        if new_root is not None:
             try:
-                moved = await _change_root_folder(session, series, new_root, body.move_files)
+                moved = await _change_root_folder(session, series, new_root, body)
             except MoveError as exc:
                 out.problems.append(
                     SeriesEditorProblemOut(series_id=series.id, title=series.title, detail=str(exc))
@@ -318,6 +343,8 @@ async def edit_series_bulk(body: SeriesEditorIn, session: AsyncSession = Depends
             if moved:
                 out.moved += 1
                 _notify_kavita(values, series)
+        else:
+            _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
         out.updated += 1
     await session.commit()
     return out

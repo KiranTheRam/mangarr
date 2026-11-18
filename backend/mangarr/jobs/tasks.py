@@ -7,7 +7,7 @@ import re
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1680,10 +1680,27 @@ def _place_torrent_files(content_path, series, chapters, *args, **kwargs):
     return placed, coverage
 
 
+def _torrent_payload_overlaps_library(
+    content_path: Path, library_root: Path, files: list[Path] | None,
+) -> bool:
+    """Whether a torrent can read metadata from an existing library archive."""
+    try:
+        root = library_root.resolve()
+        if files is not None:
+            return any(path.resolve().is_relative_to(root) for path in files)
+        payload = content_path.resolve()
+        return payload.is_relative_to(root) or root.is_relative_to(payload)
+    except (OSError, RuntimeError):
+        # Let the importer handle path errors with the usual retry policy.
+        return True
+
+
 async def _import_torrent(
     session: AsyncSession, dl: Download, content_path: Path, values: dict[str, str],
     files: list[Path] | None = None,
 ) -> None:
+    from ..metadata_issues import manual_archive_lock
+
     series = await _load_series(session, dl.series_id) if dl.series_id else None
     if series is None or not series.root_folder:
         dl.status = DownloadStatus.FAILED
@@ -1712,99 +1729,120 @@ async def _import_torrent(
             dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
-    # copy mode, a cross-device hardlink fallback and image packing rewrite
-    # every byte (and the duplicate preflight reads every archive); for a
-    # multi-GB payload that would freeze the API, the queue and this sync, so
-    # it runs off the loop. ORM objects aren't thread-safe: the importer gets
-    # plain snapshots, and the chapters it matched are mapped back to this
-    # session's objects for the updates below.
-    candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
-    try:
+    # The caller holds the series lock throughout. Legacy payloads can
+    # already be in the library, where planning a chapter match may read
+    # ComicInfo from the very archive a repair is about to replace.
+    library_root = Path(series.root_folder.path)
+    protects_inputs = await asyncio.to_thread(
+        _torrent_payload_overlaps_library, content_path, library_root, files,
+    )
+    async with AsyncExitStack() as archive_guard:
+        if protects_inputs:
+            await archive_guard.enter_async_context(manual_archive_lock)
+
+        # copy mode, a cross-device hardlink fallback and image packing rewrite
+        # every byte (and the duplicate preflight reads every archive); for a
+        # multi-GB payload that would freeze the API, the queue and this sync, so
+        # it runs off the loop. ORM objects aren't thread-safe: the importer gets
+        # plain snapshots, and the chapters it matched are mapped back to this
+        # session's objects for the updates below.
+        candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
         try:
-            placed, coverage = await asyncio.to_thread(
-                _place_torrent_files,
-                content_path,
-                SimpleNamespace(title=series.title, folder_name=series.folder_name),
-                [
-                    SimpleNamespace(id=chapter.id, number=chapter.number,
-                                    volume=chapter.volume, title=chapter.title,
-                                    downloaded=chapter.downloaded, file_path=chapter.file_path)
-                    for chapter in candidates.values()
-                ],
-                Path(series.root_folder.path),
-                values["naming_template"], values["naming_template_no_volume"],
-                import_mode=values.get("import_mode", "hardlink"), files=files,
-            )
-        except Exception:
-            # the queue stays usable while the worker runs, so the user may
-            # have removed this download meanwhile (which also deletes the
-            # payload, failing the import): their removal stands
-            await _raise_if_download_removed(session, dl.id)
-            raise
-        await _raise_if_download_removed(session, dl.id)
-    except DownloadCancelled as cancelled:
-        # `dl` still holds the pre-import status; writing anything here would
-        # undo the removal. Files the import already placed stay in the
-        # library unrecorded, as after any import that stops partway; a
-        # rescan or a later grab of the chapter picks them up.
-        _import_path_missing_counts.pop(dl.id, None)
-        log.info("torrent import %d discarded: %s", dl.id, cancelled)
-        return
-    except FileNotFoundError as exc:
-        # qBittorrent may finish downloading and then atomically move the
-        # payload from its temporary directory to the category directory.
-        # A move between discovery and hardlink/copy is transient: let the
-        # next sync fetch the torrent's new content_path and retry.  Import is
-        # idempotent because already-created destinations are not overwritten.
-        misses = _import_path_missing_counts.get(dl.id, 0) + 1
-        _import_path_missing_counts[dl.id] = misses
-        if misses >= IMPORT_PATH_MISSING_LIMIT:
+            if protects_inputs:
+                await _raise_if_download_removed(session, dl.id)
+            try:
+                placed, coverage = await asyncio.to_thread(
+                    _place_torrent_files,
+                    content_path,
+                    SimpleNamespace(title=series.title, folder_name=series.folder_name),
+                    [
+                        SimpleNamespace(id=chapter.id, number=chapter.number,
+                                        volume=chapter.volume, title=chapter.title,
+                                        downloaded=chapter.downloaded, file_path=chapter.file_path)
+                        for chapter in candidates.values()
+                    ],
+                    library_root,
+                    values["naming_template"], values["naming_template_no_volume"],
+                    import_mode=values.get("import_mode", "hardlink"), files=files,
+                )
+            except Exception:
+                # the queue stays usable while the worker runs, so the user may
+                # have removed this download meanwhile (which also deletes the
+                # payload, failing the import): their removal stands
+                await _raise_if_download_removed(session, dl.id)
+                raise
+        except DownloadCancelled as cancelled:
+            # `dl` still holds the pre-import status; writing anything here would
+            # undo the removal. Files the import already placed stay in the
+            # library unrecorded, as after any import that stops partway; a
+            # rescan or a later grab of the chapter picks them up.
             _import_path_missing_counts.pop(dl.id, None)
+            log.info("torrent import %d discarded: %s", dl.id, cancelled)
+            return
+        except FileNotFoundError as exc:
+            # qBittorrent may finish downloading and then atomically move the
+            # payload from its temporary directory to the category directory.
+            # A move between discovery and hardlink/copy is transient: let the
+            # next sync fetch the torrent's new content_path and retry.  Import is
+            # idempotent because already-created destinations are not overwritten.
+            misses = _import_path_missing_counts.get(dl.id, 0) + 1
+            _import_path_missing_counts[dl.id] = misses
+            if misses >= IMPORT_PATH_MISSING_LIMIT:
+                _import_path_missing_counts.pop(dl.id, None)
+                dl.status = DownloadStatus.FAILED
+                dl.error = (f"content kept disappearing during import: {exc} — "
+                            "check qBittorrent's temporary and category paths")[:500]
+                log.exception("torrent import %d repeatedly lost its content path", dl.id)
+            else:
+                dl.status = DownloadStatus.DOWNLOADING
+                dl.error = f"content moved during import; retrying: {exc}"[:500]
+                log.info("torrent import %d content moved; retrying on next sync", dl.id)
+            await session.commit()
+            return
+        except Exception as exc:
+            log.exception("torrent import %d failed", dl.id)
             dl.status = DownloadStatus.FAILED
-            dl.error = (f"content kept disappearing during import: {exc} — "
-                        "check qBittorrent's temporary and category paths")[:500]
-            log.exception("torrent import %d repeatedly lost its content path", dl.id)
-        else:
-            dl.status = DownloadStatus.DOWNLOADING
-            dl.error = f"content moved during import; retrying: {exc}"[:500]
-            log.info("torrent import %d content moved; retrying on next sync", dl.id)
+            dl.error = str(exc)[:500]
+            await session.commit()
+            return
+        _import_path_missing_counts.pop(dl.id, None)
+        imported = [
+            (dest, candidates[match.id] if match is not None else None, volume)
+            for dest, match, volume in placed
+        ]
+        # Ordinary downloads copy or pack external payloads without holding
+        # the archive lock. Publishing ownership must still serialize with
+        # repairs so their ownership checks cover the replacement itself.
+        if not protects_inputs:
+            await archive_guard.enter_async_context(manual_archive_lock)
+        try:
+            await _raise_if_download_removed(session, dl.id)
+        except DownloadCancelled as cancelled:
+            log.info("torrent import %d discarded: %s", dl.id, cancelled)
+            return
+        for dest, chapter, _volume in imported:
+            if chapter is not None:
+                # Keep the origin of a file the import found already mapped.
+                if not chapter.downloaded or chapter.file_path != str(dest):
+                    chapter.file_path = str(dest)
+                    chapter.file_source = dl.source_name or "nyaa"
+                chapter.downloaded = True
+            else:
+                for chapter_id in coverage.get(str(dest), []):
+                    ch = candidates[chapter_id]
+                    if not ch.downloaded:
+                        ch.downloaded = True
+                        # Assign file_source after file_path resets provenance.
+                        ch.file_path = str(dest)
+                        ch.file_source = dl.source_name or "nyaa"
+        dl.status = DownloadStatus.DONE
+        dl.progress = 1.0
+        dl.error = ""
+        session.add(HistoryEvent(
+            series_id=series.id, event="imported", source_name=dl.source_name or "nyaa",
+            detail=f"{len(imported)} file(s) from {dl.title}",
+        ))
         await session.commit()
-        return
-    except Exception as exc:
-        log.exception("torrent import %d failed", dl.id)
-        dl.status = DownloadStatus.FAILED
-        dl.error = str(exc)[:500]
-        await session.commit()
-        return
-    _import_path_missing_counts.pop(dl.id, None)
-    imported = [
-        (dest, candidates[match.id] if match is not None else None, volume)
-        for dest, match, volume in placed
-    ]
-    for dest, chapter, volume in imported:
-        if chapter is not None:
-            # a destination that already was this chapter's file keeps its
-            # recorded origin — the import found it rather than placed it
-            if not chapter.downloaded or chapter.file_path != str(dest):
-                chapter.file_path = str(dest)
-                chapter.file_source = dl.source_name or "nyaa"
-            chapter.downloaded = True
-        else:
-            for chapter_id in coverage.get(str(dest), []):
-                ch = candidates[chapter_id]
-                if not ch.downloaded:
-                    ch.downloaded = True
-                    # set after file_path: assigning it resets provenance
-                    ch.file_path = str(dest)
-                    ch.file_source = dl.source_name or "nyaa"
-    dl.status = DownloadStatus.DONE
-    dl.progress = 1.0
-    dl.error = ""
-    session.add(HistoryEvent(
-        series_id=series.id, event="imported", source_name=dl.source_name or "nyaa",
-        detail=f"{len(imported)} file(s) from {dl.title}",
-    ))
-    await session.commit()
     notifications.notify_import(values, series.id, f"{len(imported)} file(s) from torrent")
     _notify_kavita(values, series)
 

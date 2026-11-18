@@ -9,6 +9,9 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from mangarr import comicinfo, metadata_issues
+from mangarr.api import issues
+from mangarr.download.cbz import write_cbz
 from mangarr.jobs import tasks
 from mangarr.models import (
     Base,
@@ -20,6 +23,7 @@ from mangarr.models import (
     RootFolder,
     Series,
 )
+from mangarr.schemas import ComicInfoUpdateIn
 
 VALUES = {
     "naming_template": "{series} - Ch. {chapter:04.1f}",
@@ -102,6 +106,89 @@ async def two_sessions(tmp_path, monkeypatch):
     async with maker() as sync_session, maker() as api_session:
         yield sync_session, api_session, notified
     await engine.dispose()
+
+
+@pytest.mark.parametrize("correct_number", [False, True])
+async def test_torrent_import_waits_for_repair_before_adopting_shared_archive(
+    two_sessions, tmp_path, monkeypatch, correct_number,
+):
+    sync_session, api_session, _ = two_sessions
+    folder = tmp_path / "library" / "Shared"
+    archive = folder / "Bonus Story.cbz"
+    original_number = 2 if correct_number else 1
+    write_cbz(
+        archive, [b"\xff\xd8\xffimage"],
+        f"<ComicInfo><Number>{original_number}</Number></ComicInfo>",
+    )
+    root = RootFolder(path=str(folder.parent))
+    first = Series(title="First", folder_name=folder.name, root_folder=root, chapters=[
+        Chapter(number=1, downloaded=True, file_path=str(archive)),
+    ])
+    second_chapter = Chapter(number=original_number)
+    second = Series(title="Second", folder_name=folder.name, root_folder=root, chapters=[second_chapter])
+    sync_session.add_all([first, second])
+    await sync_session.flush()
+    download = Download(series_id=second.id, kind=DownloadKind.TORRENT, status=DownloadStatus.IMPORTING)
+    sync_session.add(download)
+    await sync_session.commit()
+
+    import_waiting = asyncio.Event()
+
+    class ObservedLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                import_waiting.set()
+            return await super().acquire()
+
+    archive_lock = ObservedLock()
+    monkeypatch.setattr(issues, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(metadata_issues, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(tasks, "_SERIES_LOCKS", {})
+    before = await issues.get_chapter_comicinfo(first.id, first.chapters[0].id, api_session)
+
+    repair_ready = asyncio.Event()
+    release_repair = threading.Event()
+    loop = asyncio.get_running_loop()
+    require_revision = comicinfo._require_revision
+
+    def pause_repair(path, revision):
+        require_revision(path, revision)
+        if path == archive and any(folder.glob(f".{archive.name}.*.tmp")):
+            loop.call_soon_threadsafe(repair_ready.set)
+            assert release_repair.wait(timeout=8)
+
+    monkeypatch.setattr(comicinfo, "_require_revision", pause_repair)
+
+    async def import_archive():
+        async with tasks.series_lock(second.id):
+            await tasks._import_torrent(sync_session, download, archive, VALUES, files=[archive])
+
+    edit = {"number": "1"} if correct_number else {"title": "Repaired"}
+    repair = asyncio.create_task(issues.update_chapter_comicinfo(
+        first.id, first.chapters[0].id, ComicInfoUpdateIn(revision=before.revision, **edit), api_session,
+    ))
+    queued_import = None
+    try:
+        await asyncio.wait_for(repair_ready.wait(), timeout=5)
+        queued_import = asyncio.create_task(import_archive())
+        await asyncio.wait_for(import_waiting.wait(), timeout=5)
+        assert download.status == DownloadStatus.IMPORTING
+        assert not second_chapter.downloaded
+    finally:
+        release_repair.set()
+        await repair
+        if queued_import is not None:
+            await queued_import
+
+    await sync_session.refresh(second_chapter)
+    assert download.status == DownloadStatus.DONE
+    repaired = comicinfo.read_comicinfo(archive)
+    if correct_number:
+        assert repaired.number == "1"
+        assert not second_chapter.downloaded and not second_chapter.file_path
+    else:
+        assert repaired.title == "Repaired"
+        assert second_chapter.downloaded and second_chapter.file_path == str(archive)
 
 
 @pytest.mark.parametrize("outcome", ["imported", "payload deleted", "failed"])

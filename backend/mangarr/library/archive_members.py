@@ -37,7 +37,12 @@ def archive_files(entries: Iterable[ZipInfo]) -> Iterator[ArchiveFile]:
 
 
 def archive_pages(files: Iterable[ArchiveFile]) -> Iterator[ArchiveFile]:
-    return ((entry, path) for entry, path in files if path.suffix.lower() in IMAGE_EXTS)
+    # Readers skip dot-prefixed ZIP names when counting pages. Use the raw
+    # name because PurePosixPath removes a leading "./".
+    return (
+        (entry, path) for entry, path in files
+        if not entry.filename.startswith(".") and path.suffix.lower() in IMAGE_EXTS
+    )
 
 
 def find_comicinfo_member(files: Iterable[ArchiveFile]) -> ZipInfo | None:

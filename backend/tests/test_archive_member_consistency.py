@@ -50,10 +50,12 @@ def test_distinct_library_metadata_entries_are_ambiguous_to_both_readers(tmp_pat
         read_comicinfo(path)
 
 
-def test_nas_members_are_not_pages_but_survive_metadata_edits(tmp_path):
+def test_hidden_and_nas_members_are_not_pages_but_survive_metadata_edits(tmp_path):
     path = tmp_path / "Tracked Ch. 1.cbz"
     page = b"story page"
-    nas_members = {
+    excluded_members = {
+        ".thumb.jpg": b"hidden thumbnail",
+        ".previews/Chapter 2.jpg": b"hidden preview",
         "@eaDIR/001.jpg/SYNOPHOTO_THUMB_S.jpg": b"Synology thumbnail",
         "nested/.@__thumb/Chapter 2.jpg": b"QNAP thumbnail",
         ".zfs\\snapshot\\copy.png": b"snapshot",
@@ -61,7 +63,7 @@ def test_nas_members_are_not_pages_but_survive_metadata_edits(tmp_path):
     with ZipFile(path, "w") as archive:
         archive.writestr("c001-p001.jpg", page)
         archive.writestr("ComicInfo.xml", "<ComicInfo><Number>1</Number><PageCount>4</PageCount></ComicInfo>")
-        for name, content in nas_members.items():
+        for name, content in excluded_members.items():
             archive.writestr(name, content)
 
     assert read_comicinfo(path).actual_page_count == 1
@@ -70,7 +72,7 @@ def test_nas_members_are_not_pages_but_survive_metadata_edits(tmp_path):
 
     assert update_comicinfo(path, {"page_count": 1}).page_count == "1"
     with ZipFile(path) as archive:
-        assert {name: archive.read(name) for name in nas_members} == nas_members
+        assert {name: archive.read(name) for name in excluded_members} == excluded_members
 
     merged = tmp_path / "Volume 1.cbz"
     assert merge_chapter_archives([(1, path)], merged, "Tracked", 1) == 1
