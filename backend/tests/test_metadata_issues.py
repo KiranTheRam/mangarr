@@ -370,6 +370,49 @@ async def test_changed_archive_requires_a_fresh_review_even_if_issue_values_matc
     assert issue.revision != reviewed.revision
 
 
+async def test_changed_issue_kind_starts_active_and_rejects_old_dismissal(repair_db):
+    session, _, series, path = repair_db
+    [issue] = await detect_series_issues(session, series)
+    await session.commit()
+    old_id = issue.public_id
+    await issues_api.ignore_issue(old_id, session)
+
+    update_comicinfo(path, {"volume": 8})
+    await detect_series_issues(session, series)
+    await session.commit()
+    assert issue.kind == "comicinfo_volume_mismatch" and issue.ignored and issue.public_id == old_id
+
+    update_comicinfo(path, {"volume": "unknown"})
+    result = await issues_api.scan_issues(session)
+    assert result.active == 1 and result.ignored == 0
+    assert issue.kind == "comicinfo_volume_invalid" and issue.public_id != old_id
+    with pytest.raises(HTTPException) as exc:
+        await issues_api.ignore_issue(old_id, session)
+    assert exc.value.status_code == 404
+    assert not issue.ignored
+
+
+async def test_comicinfo_update_distinguishes_omission_from_removal(repair_db):
+    session, _, series, path = repair_db
+    chapter_id = series.chapters[0].id
+    update_comicinfo(path, {"volume": "1.5", "page_count": "unknown"})
+    before = read_comicinfo(path)
+    with pytest.raises(HTTPException) as exc:
+        await issues_api.update_chapter_comicinfo(
+            series.id, chapter_id, ComicInfoUpdateIn(revision=before.revision), session,
+        )
+    assert exc.value.status_code == 422 and read_comicinfo(path) == before
+
+    result = await issues_api.update_chapter_comicinfo(
+        series.id, chapter_id, ComicInfoUpdateIn(revision=before.revision, title="New title"), session,
+    )
+    assert result.title == "New title" and result.volume == "1.5" and result.page_count == "unknown"
+    result = await issues_api.update_chapter_comicinfo(
+        series.id, chapter_id, ComicInfoUpdateIn(revision=result.revision, page_count=None), session,
+    )
+    assert result.page_count is None and result.volume == "1.5"
+
+
 async def test_invalid_xml_keeps_archive_and_valid_write_runs_off_event_loop(repair_db, monkeypatch):
     session, _, series, path = repair_db
     chapter_id = series.chapters[0].id

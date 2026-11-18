@@ -274,11 +274,11 @@ class ComicInfoOut(BaseModel):
 
 class ComicInfoUpdateIn(BaseModel):
     revision: str
-    series: str | None
-    number: str | None
-    volume: int | None
-    title: str | None
-    page_count: int | None
+    series: str | None = None
+    number: str | None = None
+    volume: int | None = None
+    title: str | None = None
+    page_count: int | None = None
 
     @field_validator("series", "number", "title")
     @classmethod

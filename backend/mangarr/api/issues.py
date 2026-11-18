@@ -104,12 +104,15 @@ async def update_chapter_comicinfo(
     body: ComicInfoUpdateIn,
     session: AsyncSession = Depends(get_session),
 ):
+    updates = body.model_dump(exclude={"revision"}, exclude_unset=True)
+    if not updates:
+        raise HTTPException(422, "No ComicInfo fields to update")
     async with series_lock(series_id), manual_archive_lock:
         series = await _series(session, series_id)
         if series is None:
             raise HTTPException(404, "Series not found")
         path, _ = await _inspect(session, series, chapter_id)
-        info = await _write_archive(path, body.revision, body.model_dump(exclude={"revision"}))
+        info = await _write_archive(path, body.revision, updates)
         await detect_series_issues(session, series)
         await session.commit()
         await _notify_reader(session, series)

@@ -514,15 +514,47 @@ function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: 
     .map(([volume, chs]) => ({ volume, chapters: chs.sort((a, b) => b.number - a.number) }));
 }
 
-function archiveDraft(info: ComicInfo) {
+function archiveFields(info: ComicInfo) {
   return {
-    revision: info.revision,
     series: info.series ?? "",
     number: info.number ?? "",
     volume: info.volume ?? "",
     title: info.title ?? "",
     page_count: info.page_count ?? "",
   };
+}
+
+type ArchiveFields = ReturnType<typeof archiveFields>;
+type ComicInfoUpdate = {
+  revision: string;
+  series?: string | null;
+  number?: string | null;
+  title?: string | null;
+  volume?: number | null;
+  page_count?: number | null;
+};
+
+export function comicInfoUpdate(original: ComicInfo, fields: ArchiveFields) {
+  const payload: ComicInfoUpdate = { revision: original.revision };
+  for (const field of ["series", "number", "title"] as const) {
+    const value = fields[field].trim() || null;
+    if (value !== original[field]) payload[field] = value;
+  }
+  for (const field of ["volume", "page_count"] as const) {
+    const value = fields[field].trim() || null;
+    if (value === original[field]) continue;
+    if (value === null) {
+      payload[field] = null;
+      continue;
+    }
+    const number = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(number) || number < 1) {
+      const label = field === "volume" ? "Volume" : "Page count";
+      return { payload: null, error: `${label} must be a positive whole number.` };
+    }
+    payload[field] = number;
+  }
+  return { payload: Object.keys(payload).length > 1 ? payload : null, error: null };
 }
 
 export function ChapterMetadataModal({
@@ -543,7 +575,7 @@ export function ChapterMetadataModal({
   const [titleLocked, setTitleLocked] = useState(chapter.title_locked);
   const [volumeLocked, setVolumeLocked] = useState(chapter.volume_locked);
   const [excluded, setExcluded] = useState(chapter.excluded);
-  const [draft, setDraft] = useState<ReturnType<typeof archiveDraft> | null>(null);
+  const [draft, setDraft] = useState<{ original: ComicInfo; fields: ArchiveFields } | null>(null);
   const queryClient = useQueryClient();
   const archiveKey = ["comicinfo", seriesId, chapter.id];
   const chapterPath = `/series/${seriesId}/chapters/${chapter.id}`;
@@ -556,7 +588,9 @@ export function ChapterMetadataModal({
     enabled: canInspectArchive,
     retry: false,
   });
-  const fields = draft ?? (comicInfo.data ? archiveDraft(comicInfo.data) : null);
+  const fields = draft?.fields ?? (comicInfo.data ? archiveFields(comicInfo.data) : null);
+  const archiveUpdate = draft ? comicInfoUpdate(draft.original, draft.fields) : null;
+  const archivePayload = archiveUpdate?.payload ?? null;
   const saveChapter = useMutation({
     mutationFn: () => api.put(`${chapterPath}/metadata`, {
       title,
@@ -571,14 +605,7 @@ export function ChapterMetadataModal({
     },
   });
   const saveArchive = useMutation({
-    mutationFn: (reviewed: ReturnType<typeof archiveDraft>) => api.put<ComicInfo>(`${chapterPath}/comicinfo`, {
-      revision: reviewed.revision,
-      series: reviewed.series.trim() || null,
-      number: reviewed.number.trim() || null,
-      volume: reviewed.volume.trim() === "" ? null : Number(reviewed.volume),
-      title: reviewed.title.trim() || null,
-      page_count: reviewed.page_count.trim() === "" ? null : Number(reviewed.page_count),
-    }),
+    mutationFn: (payload: ComicInfoUpdate) => api.put<ComicInfo>(`${chapterPath}/comicinfo`, payload),
     onSuccess: (info) => {
       queryClient.setQueryData(archiveKey, info);
       setDraft(null);
@@ -587,9 +614,16 @@ export function ChapterMetadataModal({
   });
   const saving = saveChapter.isPending || saveArchive.isPending;
   const close = () => { if (!saving) onClose(); };
-  const changeFile = (field: keyof Omit<ReturnType<typeof archiveDraft>, "revision">) =>
+  const changeFile = (field: keyof ArchiveFields) =>
     (event: React.ChangeEvent<HTMLInputElement>) => {
-      if (fields) setDraft({ ...fields, [field]: event.target.value });
+      const value = event.target.value;
+      const info = comicInfo.data;
+      if (!info) return;
+      setDraft((previous) => {
+        const original = previous?.original ?? info;
+        const fields = { ...(previous?.fields ?? archiveFields(original)), [field]: value };
+        return { original, fields };
+      });
       saveArchive.reset();
     };
   return (
@@ -678,23 +712,23 @@ export function ChapterMetadataModal({
           <div className="comicinfo-fields">
             <div className="form-row"><label>Series</label><input value={fields.series} placeholder={seriesTitle} onChange={changeFile("series")} /></div>
             <div className="form-row"><label>Number</label><input value={fields.number} placeholder={String(chapter.number)} onChange={changeFile("number")} /></div>
-            <div className="form-row"><label>Volume</label><input type="number" min="1" value={fields.volume} onChange={changeFile("volume")} /></div>
+            <div className="form-row"><label>Volume</label><input inputMode="numeric" value={fields.volume} onChange={changeFile("volume")} /></div>
             <div className="form-row"><label>Title</label><input value={fields.title} onChange={changeFile("title")} /></div>
             <div className="form-row">
               <label>Page count</label>
-              <input type="number" min="1" value={fields.page_count} onChange={changeFile("page_count")} />
+              <input inputMode="numeric" value={fields.page_count} onChange={changeFile("page_count")} />
               <small>{comicInfo.data.actual_page_count} image pages in archive</small>
             </div>
           </div>
           <div className="filepath" title={comicInfo.data.file_path}>{comicInfo.data.file_path}</div>
+          {archiveUpdate?.error && <p className="form-hint" role="alert">{archiveUpdate.error}</p>}
           <ErrorNotice error={saveArchive.error} />
           <div className="modal-actions chapter-edit-actions">
             {saveArchive.isSuccess && <span role="status">ComicInfo saved</span>}
             <button
               className="btn primary"
-              disabled={!draft || (fields.volume !== "" && Number(fields.volume) < 1)
-                || (fields.page_count !== "" && Number(fields.page_count) < 1)}
-              onClick={() => { if (draft) saveArchive.mutate(draft); }}
+              disabled={!archivePayload}
+              onClick={() => { if (archivePayload) saveArchive.mutate(archivePayload); }}
             >
               {saveArchive.isPending ? "Saving…" : "Save ComicInfo"}
             </button>

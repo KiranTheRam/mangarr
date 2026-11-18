@@ -11,6 +11,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -334,6 +335,11 @@ async def reconcile_candidates(
         if issue is None:
             issue = LibraryIssue(key=key, series_id=series_id, ignored=False)
             session.add(issue)
+        elif issue.kind != candidate.kind:
+            # A dismissal (including a pending Ignore request) belongs to the
+            # previous warning, even when the archive and field are the same.
+            issue.ignored = False
+            issue.public_id = uuid4().hex
         revision = candidate.revision
         if issue.revision != revision:
             values = asdict(candidate)

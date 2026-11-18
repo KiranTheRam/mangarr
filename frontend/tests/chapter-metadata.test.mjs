@@ -7,7 +7,7 @@ import { createServer } from "vite";
 
 const server = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
 after(() => server.close());
-const { ChapterMetadataModal } = await server.ssrLoadModule("/src/pages/SeriesDetail.tsx");
+const { ChapterMetadataModal, comicInfoUpdate } = await server.ssrLoadModule("/src/pages/SeriesDetail.tsx");
 
 test("chapter and ComicInfo saves have separate controls and archive availability", () => {
   const client = new QueryClient();
@@ -32,4 +32,26 @@ test("chapter and ComicInfo saves have separate controls and archive availabilit
   assert.match(loaded, /value="Archive title"/);
   assert.match(loaded, /<button class="btn primary">Save Mangarr metadata<\/button>/);
   assert.match(loaded, /<button class="btn primary" disabled="">Save ComicInfo<\/button>/);
+});
+
+test("ComicInfo saves omit untouched metadata and distinguish removals from invalid numbers", () => {
+  const original = {
+    revision: "reviewed-archive",
+    series: "Tracked", number: "1", title: "Old title", volume: "1.5", page_count: "unknown",
+  };
+  const fields = {
+    series: "Tracked", number: "1", title: "Old title", volume: "1.5", page_count: "unknown",
+  };
+  assert.equal(comicInfoUpdate(original, fields).payload, null);
+  assert.deepEqual(comicInfoUpdate(original, { ...fields, title: "New title" }).payload, {
+    revision: original.revision, title: "New title",
+  });
+  assert.deepEqual(comicInfoUpdate(original, { ...fields, page_count: "", volume: "10" }).payload, {
+    revision: original.revision, page_count: null, volume: 10,
+  });
+  for (const page_count of ["oops", "1.5", "1e2", "0"]) {
+    const result = comicInfoUpdate(original, { ...fields, page_count });
+    assert.equal(result.payload, null);
+    assert.match(result.error, /Page count/);
+  }
 });
