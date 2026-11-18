@@ -21,7 +21,8 @@ from .comicinfo import (
 )
 from .filename import parse_filename
 from .library.scanner import (
-    chapters_under_folders, resolve_folders, root_unavailable, unavailable_extra_folders,
+    chapters_under_folders, resolve_folders, resolve_volume_offsets, root_unavailable,
+    unavailable_extra_folders,
 )
 from .models import Chapter, LibraryIssue, Series
 from .titles import metadata_titles
@@ -174,6 +175,13 @@ def metadata_identifies_volume(
     )
 
 
+def _archive_volume_offset(path: Path, folder_offsets: dict[Path, int]) -> int | None:
+    # A nested extra can overlap the primary folder or another extra. Without
+    # a unique numbering convention, a repair cannot safely pick a volume.
+    offsets = {offset for folder, offset in folder_offsets.items() if path.is_relative_to(folder)}
+    return offsets.pop() if len(offsets) == 1 else None
+
+
 def find_candidates(
     series: Series, ownership: ArchiveOwnership, expect_content: bool = True
 ) -> list[Candidate] | None:
@@ -183,20 +191,23 @@ def find_candidates(
     root = Path(series.root_folder.path)
     if root_unavailable(root, expect_content):
         return None
-    files: list[tuple[Chapter, Path, ComicInfoMetadata]] = []
+    files: list[tuple[Chapter, Path, ComicInfoMetadata, int | None]] = []
     try:
         extras = [root / folder.path for folder in series.extra_folders]
         if chapters_under_folders(series.chapters, unavailable_extra_folders(extras)):
             return None
         folders = _archive_folders(series)
+        offsets = resolve_volume_offsets(root, series)
+        folder_offsets = {folder: offsets.get(str(folder), 0) for folder in folders}
         for chapter in series.chapters:
             if chapter.excluded or not chapter.downloaded or not chapter.file_path:
                 continue
             try:
                 if chapter.file_path in ownership.unavailable:
                     raise ownership.unavailable[chapter.file_path]
-                _, info = _inspect_chapter_archive(series, chapter, folders, ownership)
-                files.append((chapter, Path(chapter.file_path), info))
+                resolved, info = _inspect_chapter_archive(series, chapter, folders, ownership)
+                offset = _archive_volume_offset(resolved, folder_offsets)
+                files.append((chapter, Path(chapter.file_path), info, offset))
             except FileNotFoundError:
                 # An accessible parent lets us distinguish a deleted archive
                 # from a missing mount. A configured extra may be its own mount.
@@ -214,7 +225,7 @@ def find_candidates(
     uncertain_volume_sources = {"", "legacy", "disk-inferred", "comicinfo"}
     valid_titles = {normalized for value in metadata_titles(series) if (normalized := normalize_title(value))}
 
-    for chapter, path, info in files:
+    for chapter, path, info, offset in files:
         if not info.exists:
             continue
         number = _numeric(info.number)
@@ -258,7 +269,9 @@ def find_candidates(
         if info.volume is not None:
             volume = parse_comicinfo_int(info.volume)
             reliable = chapter.volume_source not in uncertain_volume_sources
-            expected_volume = parse_comicinfo_int(str(chapter.volume)) if chapter.volume is not None else None
+            expected_volume = None
+            if chapter.volume is not None and offset is not None:
+                expected_volume = parse_comicinfo_int(str(chapter.volume + offset))
             if volume is None:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_invalid", str(path), "volume",
@@ -268,7 +281,7 @@ def find_candidates(
                     "tag keeps the chapter available without inventing a volume.",
                     info.revision,
                 ))
-            elif chapter.volume is None:
+            elif chapter.volume is None and offset == 0:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_unexpected", str(path), "volume",
                     info.volume, None,
@@ -278,12 +291,15 @@ def find_candidates(
                     info.revision,
                 ))
             elif reliable and expected_volume is not None and volume != expected_volume:
+                expected = f"Volume {chapter.volume}"
+                if offset:
+                    expected = f"local {expected} (physical Volume {expected_volume} with the folder offset)"
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_mismatch", str(path), "volume",
                     info.volume, str(expected_volume),
                     f"ComicInfo volume disagrees with {chapter.volume_source}",
                     f"The archive says Volume {info.volume}, while {chapter.volume_source} "
-                    f"places chapter {chapter.number:g} in Volume {chapter.volume}.",
+                    f"places chapter {chapter.number:g} in {expected}.",
                     info.revision,
                 ))
 
@@ -292,9 +308,11 @@ def find_candidates(
     # catches imported one-off bonus chapters without pretending disk-inferred
     # assignments are authoritative enough to validate the bad tag.
     by_volume: dict[int, list[tuple[Chapter, Path, ComicInfoMetadata]]] = {}
-    for item in files:
-        if item[0].volume is not None:
-            by_volume.setdefault(item[0].volume, []).append(item)
+    for chapter, path, info, offset in files:
+        # Siblings in differently numbered editions do not establish whether
+        # a volume tag is isolated in the archive's physical edition.
+        if chapter.volume is not None and offset == 0:
+            by_volume.setdefault(chapter.volume, []).append((chapter, path, info))
     for volume, peers in by_volume.items():
         declared = [item for item in peers if item[2].volume is not None]
         if len(peers) < 2 or len(declared) != 1:
@@ -348,6 +366,38 @@ async def detect_series_issues(
     if candidates is None:
         return []
     return await reconcile_candidates(session, series.id, candidates)
+
+
+async def relocate_archive_issues(
+    session: AsyncSession, series_id: int, renames: list[tuple[str, str]],
+) -> bool:
+    """Move warnings with successfully renamed archives in filesystem order."""
+    if not renames:
+        return False
+    issues_by_path: dict[str, list[LibraryIssue]] = defaultdict(list)
+    for issue in await session.scalars(select(LibraryIssue).where(LibraryIssue.series_id == series_id)):
+        issues_by_path[issue.file_path].append(issue)
+    changed = False
+    for source, destination in renames:
+        source, destination = str(Path(source)), str(Path(destination))
+        if source == destination:
+            continue
+        moving = issues_by_path.pop(source, [])
+        stale = issues_by_path.pop(destination, [])
+        if stale:
+            # The destination was available for the rename, so previous
+            # warnings there belong to a different, absent archive.
+            for issue in stale:
+                await session.delete(issue)
+            await session.flush()
+        if moving:
+            for issue in moving:
+                issue.file_path = destination
+                issue.key = _key(series_id, destination, issue.field)
+            issues_by_path[destination] = moving
+            await session.flush()
+        changed = changed or bool(moving or stale)
+    return changed
 
 
 async def reconcile_candidates(

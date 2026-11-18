@@ -12,7 +12,7 @@ import tempfile
 import zipfile
 import zlib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree
 
 from .filename import parse_filename
@@ -114,7 +114,7 @@ def _copy_posix_access_acl(source_fd: int, target_fd: int) -> None:
         os.setxattr(target_fd, _POSIX_ACCESS_ACL, acl)
 
 
-def _members(archive: zipfile.ZipFile) -> tuple[zipfile.ZipInfo | None, list[Path]]:
+def _members(archive: zipfile.ZipFile) -> tuple[zipfile.ZipInfo | None, list[PurePosixPath]]:
     entries = archive.infolist()
     if len(entries) > MAX_ZIP_ENTRIES:
         raise ComicInfoError("Archive exceeds the ZIP entry count limit")
@@ -133,7 +133,15 @@ def _members(archive: zipfile.ZipFile) -> tuple[zipfile.ZipInfo | None, list[Pat
             if info.file_size:
                 raise ComicInfoError("Archive directory contains unexpected data")
             continue
-        name = Path(info.filename)
+        name = PurePosixPath(info.filename.replace("\\", "/"))
+        # ZIPs made on macOS may store resource forks beside the images or
+        # under a metadata directory. Retain them on rewrite, but leave them
+        # out of page counts and chapter label matching.
+        if any(
+            part.startswith("._") or part.casefold() in {"__macosx", ".appledouble"}
+            for part in name.parts
+        ):
+            continue
         if name.name.lower() == "comicinfo.xml":
             if member is not None:
                 raise ComicInfoError("Archive contains multiple ComicInfo.xml files")
@@ -161,7 +169,7 @@ def _read_root(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> ElementTree
     return root
 
 
-def _chapter_labels_span(pages: list[Path]) -> bool:
+def _chapter_labels_span(pages: list[PurePosixPath]) -> bool:
     labels = set()
     for page in pages:
         for part in (*page.parts[:-1], page.stem):
@@ -194,7 +202,7 @@ def parse_comicinfo_int(value: str | None) -> int | None:
 
 
 def _metadata(
-    root: ElementTree.Element | None, pages: list[Path], revision: str
+    root: ElementTree.Element | None, pages: list[PurePosixPath], revision: str
 ) -> ComicInfoMetadata:
     def text(tag: str, *, integer: bool = False) -> str | None:
         if root is None:

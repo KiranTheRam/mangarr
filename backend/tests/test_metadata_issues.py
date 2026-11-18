@@ -551,6 +551,44 @@ async def test_rename_waits_for_comicinfo_replacement(repair_db, monkeypatch):
     assert read_comicinfo(renamed).volume == "1"
 
 
+@pytest.mark.parametrize("destination_state", ["empty", "stale_warning", "collision"])
+async def test_rename_preserves_ignored_warning_for_same_archive(repair_db, destination_state):
+    session, _, series, path = repair_db
+    series_id = series.id
+    await library_api.scan(series_id, session)
+    [warning] = await issues_api.list_issues(ignored=False, series_id=series_id, session=session)
+    await issues_api.ignore_issue(warning.id, session)
+    [preview] = await library_api.rename_preview(series_id, session)
+    destination = Path(preview.new_path)
+
+    if destination_state == "stale_warning":
+        session.add(LibraryIssue(
+            key=metadata_issues._key(series_id, str(destination), warning.field),
+            series_id=series_id, chapter_id=warning.chapter_id,
+            kind=warning.kind, file_path=str(destination), field=warning.field,
+            title="Old warning at destination", detail="The original archive was deleted.",
+        ))
+        await session.commit()
+    elif destination_state == "collision":
+        archive(destination, "<ComicInfo><Number>1</Number></ComicInfo>")
+
+    [outcome] = await library_api.rename_apply(series_id, RenameApplyIn(), session)
+    if destination_state == "collision":
+        assert outcome.status == "skipped-collision"
+        [unchanged] = await issues_api.list_issues(ignored=True, series_id=series_id, session=session)
+        assert unchanged.id == warning.id and unchanged.file_path == str(path)
+        return
+
+    assert outcome.status == "renamed"
+    [relocated] = await issues_api.list_issues(ignored=True, series_id=series_id, session=session)
+    assert relocated.id == warning.id
+    assert relocated.file_path == str(destination)
+    assert relocated.revision != warning.revision
+    await library_api.scan(series_id, session)
+    assert await issues_api.list_issues(ignored=True, series_id=series_id, session=session) == [relocated]
+    assert await issues_api.list_issues(ignored=False, series_id=series_id, session=session) == []
+
+
 @pytest.mark.parametrize("rebuilt_number", [1, 99])
 async def test_chapter_resync_detaches_then_reconciles_issues(repair_db, monkeypatch, rebuilt_number):
     session, maker, series, _ = repair_db

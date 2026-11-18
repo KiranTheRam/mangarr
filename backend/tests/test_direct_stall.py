@@ -124,6 +124,8 @@ async def test_concurrent_page_callbacks_do_not_break_the_session(
         async with asyncio.TaskGroup() as tg:
             for i in range(total):
                 tg.create_task(page(i))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"downloaded archive")
 
     monkeypatch.setattr(tasks, "download_chapter_to_cbz", concurrent_download)
 

@@ -23,7 +23,7 @@ from ..library.scanner import (
     unavailable_extra_folders,
 )
 from ..jobs.tasks import series_lock
-from ..metadata_issues import detect_series_issues, manual_archive_lock
+from ..metadata_issues import detect_series_issues, manual_archive_lock, relocate_archive_issues
 from ..models import Chapter, LibraryIssue, RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     CleanupApplyIn,
@@ -222,6 +222,9 @@ async def rename_apply(
             wanted = set(body.chapter_ids)
             items = [i for i in items if wanted & set(i.chapter_ids)]
         outcomes = apply_renames(items, {c.id: c for c in _active_chapters(series)})
+        renamed = [(o.item.current_path, o.item.new_path) for o in outcomes if o.status == "renamed"]
+        if await relocate_archive_issues(session, series_id, renamed):
+            await detect_series_issues(session, series)
         await session.commit()
     return [
         RenameOutcomeOut(

@@ -6,10 +6,13 @@ import logging
 import re
 import time
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1222,6 +1225,8 @@ async def process_direct_queue() -> None:
 
 
 async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
+    from ..metadata_issues import manual_archive_lock
+
     download_id = dl.id
     source_name = dl.source_name
     values = await registry.apply_settings(session)
@@ -1328,8 +1333,23 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             last_progress_commit = now
             await session.commit()
 
-    dest: Path | None = None
-    dest_preexisted = False
+    async def check_destination_owner(dest: Path) -> None:
+        # A template that drops precision can map two chapters to one file.
+        owner = await session.scalar(
+            select(Chapter.number).where(
+                Chapter.series_id == series_id,
+                Chapter.id != chapter_id,
+                Chapter.file_path == str(dest),
+            )
+        )
+        if owner is not None:
+            raise RuntimeError(
+                f"{dest.name} already holds chapter {owner:g}; "
+                "use a naming template that keeps chapter numbers distinct"
+            )
+
+    staged: Path | None = None
+    download_task: asyncio.Task | None = None
     try:
         # inside the try: a broken naming template must fail THIS download
         # (visibly, with an error) instead of crashing the queue worker and
@@ -1340,23 +1360,12 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             series.title, series.folder_name,
             chapter.number, chapter.volume, chapter.title,
         )
-        # a template that drops precision can still map two chapters to one
-        # file; writing would silently replace the other chapter's archive
-        owner = await session.scalar(
-            select(Chapter.number).where(
-                Chapter.series_id == series.id,
-                Chapter.id != chapter.id,
-                Chapter.file_path == str(dest),
-            )
-        )
-        if owner is not None:
-            raise RuntimeError(
-                f"{dest.name} already holds chapter {owner:g}; "
-                "use a naming template that keeps chapter numbers distinct"
-            )
-        dest_preexisted = dest.exists()
+        await check_destination_owner(dest)
+        # A scan must not adopt the download before the worker updates its
+        # mapping. Keep it on the destination filesystem for atomic install.
+        staged = dest.with_name(f".mangarr-direct-{uuid4().hex}.staged")
         download_task = asyncio.create_task(download_chapter_to_cbz(
-            source, dl.payload, series, chapter, dest,
+            source, dl.payload, series, chapter, staged,
             progress_cb=on_progress,
             cancel_cb=check_still_wanted,
             web_url="",
@@ -1380,16 +1389,17 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
                     f"stalled: no page finished for {stall_seconds / 60:g} minutes; "
                     "download cancelled so the queue can continue"
                 )
-        await ensure_not_cancelled(force=True)
+        async with series_lock(series_id), manual_archive_lock:
+            # A rename or manual mapping could have changed the current file
+            # while pages were in flight. Install against the current mapping.
+            await ensure_not_cancelled(force=True)
+            await session.refresh(chapter)
+            await check_destination_owner(dest)
+            await _install_direct_download(
+                session, dl, series, chapter, staged, dest, check_still_wanted,
+            )
     except DownloadCancelled as cancel_exc:
         await session.rollback()
-        if dest is not None and not dest_preexisted:
-            for path in (dest, dest.with_suffix(".cbz.partial")):
-                try:
-                    if path.exists():
-                        path.unlink()
-                except OSError as os_exc:
-                    log.warning("could not remove cancelled download artifact %s: %s", path, os_exc)
         current = await session.get(Download, download_id)
         if current is not None and not (
             current.status == DownloadStatus.FAILED and current.error == REMOVED_BY_USER
@@ -1439,12 +1449,6 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         # a progress commit may have been cancelled mid-flight when the page
         # fetches were torn down; reset the session before recording failure
         await session.rollback()
-        if unavailable and dest is not None:
-            partial = dest.with_suffix(".cbz.partial")
-            try:
-                partial.unlink(missing_ok=True)
-            except OSError as os_exc:
-                log.warning("could not remove partial download %s: %s", partial, os_exc)
         dl = await session.get(Download, download_id)
         if dl is None:
             return
@@ -1477,7 +1481,26 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         ))
         await session.commit()
         return
+    finally:
+        if download_task is not None and not download_task.done():
+            download_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await download_task
+        if staged is not None:
+            for artifact in (staged, staged.with_suffix(".cbz.partial")):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError as exc:
+                    log.warning("could not remove staged download artifact %s: %s", artifact, exc)
 
+    notifications.notify_import(values, series.id, f"Chapter {chapter.number:g}")
+    _notify_kavita(values, series)
+
+
+async def _install_direct_download(
+    session: AsyncSession, dl: Download, series: Series, chapter: Chapter, staged: Path, dest: Path,
+    check_still_wanted: Callable[[], Awaitable[None]],
+) -> None:
     # a file mangarr fetched itself is replaced outright; anything else (the
     # user's own files, a shared volume archive) stays where it is
     replaced = chapter.file_path if chapter.downloaded else ""
@@ -1485,13 +1508,15 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     discard_replaced = bool(
         replaced and replaced != str(dest)
         and replaced_source in registry.DIRECT_SOURCES
-        and not any(
-            c.file_path == replaced for c in series.chapters if c.id != chapter.id
-        )
+        and await session.scalar(
+            select(Chapter.id).where(Chapter.id != chapter.id, Chapter.file_path == replaced).limit(1)
+        ) is None
     )
+    await check_still_wanted()
+    staged.replace(dest)
     chapter.downloaded = True
     chapter.file_path = str(dest)
-    chapter.file_source = source_name
+    chapter.file_source = dl.source_name
     chapter.file_group = dl.release_group
     dl.status = DownloadStatus.DONE
     dl.progress = 1.0
@@ -1515,8 +1540,6 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             Path(replaced).unlink(missing_ok=True)
         except OSError as exc:
             log.warning("could not remove replaced file %s: %s", replaced, exc)
-    notifications.notify_import(values, series.id, f"Chapter {chapter.number:g}")
-    _notify_kavita(values, series)
 
 
 # --------------------------------------------------------------- qbt sync
