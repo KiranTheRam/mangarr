@@ -7,9 +7,9 @@ import threading
 import zipfile
 from pathlib import Path
 
-from fastapi import HTTPException
-
+import httpx
 import pytest
+from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -345,6 +345,7 @@ async def repair_db(tmp_path, monkeypatch):
     lock = asyncio.Lock()
     monkeypatch.setattr(issues_api, "manual_archive_lock", lock)
     monkeypatch.setattr(library_api, "manual_archive_lock", lock)
+    monkeypatch.setattr(metadata_issues, "manual_archive_lock", lock)
     monkeypatch.setattr(db_module, "SessionLocal", maker)
     async with maker() as session:
         series = Series(title="Tracked", folder_name="Tracked", root_folder=RootFolder(path=str(root)))
@@ -355,6 +356,26 @@ async def repair_db(tmp_path, monkeypatch):
         await session.commit()
         yield session, maker, series, path
     await engine.dispose()
+
+
+@pytest.mark.parametrize("display_title", ["My Custom Title", "海辺の物語"])
+async def test_series_repair_accepts_the_custom_display_title(repair_db, display_title):
+    session, _, series, path = repair_db
+    series.title = display_title
+    series.provider_title = "Official Provider Name"
+    update_comicinfo(path, {"series": display_title, "volume": 1})
+    await session.commit()
+
+    await library_api.scan(series.id, session)
+    assert await issues_api.list_issues(ignored=False, series_id=series.id, session=session) == []
+
+    update_comicinfo(path, {"series": "An Unrelated Series"})
+    await library_api.scan(series.id, session)
+    [issue] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    assert issue.suggested_value == display_title
+    await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), session)
+    assert read_comicinfo(path).series == display_title
+    assert await issues_api.list_issues(ignored=False, series_id=series.id, session=session) == []
 
 
 async def test_deleted_issue_identity_cannot_target_another_archive(repair_db):
@@ -751,6 +772,74 @@ async def test_archive_edit_serializes_cross_series_manual_mapping(repair_db, mo
     async with maker() as db:
         with pytest.raises(HTTPException, match="shared"):
             await issues_api.get_chapter_comicinfo(sid, chapter_id, db)
+
+
+@pytest.mark.parametrize("background", [False, True])
+async def test_cross_series_scan_waits_for_comicinfo_replacement(repair_db, monkeypatch, background):
+    session, maker, series, path = repair_db
+    other = Series(
+        title="Other", folder_name=series.folder_name, root_folder=series.root_folder,
+        chapters=[Chapter(number=1)],
+    )
+    session.add(other)
+    await session.commit()
+    series_id, chapter_id = series.id, series.chapters[0].id
+    other_id, other_chapter_id = other.id, other.chapters[0].id
+
+    app = FastAPI()
+    app.include_router(issues_api.router)
+    app.include_router(library_api.router)
+    loop = asyncio.get_running_loop()
+    checked = asyncio.Event()
+    release = threading.Event()
+    require_revision = comicinfo._require_revision
+
+    def pause_replacement(candidate_path, revision):
+        require_revision(candidate_path, revision)
+        if any(path.parent.glob(f".{path.name}.*.tmp")):
+            loop.call_soon_threadsafe(checked.set)
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(comicinfo, "_require_revision", pause_replacement)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        async def adopt():
+            if background:
+                async with tasks.series_lock(other_id), maker() as db:
+                    assert await tasks.scan_series_folder(db, await tasks._load_series(db, other_id))
+            else:
+                response = await client.post(f"/series/{other_id}/scan")
+                assert response.status_code == 200, response.text
+                assert response.json()["matched_chapters"] == 1
+
+        endpoint = f"/series/{series_id}/chapters/{chapter_id}/comicinfo"
+        before = await client.get(endpoint)
+        assert before.status_code == 200, before.text
+        async with asyncio.timeout(10):
+            repair = asyncio.create_task(client.put(endpoint, json={
+                "revision": before.json()["revision"], "title": "Edited title",
+            }))
+            adoption = None
+            try:
+                await checked.wait()
+                adoption = asyncio.create_task(adopt())
+                _, pending = await asyncio.wait([adoption], timeout=0.05)
+                assert adoption in pending
+                async with maker() as db:
+                    assert not (await db.get(Chapter, other_chapter_id)).downloaded
+            finally:
+                release.set()
+                repaired = await repair
+                if adoption is not None:
+                    await adoption
+
+        assert repaired.status_code == 200, repaired.text
+        assert (await client.get(endpoint)).status_code == 400
+        async with maker() as db:
+            assert (await db.get(Chapter, other_chapter_id)).file_path == str(path)
+    assert read_comicinfo(path).title == "Edited title"
 
 
 @pytest.mark.parametrize("evidence", ["volume filename", "title only", "chapter span", "XML span", "page labels"])

@@ -797,24 +797,28 @@ async def scan_series_folder(
     session: AsyncSession, series: Series, *, scan_issues: bool = True,
 ) -> bool:
     """Adopt existing library folders for the series and mark chapters that are
-    already on disk as owned (so they aren't re-downloaded)."""
+    already on disk as owned (so they aren't re-downloaded).
+
+    The caller holds the series lock. Commit adoptions before releasing the
+    archive lock so an editor sees all owners when it checks an archive.
+    """
     from ..library.scanner import resolve_volume_offsets, scan_series
+    from ..metadata_issues import detect_series_issues, manual_archive_lock
 
-    folders = _series_folders(series)
-    if not folders:
-        return False
-    offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
-    result = scan_series(
-        series, [chapter for chapter in series.chapters if not chapter.excluded],
-        folders, offsets,
-        root=Path(series.root_folder.path),
-        expect_content=await root_expects_content(session, series),
-    )
-    from ..metadata_issues import detect_series_issues
-
-    if scan_issues and not result.root_unavailable:
-        await detect_series_issues(session, series)
-    await session.commit()
+    async with manual_archive_lock:
+        folders = _series_folders(series)
+        if not folders:
+            return False
+        offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
+        result = scan_series(
+            series, [chapter for chapter in series.chapters if not chapter.excluded],
+            folders, offsets,
+            root=Path(series.root_folder.path),
+            expect_content=await root_expects_content(session, series),
+        )
+        if scan_issues and not result.root_unavailable:
+            await detect_series_issues(session, series)
+        await session.commit()
     return not result.root_unavailable
 
 

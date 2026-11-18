@@ -2,6 +2,7 @@
 folder, bulk refresh/search and bulk delete."""
 
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from fastapi import HTTPException
@@ -9,7 +10,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from mangarr.api import series as series_api
+from mangarr.api import issues as issues_api, library as library_api, series as series_api
+from mangarr.comicinfo import read_comicinfo
 from mangarr.models import (
     Base,
     Chapter,
@@ -20,7 +22,7 @@ from mangarr.models import (
     Series,
     SeriesFolder,
 )
-from mangarr.schemas import SeriesBulkIn, SeriesBulkRefreshIn, SeriesEditorIn
+from mangarr.schemas import IssueResolveIn, SeriesBulkIn, SeriesBulkRefreshIn, SeriesEditorIn
 
 
 @pytest.fixture
@@ -121,6 +123,56 @@ async def test_move_carries_the_folder_and_repoints_chapters(session, roots):
         str(new / "Alpha" / "Volumes"), str(old / "Loose"),
     ]
     assert a.root_folder_id == new_root.id
+
+
+@pytest.mark.parametrize("extra_available", [False, True])
+async def test_move_carries_ignored_archive_warning_to_new_root(session, roots, extra_available):
+    old, new = roots
+    old_root, new_root = RootFolder(path=str(old)), RootFolder(path=str(new))
+    session.add(new_root)
+    series = await _add(
+        session, "Alpha", old_root, numbers=(1, 2),
+        extra_folders=[SeriesFolder(path="Outside")],
+    )
+    (old / "Alpha").mkdir()
+    (old / "Outside").mkdir()
+    primary = old / "Alpha" / "Ch 1.cbz"
+    outside = old / "Outside" / "Ch 2.cbz"
+    for path in (primary, outside):
+        with ZipFile(path, "w") as archive:
+            archive.writestr("001.jpg", b"page")
+            archive.writestr("ComicInfo.xml", "<ComicInfo><PageCount>2</PageCount></ComicInfo>")
+    await library_api.scan(series.id, session)
+    warnings = {
+        warning.file_path: warning
+        for warning in await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    }
+    await issues_api.ignore_issue(warnings[str(primary)].id, session)
+    if not extra_available:
+        outside.parent.rename(old / "Detached")
+
+    out = await _edit(session, series_ids=[series.id], root_folder_id=new_root.id, move_files=True)
+
+    assert out.moved == 1 and not out.problems
+    moved_path = new / "Alpha" / "Ch 1.cbz"
+    [moved] = await issues_api.list_issues(ignored=True, series_id=series.id, session=session)
+    assert moved.id == warnings[str(primary)].id
+    assert moved.file_path == str(moved_path)
+    assert (moved.revision != warnings[str(primary)].revision) is extra_available
+    assert series.extra_folders[0].path == str(outside.parent)
+    assert await issues_api.list_issues(ignored=False, series_id=series.id, session=session) == [
+        warnings[str(outside)],
+    ]
+
+    if not extra_available:
+        (old / "Detached").rename(outside.parent)
+    await library_api.scan(series.id, session)
+    [rescanned] = await issues_api.list_issues(ignored=True, series_id=series.id, session=session)
+    assert rescanned.id == moved.id and rescanned.file_path == moved.file_path
+    assert rescanned.revision != warnings[str(primary)].revision
+    await issues_api.restore_issue(rescanned.id, session)
+    await issues_api.resolve_issue(rescanned.id, IssueResolveIn(revision=rescanned.revision), session)
+    assert read_comicinfo(moved_path).page_count == "1"
 
 
 async def test_move_never_overwrites_and_reports_blocked_series(session, roots):

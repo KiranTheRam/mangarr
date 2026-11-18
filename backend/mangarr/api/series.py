@@ -31,6 +31,7 @@ from ..jobs.tasks import (
     try_acquire_series_lock,
 )
 from ..library.move import MoveError, anchor_extra_folders, move_series_folder
+from ..metadata_issues import detect_series_issues, manual_archive_lock, relocate_archive_issues
 from ..models import Chapter, Download, DownloadKind, DownloadStatus, RootFolder, Series
 from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
@@ -248,28 +249,38 @@ async def _change_root_folder(
             anchor_extra_folders(series, Path(series.root_folder.path))
         series.root_folder = new_root
         return False
-    in_flight = await session.scalar(
-        select(Download.id).where(
-            Download.series_id == series.id,
-            Download.status.in_([
-                DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
-            ]),
-        ).limit(1)
-    )
-    if in_flight is not None:
-        # an import would write into the old folder after it moved away
-        raise MoveError("downloads are in progress; move it once they finish")
     lock = await try_acquire_series_lock(series.id)
     if lock is None:
         raise MoveError("the series is refreshing; try again once it finishes")
     try:
-        old_root = Path(series.root_folder.path)
-        moved = await move_series_folder(series, new_root)
-        anchor_extra_folders(series, old_root)
-        series.root_folder = new_root
-        # commit while still holding the lock, so the next refresh already
-        # sees the files at their new paths
-        await session.commit()
+        async with manual_archive_lock:
+            # Defer writes from bulk monitoring edits until the move commits.
+            with session.no_autoflush:
+                in_flight = await session.scalar(
+                    select(Download.id).where(
+                        Download.series_id == series.id,
+                        Download.status.in_([
+                            DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+                        ]),
+                    ).limit(1)
+                )
+            if in_flight is not None:
+                raise MoveError("downloads are in progress; move it once they finish")
+
+            old_root = Path(series.root_folder.path)
+            old_paths = {chapter.id: chapter.file_path for chapter in series.chapters}
+            moved = await move_series_folder(series, new_root)
+            anchor_extra_folders(series, old_root)
+            series.root_folder = new_root
+            if moved:
+                renames = list(dict.fromkeys(
+                    (old_paths[chapter.id], chapter.file_path)
+                    for chapter in series.chapters
+                    if old_paths[chapter.id] and old_paths[chapter.id] != chapter.file_path
+                ))
+                if await relocate_archive_issues(session, series.id, renames):
+                    await detect_series_issues(session, series)
+            await session.commit()
     finally:
         lock.release()
     return moved

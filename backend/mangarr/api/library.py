@@ -144,10 +144,7 @@ def _require_series_media_path(series: Series, raw_path: str) -> Path:
 
 @router.post("/series/{series_id}/scan", response_model=ScanResultOut)
 async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
-    from ..jobs.tasks import acquire_series_lock
-
-    lock = await acquire_series_lock(series_id)
-    try:
+    async with series_lock(series_id), manual_archive_lock:
         series = await _load(session, series_id)
         root = _root_of(series)
         await _require_root_available(session, series)
@@ -176,8 +173,6 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
             cleared=result.cleared,
             unmatched=[m.path.name for m in result.unmatched],
         )
-    finally:
-        lock.release()
 
 
 @router.post("/library/scan", status_code=202)
@@ -304,10 +299,7 @@ async def cleanup_apply(
 ):
     from ..library.cleanup import apply_cleanup
 
-    from ..jobs.tasks import acquire_series_lock
-
-    lock = await acquire_series_lock(series_id)
-    try:
+    async with series_lock(series_id), manual_archive_lock:
         series = await _load(session, series_id)
         result = apply_cleanup(
             series, _active_chapters(series), _folders_of(series), body.delete,
@@ -318,8 +310,6 @@ async def cleanup_apply(
             deleted=result.deleted, repointed=result.repointed,
             skipped=result.skipped, freed_bytes=result.freed_bytes,
         )
-    finally:
-        lock.release()
 
 
 @router.post("/series/{series_id}/files/map-range", response_model=FileMapRangeOut)
@@ -588,39 +578,40 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
 
         series = await _load(session, series_id)
         await update_chapters(session, series, values)
-        # a locked chapter no source re-lists (e.g. a manually mapped extra)
-        # must survive the rebuild — recreate it rather than dropping the
-        # very metadata the lock promised to keep
-        present = {ch.number for ch in series.chapters}
-        for number, saved in preserved_metadata.items():
-            if number not in present:
-                series.chapters.append(
-                    Chapter(number=number, monitored=saved[7], excluded=saved[6])
-                )
-        for ch in series.chapters:
-            saved = preserved_metadata.get(ch.number)
-            if saved is None:
-                continue
-            (
-                title, volume, title_source, volume_source,
-                title_locked, volume_locked, excluded, monitored,
-                downloaded, file_path, released_at, available_sources,
-            ) = saved
-            if excluded:
-                ch.title, ch.volume = title, volume
-                ch.title_source, ch.volume_source = title_source, volume_source
-                ch.title_locked, ch.volume_locked = title_locked, volume_locked
-                ch.excluded, ch.monitored = True, monitored
-                ch.downloaded, ch.file_path = downloaded, file_path
-                ch.released_at, ch.available_sources = released_at, available_sources
-                continue
-            if title_locked:
-                ch.title, ch.title_source, ch.title_locked = title, title_source, True
-            if volume_locked:
-                ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
-        await session.commit()
-        scan = await _scan_now(session, series)
-        return ResyncOut(chapters=len(_active_chapters(series)), matched_chapters=scan)
+        async with manual_archive_lock:
+            # a locked chapter no source re-lists (e.g. a manually mapped extra)
+            # must survive the rebuild — recreate it rather than dropping the
+            # very metadata the lock promised to keep
+            present = {ch.number for ch in series.chapters}
+            for number, saved in preserved_metadata.items():
+                if number not in present:
+                    series.chapters.append(
+                        Chapter(number=number, monitored=saved[7], excluded=saved[6])
+                    )
+            for ch in series.chapters:
+                saved = preserved_metadata.get(ch.number)
+                if saved is None:
+                    continue
+                (
+                    title, volume, title_source, volume_source,
+                    title_locked, volume_locked, excluded, monitored,
+                    downloaded, file_path, released_at, available_sources,
+                ) = saved
+                if excluded:
+                    ch.title, ch.volume = title, volume
+                    ch.title_source, ch.volume_source = title_source, volume_source
+                    ch.title_locked, ch.volume_locked = title_locked, volume_locked
+                    ch.excluded, ch.monitored = True, monitored
+                    ch.downloaded, ch.file_path = downloaded, file_path
+                    ch.released_at, ch.available_sources = released_at, available_sources
+                    continue
+                if title_locked:
+                    ch.title, ch.title_source, ch.title_locked = title, title_source, True
+                if volume_locked:
+                    ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
+            await session.commit()
+            scan = await _scan_now(session, series)
+            return ResyncOut(chapters=len(_active_chapters(series)), matched_chapters=scan)
     finally:
         lock.release()
 
@@ -787,12 +778,13 @@ async def resync_volumes(
             return VolumeResyncOut(has_data=False, assigned=0, changed=0,
                                    repointed=0, cleared=0)
 
-        # volume archives on disk anchor the chapters the source can't place
-        volume_map = refine_volume_map_with_disk(series, volume_map)
-        assigned, changed, repointed, cleared, _ = _run_resync(
-            series, _active_chapters(series), volume_map, map_sources
-        )
-        await session.commit()
+        async with manual_archive_lock:
+            # volume archives on disk anchor the chapters the source can't place
+            volume_map = refine_volume_map_with_disk(series, volume_map)
+            assigned, changed, repointed, cleared, _ = _run_resync(
+                series, _active_chapters(series), volume_map, map_sources
+            )
+            await session.commit()
         return VolumeResyncOut(
             has_data=True, assigned=assigned, changed=changed,
             repointed=repointed, cleared=cleared,

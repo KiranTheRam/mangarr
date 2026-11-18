@@ -40,14 +40,17 @@ def test_bounded_stream_even_if_declared_size_is_small(monkeypatch):
     archive.open.assert_called_once_with(info)
 
 
-def test_duplicate_name_opens_checked_entry(tmp_path):
+def test_duplicate_metadata_name_is_not_used_for_matching(tmp_path, monkeypatch):
     path = tmp_path / "duplicate.cbz"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("ComicInfo.xml", "<ComicInfo><Title>first</Title><Number>1</Number></ComicInfo>")
         with pytest.warns(UserWarning):
             archive.writestr("ComicInfo.xml", b"x" * (matcher.MAX_COMICINFO_BYTES + 1))
-    assert matcher.comicinfo_title(path) == "first"
-    assert matcher.comicinfo_number(path) == 1
+    open_member = Mock(side_effect=AssertionError("ambiguous metadata must not be opened"))
+    monkeypatch.setattr(zipfile.ZipFile, "open", open_member)
+    assert matcher.comicinfo_title(path) == ""
+    assert matcher.comicinfo_number(path) is None
+    open_member.assert_not_called()
 
 
 @pytest.mark.parametrize("data", [b"bad xml", b"<ComicInfo><Number>bad</Number></ComicInfo>"])

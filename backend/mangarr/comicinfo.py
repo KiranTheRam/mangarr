@@ -16,7 +16,9 @@ from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree
 
 from .filename import parse_filename
-from .library.matcher import IMAGE_EXTS, MAX_COMICINFO_BYTES
+from .library.archive_members import (
+    MAX_COMICINFO_BYTES, archive_files, archive_pages, find_comicinfo_member,
+)
 from .library.zip_limits import (
     BoundedZipReader, COPY_CHUNK_BYTES, MAX_EXPANDED_BYTES, MAX_MEMBER_BYTES,
     MAX_ZIP_DIRECTORY_BYTES, MAX_ZIP_ENTRIES, SAFE_ZIP_COMPRESSION,
@@ -119,8 +121,6 @@ def _members(archive: zipfile.ZipFile) -> tuple[zipfile.ZipInfo | None, list[Pur
     if len(entries) > MAX_ZIP_ENTRIES:
         raise ComicInfoError("Archive exceeds the ZIP entry count limit")
     names = set()
-    member = None
-    pages = []
     for info in entries:
         if info.filename in names:
             raise ComicInfoError("Archive contains duplicate ZIP member names")
@@ -129,28 +129,12 @@ def _members(archive: zipfile.ZipFile) -> tuple[zipfile.ZipInfo | None, list[Pur
             raise ComicInfoError("Archive uses unsupported ZIP compression or encryption")
         if info.file_size > MAX_MEMBER_BYTES:
             raise ComicInfoError("Archive exceeds the expanded member size limit")
-        if info.is_dir():
-            if info.file_size:
-                raise ComicInfoError("Archive directory contains unexpected data")
-            continue
-        name = PurePosixPath(info.filename.replace("\\", "/"))
-        # ZIPs made on macOS may store resource forks beside the images or
-        # under a metadata directory. Retain them on rewrite, but leave them
-        # out of page counts and chapter label matching.
-        if any(
-            part.startswith("._") or part.casefold() in {"__macosx", ".appledouble"}
-            for part in name.parts
-        ):
-            continue
-        if name.name.lower() == "comicinfo.xml":
-            if member is not None:
-                raise ComicInfoError("Archive contains multiple ComicInfo.xml files")
-            member = info
-        elif name.suffix.lower() in IMAGE_EXTS:
-            pages.append(name)
+        if info.is_dir() and info.file_size:
+            raise ComicInfoError("Archive directory contains unexpected data")
     if sum(info.file_size for info in entries) > MAX_EXPANDED_BYTES:
         raise ComicInfoError("Archive exceeds the total expanded size limit")
-    return member, pages
+    files = list(archive_files(entries))
+    return find_comicinfo_member(files), [path for _, path in archive_pages(files)]
 
 
 def _read_root(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> ElementTree.Element:

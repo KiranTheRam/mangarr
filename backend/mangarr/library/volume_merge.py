@@ -14,7 +14,8 @@ from tempfile import NamedTemporaryFile
 
 from ..download.cbz import build_comicinfo
 from ..util import NEW_FILE_MODE, natural_key
-from .matcher import IMAGE_EXTS, PAGE_PROVENANCE_NAME, read_archive_source_page_signature
+from .archive_members import archive_files, archive_pages
+from .matcher import PAGE_PROVENANCE_NAME, read_archive_source_page_signature
 from .zip_limits import (
     BoundedZipReader, COPY_CHUNK_BYTES, MAX_EXPANDED_BYTES, MAX_MEMBER_BYTES,
     MAX_ZIP_DIRECTORY_BYTES, MAX_ZIP_ENTRIES, SAFE_ZIP_COMPRESSION,
@@ -25,17 +26,6 @@ log = logging.getLogger(__name__)
 MAX_MERGE_PAGES = 10_000
 MAX_MERGE_PAGE_BYTES = MAX_MEMBER_BYTES
 MAX_MERGE_BYTES = MAX_EXPANDED_BYTES
-
-
-def _page_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
-    pages = [
-        info for info in archive.infolist()
-        if not info.is_dir() and Path(info.filename).suffix.lower() in IMAGE_EXTS
-    ]
-    # mangarr's own writers zero-pad page names, but torrent-imported archives
-    # often don't (1.jpg … 10.jpg): order numbers by value. Subfolders still
-    # stay together, since the key compares the path prefix first.
-    return sorted(pages, key=lambda info: natural_key(info.filename))
 
 
 def merge_chapter_archives(
@@ -69,13 +59,13 @@ def merge_chapter_archives(
                 with BoundedZipReader(path.open("rb", buffering=0), MAX_ZIP_DIRECTORY_BYTES) as handle, zipfile.ZipFile(handle) as archive:
                     if len(archive.infolist()) > MAX_ZIP_ENTRIES:
                         raise ValueError("chapter ZIP exceeds the entry count limit")
-                    members = _page_members(archive)
+                    source_members = [info for info, _ in archive_pages(archive_files(archive.infolist()))]
+                    # Use reading order even for archives with unpadded page numbers.
+                    members = sorted(source_members, key=lambda info: natural_key(info.filename))
                     if not members:
                         raise ValueError(f"no page images in {path}")
                     if pages + len(members) > MAX_MERGE_PAGES:
                         raise ValueError("volume merge exceeds the page count limit")
-                    source_members = [info for info in archive.infolist()
-                                      if not info.is_dir() and Path(info.filename).suffix.lower() in IMAGE_EXTS]
                     stored = tuple((info.CRC, info.file_size) for info in source_members)
                     source_signature = read_archive_source_page_signature(archive, stored)
                     # Provenance follows ZIP entry order; the merged output

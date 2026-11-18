@@ -17,9 +17,11 @@ from xml.etree import ElementTree
 from ..filename import FilenameCoverage, parse_filename
 from ..models import Chapter
 from ..util import has_chapter_marker, parse_chapter_number
+from .archive_members import (
+    IMAGE_EXTS, MAX_COMICINFO_BYTES, archive_files, archive_pages, find_comicinfo_member,
+)
 
 ARCHIVE_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z"}
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 SIDECAR_IMAGE_STEMS = {
     "banner", "cover", "fanart", "folder", "poster", "thumb", "thumbnail",
 }
@@ -120,18 +122,10 @@ def comicinfo_title(path: Path) -> str:
     return title
 
 
-# Plenty for ordinary metadata, independent of the archive's compressed size.
-MAX_COMICINFO_BYTES = 1024 * 1024
-
-
 def _read_comicinfo(path: Path) -> ElementTree.Element | None:
     try:
         with zipfile.ZipFile(path) as archive:
-            member = next(
-                (info for info in archive.infolist()
-                 if Path(info.filename).name.lower() == "comicinfo.xml"),
-                None,
-            )
+            member = find_comicinfo_member(archive_files(archive.infolist()))
             if (member is None or member.file_size > MAX_COMICINFO_BYTES
                     or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
                 return None
@@ -142,9 +136,10 @@ def _read_comicinfo(path: Path) -> ElementTree.Element | None:
             # entry was checked), and bound decompression even for bad headers.
             with archive.open(member) as stream:
                 data = stream.read(MAX_COMICINFO_BYTES + 1)
-            if len(data) > MAX_COMICINFO_BYTES:
+            if len(data) > MAX_COMICINFO_BYTES or len(data) != member.file_size:
                 return None
-            return ElementTree.fromstring(data)
+            root = ElementTree.fromstring(data)
+            return root if root.tag == "ComicInfo" else None
     except (OSError, LookupError, ValueError, RuntimeError, EOFError,
             zipfile.BadZipFile, zlib.error, ElementTree.ParseError):
         return None
@@ -204,10 +199,7 @@ def _archive_chapter_numbers(path: str, mtime_ns: int, size: int) -> frozenset[f
     numbers: set[float] = set()
     try:
         with zipfile.ZipFile(path) as archive:
-            for member in archive.infolist():
-                name = Path(member.filename)
-                if member.is_dir() or name.suffix.lower() not in IMAGE_EXTS:
-                    continue
+            for _, name in archive_pages(archive_files(archive.infolist())):
                 if not has_chapter_marker(name.stem):
                     return None
                 number = parse_chapter_number(name.stem)
@@ -249,8 +241,7 @@ def _archive_page_signature(path: str, mtime_ns: int, size: int) -> PageSignatur
         with zipfile.ZipFile(path) as archive:
             signature = tuple(
                 (member.CRC, member.file_size)
-                for member in archive.infolist()
-                if not member.is_dir() and Path(member.filename).suffix.lower() in IMAGE_EXTS
+                for member, _ in archive_pages(archive_files(archive.infolist()))
             )
     except (OSError, zipfile.BadZipFile):
         return None

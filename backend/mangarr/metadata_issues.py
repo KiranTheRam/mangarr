@@ -64,6 +64,18 @@ def _numeric(value: str | None) -> float | None:
         return None
 
 
+def _archive_title_key(title: str) -> str:
+    return normalize_title(title) or " ".join(title.casefold().split())
+
+
+def _archive_title_keys(series: Series) -> set[str]:
+    # Mangarr writes the display title even when the user overrides it.
+    return {
+        key for title in (series.title, *metadata_titles(series))
+        if (key := _archive_title_key(title))
+    }
+
+
 class ArchiveIneligible(ComicInfoError):
     """The file cannot be edited as a single chapter."""
 
@@ -129,13 +141,13 @@ def _inspect_chapter_archive(
     if len(owners) != 1:
         raise ArchiveIneligible("This archive has shared or uncertain chapter ownership")
 
-    titles = {normalize_title(title) for title in metadata_titles(series)}
+    titles = _archive_title_keys(series)
     for name in {raw.stem, path.stem}:
         coverage = parse_filename(name)
         if (
             coverage.ambiguous or coverage.is_range
             or (coverage.volume is not None and coverage.chapter is None)
-            or (series.total_volumes == 1 and normalize_title(name) in titles)
+            or (series.total_volumes == 1 and _archive_title_key(name) in titles)
         ):
             raise ArchiveIneligible("Whole-volume or multi-chapter archives need volume-level editing")
     info = read_comicinfo(path)
@@ -223,7 +235,7 @@ def find_candidates(
 
     candidates: list[Candidate] = []
     uncertain_volume_sources = {"", "legacy", "disk-inferred", "comicinfo"}
-    valid_titles = {normalized for value in metadata_titles(series) if (normalized := normalize_title(value))}
+    valid_titles = _archive_title_keys(series)
 
     for chapter, path, info, offset in files:
         if not info.exists:
@@ -256,7 +268,7 @@ def find_candidates(
                     info.revision,
                 ))
 
-        if info.series and valid_titles and normalize_title(info.series) not in valid_titles:
+        if info.series and valid_titles and _archive_title_key(info.series) not in valid_titles:
             candidates.append(Candidate(
                 chapter.id, "comicinfo_series_mismatch", str(path), "series",
                 info.series, series.title,
