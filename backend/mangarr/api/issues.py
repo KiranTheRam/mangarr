@@ -17,7 +17,7 @@ from ..db import get_session
 from ..jobs.tasks import series_lock
 from ..metadata_issues import (
     ArchiveIneligible, chapter_paths, current_candidates, detect_series_issues,
-    inspect_chapter_archive, load_archive_ownership, manual_archive_lock,
+    filename_conflicts_with_mapping, inspect_chapter_archive, load_archive_ownership, manual_archive_lock,
     metadata_identifies_volume, preserves_chapter_number_mapping, reconcile_candidates,
 )
 from ..models import Chapter, LibraryIssue, Series
@@ -66,16 +66,25 @@ async def _inspect(
 
 
 async def _write_archive(
-    chapter: Chapter, path: Path, current: ComicInfoMetadata, updates: dict[str, str | int | None],
+    series: Series, chapter: Chapter, path: Path, current: ComicInfoMetadata,
+    updates: dict[str, str | int | None],
 ) -> ComicInfoMetadata:
     value = updates.get("number", current.number)
     number = str(value) if value is not None else None
-    if number != current.number and not preserves_chapter_number_mapping(chapter, path, number):
-        raise HTTPException(
-            409,
-            "Mangarr uses ComicInfo Number to match this file. Keep it set to "
-            f"chapter {chapter.number:g} or rename the file to identify that chapter before editing.",
-        )
+    if number != current.number:
+        tracked_numbers = {item.number for item in series.chapters if not item.excluded}
+        if filename_conflicts_with_mapping(chapter, path, tracked_numbers):
+            raise HTTPException(
+                409,
+                "The filename identifies a different tracked chapter. Correct the file mapping "
+                "or rename the archive before changing ComicInfo Number.",
+            )
+        if not preserves_chapter_number_mapping(chapter, path, number):
+            raise HTTPException(
+                409,
+                "Mangarr uses ComicInfo Number to match this file. Keep it set to "
+                f"chapter {chapter.number:g} or rename the file to identify that chapter before editing.",
+            )
     if metadata_identifies_volume(chapter, path, number, updates.get("volume", current.volume)):
         raise HTTPException(
             409,
@@ -132,7 +141,7 @@ async def update_chapter_comicinfo(
         chapter, path, current = await _inspect(session, series, chapter_id)
         if current.revision != body.revision:
             raise HTTPException(409, "The chapter archive changed; reopen it and review the metadata")
-        info = await _write_archive(chapter, path, current, updates)
+        info = await _write_archive(series, chapter, path, current, updates)
         await detect_series_issues(session, series)
         await session.commit()
         await _notify_reader(session, series)
@@ -254,7 +263,7 @@ async def resolve_issue(
         chapter, path, info = await _inspect(session, series, candidate.chapter_id)
         if info.revision != candidate.archive_revision:
             raise HTTPException(409, "The chapter archive changed; scan issues again")
-        await _write_archive(chapter, path, info, {candidate.field: candidate.suggested_value})
+        await _write_archive(series, chapter, path, info, {candidate.field: candidate.suggested_value})
         await session.delete(issue)
         await detect_series_issues(session, series)
         await session.commit()

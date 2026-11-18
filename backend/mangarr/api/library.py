@@ -376,17 +376,18 @@ async def list_folders(series_id: int, session: AsyncSession = Depends(get_sessi
 async def add_folder(
     series_id: int, body: SeriesFolderIn, session: AsyncSession = Depends(get_session)
 ):
-    series = await _load(session, series_id)
-    root = _root_of(series)
-    path = _relative_to_root(root, body.path)
-    if not path or path == series.folder_name or any(f.path == path for f in series.extra_folders):
-        raise HTTPException(400, "Folder already configured for this series")
-    folder = SeriesFolder(
-        series_id=series.id, path=path, volume_offset=body.volume_offset
-    )
-    session.add(folder)
-    await session.commit()
-    await session.refresh(folder)
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        root = _root_of(series)
+        path = _relative_to_root(root, body.path)
+        if not path or path == series.folder_name or any(f.path == path for f in series.extra_folders):
+            raise HTTPException(400, "Folder already configured for this series")
+        folder = SeriesFolder(
+            series_id=series.id, path=path, volume_offset=body.volume_offset
+        )
+        session.add(folder)
+        await session.commit()
+        await session.refresh(folder)
     resolved = root / path
     return SeriesFolderOut(
         id=folder.id, path=folder.path, resolved=str(resolved),
@@ -401,13 +402,14 @@ async def update_folder(
     body: SeriesFolderUpdateIn,
     session: AsyncSession = Depends(get_session),
 ):
-    series = await _load(session, series_id)
-    folder = next((item for item in series.extra_folders if item.id == folder_id), None)
-    if folder is None:
-        raise HTTPException(404, "Folder not found")
-    folder.volume_offset = body.volume_offset
-    await session.commit()
-    root = _root_of(series)
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        folder = next((item for item in series.extra_folders if item.id == folder_id), None)
+        if folder is None:
+            raise HTTPException(404, "Folder not found")
+        folder.volume_offset = body.volume_offset
+        await session.commit()
+        root = _root_of(series)
     resolved = root / folder.path
     return SeriesFolderOut(
         id=folder.id, path=folder.path, resolved=str(resolved), primary=False,
@@ -419,11 +421,12 @@ async def update_folder(
 async def remove_folder(
     series_id: int, folder_id: int, session: AsyncSession = Depends(get_session)
 ):
-    folder = await session.get(SeriesFolder, folder_id)
-    if folder is None or folder.series_id != series_id:
-        raise HTTPException(404, "Folder not found")
-    await session.delete(folder)
-    await session.commit()
+    async with series_lock(series_id), manual_archive_lock:
+        folder = await session.get(SeriesFolder, folder_id)
+        if folder is None or folder.series_id != series_id:
+            raise HTTPException(404, "Folder not found")
+        await session.delete(folder)
+        await session.commit()
 
 
 # ---------------------------------------------------------- source links

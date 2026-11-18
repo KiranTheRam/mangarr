@@ -21,6 +21,7 @@ from mangarr.comicinfo import ArchiveChanged, ComicInfoError, read_comicinfo, up
 from mangarr.jobs import tasks
 from mangarr.schemas import (
     ChapterMetadataIn, ComicInfoUpdateIn, FileMapIn, FileMapRangeIn, IssueResolveIn, RenameApplyIn,
+    SeriesFolderUpdateIn,
 )
 from mangarr.metadata_issues import ArchiveOwnership, detect_series_issues, find_candidates
 from mangarr.models import Base, Chapter, LibraryIssue, RootFolder, Series, SeriesFolder
@@ -376,6 +377,82 @@ async def test_series_repair_accepts_the_custom_display_title(repair_db, display
     await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), session)
     assert read_comicinfo(path).series == display_title
     assert await issues_api.list_issues(ignored=False, series_id=series.id, session=session) == []
+
+
+async def _shared_volume_issue(repair_db):
+    session, _, series, initial = repair_db
+    shared = initial.parent.parent / "Shared"
+    shared.mkdir()
+    path = initial.rename(shared / initial.name)
+    series.chapters[0].file_path = str(path)
+    folder = SeriesFolder(series_id=series.id, path="Shared", volume_offset=5)
+    session.add(folder)
+    await session.commit()
+    await issues_api.scan_issues(session)
+    [issue] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    assert issue.suggested_value == "6"
+    return path, folder.id, issue
+
+
+async def test_folder_offset_update_waits_for_archive_repair(repair_db, monkeypatch):
+    _, maker, series, _ = repair_db
+    path, folder_id, issue = await _shared_volume_issue(repair_db)
+    write_started = asyncio.Event()
+    offset_requested = asyncio.Event()
+    release_write = asyncio.Event()
+    original_write = issues_api._write_archive
+
+    async def pause_archive_write(*args, **kwargs):
+        write_started.set()
+        await release_write.wait()
+        return await original_write(*args, **kwargs)
+
+    monkeypatch.setattr(issues_api, "_write_archive", pause_archive_write)
+
+    async def repair():
+        async with maker() as session:
+            await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), session)
+
+    async def update_offset():
+        async with maker() as session:
+            offset_requested.set()
+            return await library_api.update_folder(
+                series.id, folder_id, SeriesFolderUpdateIn(volume_offset=6), session,
+            )
+
+    async with asyncio.timeout(10):
+        repairing = asyncio.create_task(repair())
+        await write_started.wait()
+        changing_offset = asyncio.create_task(update_offset())
+        await offset_requested.wait()
+        try:
+            done, _ = await asyncio.wait({changing_offset}, timeout=0.05)
+            assert not done
+        finally:
+            release_write.set()
+            _, updated_folder = await asyncio.gather(repairing, changing_offset)
+
+    assert updated_folder.volume_offset == 6
+    assert read_comicinfo(path).volume == "6"
+    async with maker() as session:
+        await issues_api.scan_issues(session)
+        [current] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    assert current.suggested_value == "7"
+
+
+async def test_repair_rejects_recommendation_from_previous_folder_offset(repair_db):
+    _, maker, series, _ = repair_db
+    path, folder_id, issue = await _shared_volume_issue(repair_db)
+    async with maker() as session:
+        await library_api.update_folder(
+            series.id, folder_id, SeriesFolderUpdateIn(volume_offset=6), session,
+        )
+        with pytest.raises(HTTPException) as exc:
+            await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), session)
+        assert exc.value.status_code == 409
+        [current] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    assert read_comicinfo(path).volume == "9"
+    assert current.suggested_value == "7"
 
 
 async def test_deleted_issue_identity_cannot_target_another_archive(repair_db):

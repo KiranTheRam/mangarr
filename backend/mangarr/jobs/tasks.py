@@ -56,7 +56,9 @@ from ..models import (
     DownloadKind,
     DownloadStatus,
     HistoryEvent,
+    RootFolder,
     Series,
+    SeriesFolder,
     SeriesSourceLink,
     SeriesStatus,
 )
@@ -1681,15 +1683,22 @@ def _place_torrent_files(content_path, series, chapters, *args, **kwargs):
 
 
 def _torrent_payload_overlaps_library(
-    content_path: Path, library_root: Path, files: list[Path] | None,
+    content_path: Path, library_paths: set[Path], files: list[Path] | None,
 ) -> bool:
     """Whether a torrent can read metadata from an existing library archive."""
     try:
-        root = library_root.resolve()
+        library_dirs = {path.resolve() for path in library_paths}
         if files is not None:
-            return any(path.resolve().is_relative_to(root) for path in files)
+            return any(
+                path.is_relative_to(folder)
+                for path in (file.resolve() for file in files)
+                for folder in library_dirs
+            )
         payload = content_path.resolve()
-        return payload.is_relative_to(root) or root.is_relative_to(payload)
+        return any(
+            payload.is_relative_to(folder) or folder.is_relative_to(payload)
+            for folder in library_dirs
+        )
     except (OSError, RuntimeError):
         # Let the importer handle path errors with the usual retry policy.
         return True
@@ -1729,12 +1738,19 @@ async def _import_torrent(
             dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
-    # The caller holds the series lock throughout. Legacy payloads can
-    # already be in the library, where planning a chapter match may read
-    # ComicInfo from the very archive a repair is about to replace.
+    # The caller holds the destination series lock throughout, but a legacy
+    # payload can also be repaired in another series' root or extra folder.
     library_root = Path(series.root_folder.path)
+    library_paths = {Path(path) for path in await session.scalars(select(RootFolder.path))}
+    extra_folders = await session.execute(
+        select(RootFolder.path, SeriesFolder.path)
+        .select_from(SeriesFolder)
+        .join(Series, Series.id == SeriesFolder.series_id)
+        .join(RootFolder, RootFolder.id == Series.root_folder_id)
+    )
+    library_paths.update(Path(root) / folder for root, folder in extra_folders)
     protects_inputs = await asyncio.to_thread(
-        _torrent_payload_overlaps_library, content_path, library_root, files,
+        _torrent_payload_overlaps_library, content_path, library_paths, files,
     )
     async with AsyncExitStack() as archive_guard:
         if protects_inputs:

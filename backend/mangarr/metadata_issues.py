@@ -162,15 +162,24 @@ def inspect_chapter_archive(
     return _inspect_chapter_archive(series, chapter, _archive_folders(series), ArchiveOwnership(paths))
 
 
-def preserves_chapter_number_mapping(chapter: Chapter, path: Path, number: str | None) -> bool:
-    if _numeric(number) == chapter.number:
-        return True
+def _archive_filename_numbers(chapter: Chapter, path: Path) -> set[float | None]:
     # Match the library scanner's filename interpretation. If an alias and
     # its target differ, a scan may discover either name first.
-    return all(
-        parse_filename(name).chapter_number == chapter.number
+    return {
+        parse_filename(name).chapter_number
         for name in {Path(chapter.file_path).stem, path.stem}
-    )
+    }
+
+
+def filename_conflicts_with_mapping(
+    chapter: Chapter, path: Path, tracked_numbers: set[float],
+) -> bool:
+    """A tracked filename match wins over ComicInfo when the scanner adopts a file."""
+    return bool((_archive_filename_numbers(chapter, path) - {chapter.number}) & tracked_numbers)
+
+
+def preserves_chapter_number_mapping(chapter: Chapter, path: Path, number: str | None) -> bool:
+    return _numeric(number) == chapter.number or _archive_filename_numbers(chapter, path) == {chapter.number}
 
 
 def metadata_identifies_volume(
@@ -180,10 +189,7 @@ def metadata_identifies_volume(
     return (
         volume_number is not None and volume_number >= 0
         and _numeric(number) is None
-        and all(
-            parse_filename(name).chapter_number is None
-            for name in {Path(chapter.file_path).stem, path.stem}
-        )
+        and _archive_filename_numbers(chapter, path) == {None}
     )
 
 
@@ -203,7 +209,8 @@ def find_candidates(
     root = Path(series.root_folder.path)
     if root_unavailable(root, expect_content):
         return None
-    files: list[tuple[Chapter, Path, ComicInfoMetadata, int | None]] = []
+    tracked_numbers = {chapter.number for chapter in series.chapters if not chapter.excluded}
+    files: list[tuple[Chapter, Path, ComicInfoMetadata, int | None, bool]] = []
     try:
         extras = [root / folder.path for folder in series.extra_folders]
         if chapters_under_folders(series.chapters, unavailable_extra_folders(extras)):
@@ -219,7 +226,8 @@ def find_candidates(
                     raise ownership.unavailable[chapter.file_path]
                 resolved, info = _inspect_chapter_archive(series, chapter, folders, ownership)
                 offset = _archive_volume_offset(resolved, folder_offsets)
-                files.append((chapter, Path(chapter.file_path), info, offset))
+                number_conflict = filename_conflicts_with_mapping(chapter, resolved, tracked_numbers)
+                files.append((chapter, Path(chapter.file_path), info, offset, number_conflict))
             except FileNotFoundError:
                 # An accessible parent lets us distinguish a deleted archive
                 # from a missing mount. A configured extra may be its own mount.
@@ -237,11 +245,11 @@ def find_candidates(
     uncertain_volume_sources = {"", "legacy", "disk-inferred", "comicinfo"}
     valid_titles = _archive_title_keys(series)
 
-    for chapter, path, info, offset in files:
+    for chapter, path, info, offset, number_conflict in files:
         if not info.exists:
             continue
         number = _numeric(info.number)
-        if info.number is not None and (
+        if not number_conflict and info.number is not None and (
             number is None or not math.isclose(number, chapter.number, abs_tol=1e-6)
         ):
             chapter_number = float(chapter.number)
@@ -250,7 +258,7 @@ def find_candidates(
                 chapter.id, "comicinfo_number_mismatch", str(path), "number",
                 info.number, suggested,
                 f"ComicInfo chapter number does not match chapter {suggested}",
-                "The archive filename and Mangarr mapping identify a different chapter. "
+                "The Mangarr mapping identifies a different chapter. "
                 "Readers may sort or label this file incorrectly.",
                 info.revision,
             ))
@@ -320,7 +328,7 @@ def find_candidates(
     # catches imported one-off bonus chapters without pretending disk-inferred
     # assignments are authoritative enough to validate the bad tag.
     by_volume: dict[int, list[tuple[Chapter, Path, ComicInfoMetadata]]] = {}
-    for chapter, path, info, offset in files:
+    for chapter, path, info, offset, _ in files:
         # Siblings in differently numbered editions do not establish whether
         # a volume tag is isolated in the archive's physical edition.
         if chapter.volume is not None and offset == 0:

@@ -4,6 +4,7 @@ its results must still land on the session's chapters."""
 
 import asyncio
 import threading
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -22,6 +23,7 @@ from mangarr.models import (
     HistoryEvent,
     RootFolder,
     Series,
+    SeriesFolder,
 )
 from mangarr.schemas import ComicInfoUpdateIn
 
@@ -78,7 +80,8 @@ async def test_slow_import_does_not_block_the_event_loop(db_session, tmp_path, m
     async def other_work():
         while not import_started.is_set():
             await asyncio.sleep(0.001)
-        loop_ran.set()
+        async with metadata_issues.manual_archive_lock:
+            loop_ran.set()
 
     await asyncio.wait_for(asyncio.gather(
         tasks._import_torrent(db_session, dl, content, VALUES),
@@ -109,23 +112,34 @@ async def two_sessions(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("correct_number", [False, True])
+@pytest.mark.parametrize("location", ["shared root", "different root", "extra folder"])
 async def test_torrent_import_waits_for_repair_before_adopting_shared_archive(
-    two_sessions, tmp_path, monkeypatch, correct_number,
+    two_sessions, tmp_path, monkeypatch, correct_number, location,
 ):
     sync_session, api_session, _ = two_sessions
+    first_root = RootFolder(path=str(tmp_path / "library"))
     folder = tmp_path / "library" / "Shared"
+    extra_folders = []
+    if location == "extra folder":
+        folder = tmp_path / "extra"
+        extra_folders = [SeriesFolder(path=str(folder))]
+    second_root = first_root
+    if location != "shared root":
+        second_root = RootFolder(path=str(tmp_path / "destination"))
+        (tmp_path / "destination").mkdir()
+    (tmp_path / "library" / "Shared").mkdir(parents=True)
     archive = folder / "Bonus Story.cbz"
     original_number = 2 if correct_number else 1
     write_cbz(
         archive, [b"\xff\xd8\xffimage"],
         f"<ComicInfo><Number>{original_number}</Number></ComicInfo>",
     )
-    root = RootFolder(path=str(folder.parent))
-    first = Series(title="First", folder_name=folder.name, root_folder=root, chapters=[
+    first = Series(title="First", folder_name="Shared", root_folder=first_root, chapters=[
         Chapter(number=1, downloaded=True, file_path=str(archive)),
+    ], extra_folders=extra_folders)
+    second = Series(title="Second", folder_name="Shared", root_folder=second_root, chapters=[
+        Chapter(number=1), Chapter(number=2),
     ])
-    second_chapter = Chapter(number=original_number)
-    second = Series(title="Second", folder_name=folder.name, root_folder=root, chapters=[second_chapter])
     sync_session.add_all([first, second])
     await sync_session.flush()
     download = Download(series_id=second.id, kind=DownloadKind.TORRENT, status=DownloadStatus.IMPORTING)
@@ -173,22 +187,24 @@ async def test_torrent_import_waits_for_repair_before_adopting_shared_archive(
         queued_import = asyncio.create_task(import_archive())
         await asyncio.wait_for(import_waiting.wait(), timeout=5)
         assert download.status == DownloadStatus.IMPORTING
-        assert not second_chapter.downloaded
+        assert not any(chapter.downloaded for chapter in second.chapters)
     finally:
         release_repair.set()
         await repair
         if queued_import is not None:
             await queued_import
 
-    await sync_session.refresh(second_chapter)
+    await sync_session.refresh(second, ["chapters"])
     assert download.status == DownloadStatus.DONE
     repaired = comicinfo.read_comicinfo(archive)
     if correct_number:
         assert repaired.number == "1"
-        assert not second_chapter.downloaded and not second_chapter.file_path
     else:
         assert repaired.title == "Repaired"
-        assert second_chapter.downloaded and second_chapter.file_path == str(archive)
+    by_number = {chapter.number: chapter for chapter in second.chapters}
+    assert by_number[1].downloaded
+    assert comicinfo.read_comicinfo(Path(by_number[1].file_path)).number == "1"
+    assert not by_number[2].downloaded and not by_number[2].file_path
 
 
 @pytest.mark.parametrize("outcome", ["imported", "payload deleted", "failed"])
