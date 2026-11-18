@@ -20,10 +20,10 @@ from mangarr.api import issues as issues_api, library as library_api, series as 
 from mangarr.comicinfo import ArchiveChanged, ComicInfoError, read_comicinfo, update_comicinfo
 from mangarr.jobs import tasks
 from mangarr.schemas import (
-    ChapterMetadataIn, ComicInfoUpdateIn, FileMapIn, FileMapRangeIn, IssueResolveIn,
+    ChapterMetadataIn, ComicInfoUpdateIn, FileMapIn, FileMapRangeIn, IssueResolveIn, RenameApplyIn,
 )
 from mangarr.metadata_issues import ArchiveOwnership, detect_series_issues, find_candidates
-from mangarr.models import Base, Chapter, LibraryIssue, RootFolder, Series
+from mangarr.models import Base, Chapter, LibraryIssue, RootFolder, Series, SeriesFolder
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
@@ -503,6 +503,93 @@ async def test_comicinfo_number_can_be_removed_when_filename_matches_chapter(rep
     assert edited.number is None
     await library_api.scan(series.id, session)
     assert chapter.downloaded and chapter.file_path == str(path)
+
+
+async def test_rename_waits_for_comicinfo_replacement(repair_db, monkeypatch):
+    session, maker, series, path = repair_db
+    series_id, chapter_id = series.id, series.chapters[0].id
+    before = await issues_api.get_chapter_comicinfo(series_id, chapter_id, session)
+    loop = asyncio.get_running_loop()
+    checked = asyncio.Event()
+    release = threading.Event()
+    require_revision = comicinfo._require_revision
+
+    def pause_replacement(candidate_path, revision):
+        require_revision(candidate_path, revision)
+        if any(path.parent.glob(f".{path.name}.*.tmp")):
+            loop.call_soon_threadsafe(checked.set)
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(comicinfo, "_require_revision", pause_replacement)
+
+    async def repair():
+        async with maker() as other:
+            return await issues_api.update_chapter_comicinfo(
+                series_id, chapter_id,
+                ComicInfoUpdateIn(revision=before.revision, volume=1), other,
+            )
+
+    async def rename():
+        async with maker() as other:
+            return await library_api.rename_apply(series_id, RenameApplyIn(), other)
+
+    async with asyncio.timeout(10):
+        repair_task = asyncio.create_task(repair())
+        rename_task = None
+        try:
+            await checked.wait()
+            rename_task = asyncio.create_task(rename())
+            _, pending = await asyncio.wait([rename_task], timeout=0.05)
+            assert rename_task in pending and path.exists()
+        finally:
+            release.set()
+            results = await asyncio.gather(repair_task, *([rename_task] if rename_task else []))
+    assert results[1][0].status == "renamed"
+    async with maker() as other:
+        renamed = Path((await other.get(Chapter, chapter_id)).file_path)
+    assert not path.exists()
+    assert read_comicinfo(renamed).volume == "1"
+
+
+@pytest.mark.parametrize("rebuilt_number", [1, 99])
+async def test_chapter_resync_detaches_then_reconciles_issues(repair_db, monkeypatch, rebuilt_number):
+    session, maker, series, _ = repair_db
+    series_id = series.id
+    await library_api.scan(series_id, session)
+    [issue] = await issues_api.list_issues(ignored=False, series_id=series_id, session=session)
+    await issues_api.ignore_issue(issue.id, session)
+
+    async def rebuild(rebuild_session, rebuilding_series, _values):
+        async with maker() as other:
+            [detached] = await issues_api.list_issues(ignored=True, series_id=series_id, session=other)
+            assert detached.chapter_id is None and detached.chapter_number is None
+        rebuilding_series.chapters = [Chapter(number=rebuilt_number, volume=1, volume_source="viz")]
+        await rebuild_session.commit()
+
+    monkeypatch.setattr(tasks, "update_chapters", rebuild)
+    await library_api.resync_chapters(series_id, session)
+    ignored = await issues_api.list_issues(ignored=True, series_id=series_id, session=session)
+    assert await issues_api.list_issues(ignored=False, series_id=series_id, session=session) == []
+    if rebuilt_number == 1:
+        [restored] = ignored
+        assert restored.id == issue.id and restored.chapter_number == 1
+    else:
+        assert ignored == []
+
+
+async def test_chapter_resync_preserves_mappings_when_extra_folder_is_unavailable(repair_db):
+    session, _, series, path = repair_db
+    chapter = series.chapters[0]
+    extra = path.parent.parent.parent / "extra-mount"
+    session.add(SeriesFolder(series_id=series.id, path=str(extra)))
+    chapter.file_path = str(extra / path.name)
+    await session.commit()
+
+    with pytest.raises(HTTPException, match="extra folder") as exc:
+        await library_api.resync_chapters(series.id, session)
+    assert exc.value.status_code == 409
+    assert chapter.downloaded and chapter.file_path == str(extra / path.name)
+    assert await session.get(Chapter, chapter.id) is chapter
 
 
 async def test_invalid_xml_keeps_archive_and_valid_write_runs_off_event_loop(repair_db, monkeypatch):

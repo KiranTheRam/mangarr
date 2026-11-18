@@ -18,7 +18,7 @@ from ..jobs.tasks import series_lock
 from ..metadata_issues import (
     ArchiveIneligible, chapter_paths, current_candidates, detect_series_issues,
     inspect_chapter_archive, load_archive_ownership, manual_archive_lock,
-    preserves_chapter_number_mapping, reconcile_candidates,
+    metadata_identifies_volume, preserves_chapter_number_mapping, reconcile_candidates,
 )
 from ..models import Chapter, LibraryIssue, Series
 from ..schemas import (
@@ -66,10 +66,24 @@ async def _inspect(
 
 
 async def _write_archive(
-    path: Path, revision: str, updates: dict[str, str | int | None]
+    chapter: Chapter, path: Path, current: ComicInfoMetadata, updates: dict[str, str | int | None],
 ) -> ComicInfoMetadata:
+    value = updates.get("number", current.number)
+    number = str(value) if value is not None else None
+    if number != current.number and not preserves_chapter_number_mapping(chapter, path, number):
+        raise HTTPException(
+            409,
+            "Mangarr uses ComicInfo Number to match this file. Keep it set to "
+            f"chapter {chapter.number:g} or rename the file to identify that chapter before editing.",
+        )
+    if metadata_identifies_volume(chapter, path, number, updates.get("volume", current.volume)):
+        raise HTTPException(
+            409,
+            "Set ComicInfo Number to "
+            f"chapter {chapter.number:g} or rename the file to identify that chapter before setting Volume.",
+        )
     try:
-        return await run_in_threadpool(update_comicinfo, path, updates, expected_revision=revision)
+        return await run_in_threadpool(update_comicinfo, path, updates, expected_revision=current.revision)
     except ArchiveChanged as exc:
         raise HTTPException(409, str(exc)) from exc
     except ComicInfoError as exc:
@@ -118,17 +132,7 @@ async def update_chapter_comicinfo(
         chapter, path, current = await _inspect(session, series, chapter_id)
         if current.revision != body.revision:
             raise HTTPException(409, "The chapter archive changed; reopen it and review the metadata")
-        if (
-            "number" in updates
-            and body.number != current.number
-            and not preserves_chapter_number_mapping(chapter, path, body.number)
-        ):
-            raise HTTPException(
-                409,
-                "Mangarr uses ComicInfo Number to match this file. Keep it set to "
-                f"chapter {chapter.number:g} or rename the file to identify that chapter before editing.",
-            )
-        info = await _write_archive(path, body.revision, updates)
+        info = await _write_archive(chapter, path, current, updates)
         await detect_series_issues(session, series)
         await session.commit()
         await _notify_reader(session, series)
@@ -165,7 +169,9 @@ async def list_issues(
     query = (
         select(LibraryIssue, Series.title, Chapter.number)
         .join(Series, Series.id == LibraryIssue.series_id)
-        .outerjoin(Chapter, Chapter.id == LibraryIssue.chapter_id)
+        .outerjoin(
+            Chapter, (Chapter.id == LibraryIssue.chapter_id) & (Chapter.series_id == LibraryIssue.series_id),
+        )
         .where(LibraryIssue.ignored == ignored)  # noqa: E712
         .order_by(LibraryIssue.updated_at.desc(), LibraryIssue.id.desc())
     )
@@ -245,10 +251,10 @@ async def resolve_issue(
             await reconcile_candidates(session, series.id, candidates)
             await session.commit()
             raise HTTPException(409, "The issue changed; review the current recommendation")
-        _, path, info = await _inspect(session, series, candidate.chapter_id)
+        chapter, path, info = await _inspect(session, series, candidate.chapter_id)
         if info.revision != candidate.archive_revision:
             raise HTTPException(409, "The chapter archive changed; scan issues again")
-        await _write_archive(path, info.revision, {candidate.field: candidate.suggested_value})
+        await _write_archive(chapter, path, info, {candidate.field: candidate.suggested_value})
         await session.delete(issue)
         await detect_series_issues(session, series)
         await session.commit()

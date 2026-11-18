@@ -67,6 +67,9 @@ _TAG_ORDER = {
     ))
 }
 _NUMBER_SPAN = re.compile(r"\d+(?:\.\d+)?(?:\s*[-–—,&/]\s*\d+(?:\.\d+)?)+")
+_XML_WHITESPACE = " \t\r\n"
+_XML_INTEGER = re.compile(r"[+-]?[0-9]+")
+COMICINFO_INT_MAX = 2**31 - 1
 _POSIX_ACCESS_ACL = "system.posix_acl_access"
 _ARCHIVE_ERRORS = (
     OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile,
@@ -176,16 +179,36 @@ def number_spans_chapters(number: str | None) -> bool:
     return bool(_NUMBER_SPAN.fullmatch(number or ""))
 
 
+def parse_comicinfo_int(value: str | None) -> int | None:
+    """Parse an XML Schema xs:int, allowing signed and zero-padded integers."""
+    value = (value or "").strip(_XML_WHITESPACE)
+    if not _XML_INTEGER.fullmatch(value):
+        return None
+    digits = value.lstrip("+-").lstrip("0")
+    if len(digits) > 10:
+        return None
+    number = int(digits or "0")
+    if value.startswith("-"):
+        number = -number
+    return number if -COMICINFO_INT_MAX - 1 <= number <= COMICINFO_INT_MAX else None
+
+
 def _metadata(
     root: ElementTree.Element | None, pages: list[Path], revision: str
 ) -> ComicInfoMetadata:
-    def text(tag: str) -> str | None:
-        return (" ".join((root.findtext(tag) or "").split()) or None
-                if root is not None else None)
+    def text(tag: str, *, integer: bool = False) -> str | None:
+        if root is None:
+            return None
+        value = root.findtext(tag) or None
+        if value is None:
+            return None
+        if integer:
+            return value.strip(_XML_WHITESPACE)
+        return " ".join(value.split()) or None
 
     return ComicInfoMetadata(
-        root is not None, text("Series"), text("Number"), text("Volume"),
-        text("Title"), text("PageCount"), len(pages), revision,
+        root is not None, text("Series"), text("Number"), text("Volume", integer=True),
+        text("Title"), text("PageCount", integer=True), len(pages), revision,
         number_spans_chapters(text("Number")) or _chapter_labels_span(pages),
     )
 

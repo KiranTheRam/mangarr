@@ -541,6 +541,7 @@ export function comicInfoUpdate(original: ComicInfo, fields: ArchiveFields) {
     if (value !== original[field]) payload[field] = value;
   }
   for (const field of ["volume", "page_count"] as const) {
+    if (fields[field] === (original[field] ?? "")) continue;
     const value = fields[field].trim() || null;
     if (value === original[field]) continue;
     if (value === null) {

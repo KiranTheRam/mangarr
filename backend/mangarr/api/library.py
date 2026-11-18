@@ -5,7 +5,7 @@ import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -14,15 +14,17 @@ from ..db import get_session
 from ..library.matcher import find_series_media_files, match_files
 from ..library.rename import apply_renames, plan_renames
 from ..library.scanner import (
+    chapters_under_folders,
     find_existing_folder,
     resolve_folders,
     resolve_volume_offsets,
     scan_series,
     series_dir,
+    unavailable_extra_folders,
 )
 from ..jobs.tasks import series_lock
 from ..metadata_issues import detect_series_issues, manual_archive_lock
-from ..models import Chapter, RootFolder, Series, SeriesFolder, SeriesSourceLink
+from ..models import Chapter, LibraryIssue, RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     CleanupApplyIn,
     CleanupFileOut,
@@ -213,13 +215,14 @@ async def rename_preview(series_id: int, session: AsyncSession = Depends(get_ses
 async def rename_apply(
     series_id: int, body: RenameApplyIn, session: AsyncSession = Depends(get_session)
 ):
-    series = await _load(session, series_id)
-    items = await _plan(session, series)
-    if body.chapter_ids is not None:
-        wanted = set(body.chapter_ids)
-        items = [i for i in items if wanted & set(i.chapter_ids)]
-    outcomes = apply_renames(items, {c.id: c for c in _active_chapters(series)})
-    await session.commit()
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        items = await _plan(session, series)
+        if body.chapter_ids is not None:
+            wanted = set(body.chapter_ids)
+            items = [i for i in items if wanted & set(i.chapter_ids)]
+        outcomes = apply_renames(items, {c.id: c for c in _active_chapters(series)})
+        await session.commit()
     return [
         RenameOutcomeOut(
             current_name=o.item.current_name, new_name=o.item.new_name,
@@ -538,6 +541,10 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
         series = await _load(session, series_id)
         # the rebuild relies on a rescan to restore downloaded state
         await _require_root_available(session, series)
+        if chapters_under_folders(
+            series.chapters, unavailable_extra_folders(_folders_of(series)[1:]),
+        ):
+            raise HTTPException(409, "A configured extra folder with downloaded chapters is unavailable")
         busy = await session.scalar(
             select(func.count(Download.id)).where(
                 Download.series_id == series_id,
@@ -567,6 +574,11 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
             or_(Download.chapter_id.isnot(None), Download.status.notin_(active)),
         ))
         await session.execute(sa_delete(HistoryEvent).where(HistoryEvent.series_id == series_id))
+        # Keep dismissals by archive, but detach their chapter IDs before
+        # SQLite can reuse those IDs for the rebuilt chapter list.
+        await session.execute(
+            update(LibraryIssue).where(LibraryIssue.series_id == series_id).values(chapter_id=None)
+        )
         for ch in list(series.chapters):
             await session.delete(ch)
         await session.commit()
@@ -787,11 +799,12 @@ async def resync_volumes(
 
 
 async def _scan_now(session: AsyncSession, series: Series) -> int:
-    from ..library.scanner import scan_series
     result = scan_series(
         series, _active_chapters(series), _folders_of(series),
         _volume_offsets_of(series), root=_root_of(series),
     )
+    if not result.root_unavailable:
+        await detect_series_issues(session, series)
     await session.commit()
     return result.matched_chapters
 

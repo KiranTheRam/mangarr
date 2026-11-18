@@ -763,13 +763,20 @@ def refine_volume_map_with_disk(
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
     """Clear downloaded state for chapters whose recorded media file is gone."""
+    from ..library.scanner import chapters_under_folders, unavailable_extra_folders
+
     reason = await library_root_unavailable(session, series)
     if reason:
         log.warning("Not checking files of %r: %s", series.title, reason)
         return 0
+    extras = (
+        [Path(series.root_folder.path) / folder.path for folder in series.extra_folders]
+        if series.root_folder is not None else []
+    )
+    protected = chapters_under_folders(series.chapters, unavailable_extra_folders(extras))
     missing = 0
     for chapter in series.chapters:
-        if chapter.excluded:
+        if chapter.excluded or chapter in protected:
             continue
         if not chapter.downloaded:
             continue

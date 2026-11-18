@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .comicinfo import COMICINFO_INT_MAX
+
 MonitorMode = Literal["all", "missing", "future", "from_chapter", "latest_volume", "none"]
 
 
@@ -302,6 +304,8 @@ class ComicInfoUpdateIn(BaseModel):
     def _positive_optional_integer(cls, value, info):
         if value is not None and value < 1:
             raise ValueError(f"{info.field_name} must be at least 1")
+        if value is not None and value > COMICINFO_INT_MAX:
+            raise ValueError(f"{info.field_name} must be at most {COMICINFO_INT_MAX}")
         return value
 
 

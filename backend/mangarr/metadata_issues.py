@@ -16,9 +16,13 @@ from uuid import uuid4
 from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .comicinfo import ArchiveChanged, ComicInfoError, ComicInfoMetadata, read_comicinfo
+from .comicinfo import (
+    ArchiveChanged, ComicInfoError, ComicInfoMetadata, parse_comicinfo_int, read_comicinfo,
+)
 from .filename import parse_filename
-from .library.scanner import resolve_folders, root_unavailable
+from .library.scanner import (
+    chapters_under_folders, resolve_folders, root_unavailable, unavailable_extra_folders,
+)
 from .models import Chapter, LibraryIssue, Series
 from .titles import metadata_titles
 from .util import normalize_title
@@ -134,10 +138,7 @@ def _inspect_chapter_archive(
         ):
             raise ArchiveIneligible("Whole-volume or multi-chapter archives need volume-level editing")
     info = read_comicinfo(path)
-    if info.labels_multiple_chapters or (
-        info.volume is not None and _numeric(info.number) is None
-        and all(parse_filename(name).chapter_number is None for name in {raw.stem, path.stem})
-    ):
+    if info.labels_multiple_chapters or metadata_identifies_volume(chapter, path, info.number, info.volume):
         raise ArchiveIneligible("Whole-volume or multi-chapter archives need volume-level editing")
     return path, info
 
@@ -159,16 +160,34 @@ def preserves_chapter_number_mapping(chapter: Chapter, path: Path, number: str |
     )
 
 
+def metadata_identifies_volume(
+    chapter: Chapter, path: Path, number: str | None, volume: str | int | None,
+) -> bool:
+    volume_number = parse_comicinfo_int(str(volume)) if volume is not None else None
+    return (
+        volume_number is not None and volume_number >= 0
+        and _numeric(number) is None
+        and all(
+            parse_filename(name).chapter_number is None
+            for name in {Path(chapter.file_path).stem, path.stem}
+        )
+    )
+
+
 def find_candidates(
     series: Series, ownership: ArchiveOwnership, expect_content: bool = True
 ) -> list[Candidate] | None:
     """Return None when an unavailable archive prevents a trustworthy scan."""
     if series.root_folder is None:
         return None
-    if root_unavailable(Path(series.root_folder.path), expect_content):
+    root = Path(series.root_folder.path)
+    if root_unavailable(root, expect_content):
         return None
     files: list[tuple[Chapter, Path, ComicInfoMetadata]] = []
     try:
+        extras = [root / folder.path for folder in series.extra_folders]
+        if chapters_under_folders(series.chapters, unavailable_extra_folders(extras)):
+            return None
         folders = _archive_folders(series)
         for chapter in series.chapters:
             if chapter.excluded or not chapter.downloaded or not chapter.file_path:
@@ -214,12 +233,13 @@ def find_candidates(
             ))
 
         if info.page_count is not None:
-            page_count = _numeric(info.page_count)
-            if page_count is None or page_count != info.actual_page_count:
+            page_count = parse_comicinfo_int(info.page_count)
+            if page_count != info.actual_page_count:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_page_count_mismatch", str(path), "page_count",
                     info.page_count, str(info.actual_page_count),
-                    "ComicInfo page count does not match the archive",
+                    ("ComicInfo page count is not a valid integer" if page_count is None
+                     else "ComicInfo page count does not match the archive"),
                     f"ComicInfo declares {info.page_count!r}, but the archive contains "
                     f"{info.actual_page_count} image pages.",
                     info.revision,
@@ -236,14 +256,15 @@ def find_candidates(
             ))
 
         if info.volume is not None:
-            volume = _numeric(info.volume)
+            volume = parse_comicinfo_int(info.volume)
             reliable = chapter.volume_source not in uncertain_volume_sources
-            if volume is None or not volume.is_integer():
+            expected_volume = parse_comicinfo_int(str(chapter.volume)) if chapter.volume is not None else None
+            if volume is None:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_invalid", str(path), "volume",
                     info.volume, None,
-                    "ComicInfo volume is not a whole number",
-                    "Readers expect the Volume field to be a whole number. Removing the bad "
+                    "ComicInfo volume is not a valid integer",
+                    "Readers expect the Volume field to be a 32-bit integer. Removing the bad "
                     "tag keeps the chapter available without inventing a volume.",
                     info.revision,
                 ))
@@ -256,10 +277,10 @@ def find_candidates(
                     "makes readers create one. The recommended change removes only the tag.",
                     info.revision,
                 ))
-            elif reliable and int(volume) != chapter.volume:
+            elif reliable and expected_volume is not None and volume != expected_volume:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_mismatch", str(path), "volume",
-                    info.volume, str(chapter.volume),
+                    info.volume, str(expected_volume),
                     f"ComicInfo volume disagrees with {chapter.volume_source}",
                     f"The archive says Volume {info.volume}, while {chapter.volume_source} "
                     f"places chapter {chapter.number:g} in Volume {chapter.volume}.",
@@ -280,7 +301,7 @@ def find_candidates(
             continue
         chapter, path, info = declared[0]
         if (
-            _numeric(info.volume) != volume
+            parse_comicinfo_int(info.volume) != volume
             or chapter.volume_locked
             or chapter.volume_source not in uncertain_volume_sources
         ):
@@ -352,7 +373,7 @@ async def reconcile_candidates(
             issue.ignored = False
             issue.public_id = uuid4().hex
         revision = candidate.revision
-        if issue.revision != revision:
+        if issue.revision != revision or issue.chapter_id != candidate.chapter_id:
             values = asdict(candidate)
             values.pop("archive_revision")
             for name, value in values.items():

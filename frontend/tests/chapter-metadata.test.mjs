@@ -46,6 +46,10 @@ test("ComicInfo saves omit untouched metadata and distinguish removals from inva
   assert.deepEqual(comicInfoUpdate(original, { ...fields, title: "New title" }).payload, {
     revision: original.revision, title: "New title",
   });
+  assert.deepEqual(comicInfoUpdate(
+    { ...original, volume: "", page_count: "" },
+    { ...fields, volume: "", page_count: "", title: "New title" },
+  ).payload, { revision: original.revision, title: "New title" });
   assert.deepEqual(comicInfoUpdate(original, { ...fields, page_count: "", volume: "10" }).payload, {
     revision: original.revision, page_count: null, volume: 10,
   });
