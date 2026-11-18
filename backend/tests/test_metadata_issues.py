@@ -1,5 +1,8 @@
 import asyncio
+import errno
 import os
+import struct
+import sys
 import threading
 import zipfile
 from pathlib import Path
@@ -78,6 +81,52 @@ def test_comicinfo_update_preserves_file_owner_and_aborts_on_chown_failure(tmp_p
         update_comicinfo(path, {"number": 3})
     assert path.read_bytes() == before
     assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux stores POSIX ACLs in xattrs")
+def test_comicinfo_rewrite_preserves_access_acl_and_aborts_on_acl_failure(tmp_path, monkeypatch):
+    path = tmp_path / "chapter.cbz"
+    archive(path, "<ComicInfo><Number>2</Number></ComicInfo>")
+    acl = struct.pack(
+        "<I" + "HHI" * 5,
+        2,  # Linux POSIX ACL xattr version
+        1, 6, 0xFFFFFFFF,  # owner: read/write
+        2, 4, 4567,  # named user: read
+        4, 0, 0xFFFFFFFF,  # owning group: no access
+        16, 4, 0xFFFFFFFF,  # ACL mask: read
+        32, 0, 0xFFFFFFFF,  # others: no access
+    )
+    access_acl = "system.posix_acl_access"
+    try:
+        os.setxattr(path, access_acl, acl)
+    except OSError as exc:
+        if exc.errno == errno.EOPNOTSUPP:
+            pytest.skip("test filesystem does not support ACLs")
+        raise
+    update_comicinfo(path, {"number": 1})
+    assert os.getxattr(path, access_acl) == acl
+    assert path.stat().st_mode & 0o777 == 0o640
+
+    def denied(*_args):
+        raise PermissionError("cannot preserve archive ACL")
+
+    before = path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "setxattr", denied)
+        with pytest.raises(ComicInfoError, match="cannot preserve archive ACL"):
+            update_comicinfo(path, {"number": 3})
+    assert path.read_bytes() == before
+    assert os.getxattr(path, access_acl) == acl
+    assert list(tmp_path.iterdir()) == [path]
+
+    # A later directory default must not add an ACL to a plain archive.
+    os.removexattr(path, access_acl)
+    os.setxattr(tmp_path, "system.posix_acl_default", acl)
+    update_comicinfo(path, {"number": 4})
+    with pytest.raises(OSError) as exc:
+        os.getxattr(path, access_acl)
+    assert exc.value.errno == errno.ENODATA
+    assert path.stat().st_mode & 0o777 == 0o640
 
 
 @pytest.mark.parametrize(

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
 import stat
+import sys
 import tempfile
 import zipfile
 import zlib
@@ -50,6 +52,7 @@ _TAGS = {
     "page_count": "PageCount",
 }
 _NUMBER_SPAN = re.compile(r"\d+(?:\.\d+)?(?:\s*[-–—,&/]\s*\d+(?:\.\d+)?)+")
+_POSIX_ACCESS_ACL = "system.posix_acl_access"
 _ARCHIVE_ERRORS = (
     OSError, ValueError, RuntimeError, EOFError, zipfile.BadZipFile,
     zlib.error, ElementTree.ParseError,
@@ -70,6 +73,27 @@ def _archive_reader(path: Path, *, check_suffix: bool = True) -> BoundedZipReade
 def _revision(file_stat: os.stat_result) -> str:
     identity = (file_stat.st_dev, file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns)
     return hashlib.sha256(repr(identity).encode()).hexdigest()
+
+
+def _copy_posix_access_acl(source_fd: int, target_fd: int) -> None:
+    if sys.platform != "linux":
+        return
+    try:
+        acl = os.getxattr(source_fd, _POSIX_ACCESS_ACL)
+    except OSError as exc:
+        if exc.errno == errno.EOPNOTSUPP:
+            return
+        if exc.errno != errno.ENODATA:
+            raise
+        # The temporary file can inherit a default ACL even when the
+        # original archive has none.
+        try:
+            os.removexattr(target_fd, _POSIX_ACCESS_ACL)
+        except OSError as remove_exc:
+            if remove_exc.errno != errno.ENODATA:
+                raise
+    else:
+        os.setxattr(target_fd, _POSIX_ACCESS_ACL, acl)
 
 
 def _members(archive: zipfile.ZipFile) -> tuple[zipfile.ZipInfo | None, list[Path]]:
@@ -179,8 +203,9 @@ def update_comicinfo(
     if unknown:
         raise ComicInfoError(f"Unsupported ComicInfo field: {sorted(unknown)[0]}")
     try:
-        with _archive_reader(path) as handle, zipfile.ZipFile(handle) as source:
-            source_stat = os.fstat(handle.fileno())
+        with _archive_reader(path) as original, zipfile.ZipFile(original) as source:
+            source_fd = original.fileno()
+            source_stat = os.fstat(source_fd)
             revision = _revision(source_stat)
             if expected_revision is not None and revision != expected_revision:
                 raise ArchiveChanged("The chapter archive changed; reopen it and review the metadata")
@@ -237,9 +262,12 @@ def update_comicinfo(
                         os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
                     # chown can clear mode bits, so restore the mode afterward.
                     os.fchmod(fd, stat.S_IMODE(source_stat.st_mode))
+                    _copy_posix_access_acl(source_fd, fd)
                 # Renaming changes the inode, so a second writer holding the old
                 # revision can never replace this result after its copy finishes.
                 result = _metadata(validated, pages, _revision(temp_path.stat()))
+                if os.fstat(source_fd).st_ctime_ns != source_stat.st_ctime_ns:
+                    raise ArchiveChanged("The chapter archive changed; reopen it and review the metadata")
                 _require_revision(path, revision)
                 os.replace(temp_path, path)
                 return result
