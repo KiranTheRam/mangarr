@@ -17,7 +17,8 @@ from ..db import get_session
 from ..jobs.tasks import series_lock
 from ..metadata_issues import (
     ArchiveIneligible, chapter_paths, current_candidates, detect_series_issues,
-    inspect_chapter_archive, load_archive_ownership, manual_archive_lock, reconcile_candidates,
+    inspect_chapter_archive, load_archive_ownership, manual_archive_lock,
+    preserves_chapter_number_mapping, reconcile_candidates,
 )
 from ..models import Chapter, LibraryIssue, Series
 from ..schemas import (
@@ -45,12 +46,15 @@ async def _series(session: AsyncSession, series_id: int) -> Series | None:
 
 async def _inspect(
     session: AsyncSession, series: Series, chapter_id: int
-) -> tuple[Path, ComicInfoMetadata]:
+) -> tuple[Chapter, Path, ComicInfoMetadata]:
     chapter = next((item for item in series.chapters if item.id == chapter_id), None)
     if chapter is None:
         raise HTTPException(404, "Chapter not found")
     try:
-        return await run_in_threadpool(inspect_chapter_archive, series, chapter, await chapter_paths(session))
+        path, info = await run_in_threadpool(
+            inspect_chapter_archive, series, chapter, await chapter_paths(session),
+        )
+        return chapter, path, info
     except ArchiveIneligible as exc:
         raise HTTPException(400, str(exc)) from exc
     except ArchiveChanged as exc:
@@ -90,7 +94,7 @@ async def get_chapter_comicinfo(
         series = await _series(session, series_id)
         if series is None:
             raise HTTPException(404, "Series not found")
-        path, info = await _inspect(session, series, chapter_id)
+        _, path, info = await _inspect(session, series, chapter_id)
         return ComicInfoOut(file_path=str(path), **info.__dict__)
 
 
@@ -111,7 +115,19 @@ async def update_chapter_comicinfo(
         series = await _series(session, series_id)
         if series is None:
             raise HTTPException(404, "Series not found")
-        path, _ = await _inspect(session, series, chapter_id)
+        chapter, path, current = await _inspect(session, series, chapter_id)
+        if current.revision != body.revision:
+            raise HTTPException(409, "The chapter archive changed; reopen it and review the metadata")
+        if (
+            "number" in updates
+            and body.number != current.number
+            and not preserves_chapter_number_mapping(chapter, path, body.number)
+        ):
+            raise HTTPException(
+                409,
+                "Mangarr uses ComicInfo Number to match this file. Keep it set to "
+                f"chapter {chapter.number:g} or rename the file to identify that chapter before editing.",
+            )
         info = await _write_archive(path, body.revision, updates)
         await detect_series_issues(session, series)
         await session.commit()
@@ -229,7 +245,7 @@ async def resolve_issue(
             await reconcile_candidates(session, series.id, candidates)
             await session.commit()
             raise HTTPException(409, "The issue changed; review the current recommendation")
-        path, info = await _inspect(session, series, candidate.chapter_id)
+        _, path, info = await _inspect(session, series, candidate.chapter_id)
         if info.revision != candidate.archive_revision:
             raise HTTPException(409, "The chapter archive changed; scan issues again")
         await _write_archive(path, info.revision, {candidate.field: candidate.suggested_value})

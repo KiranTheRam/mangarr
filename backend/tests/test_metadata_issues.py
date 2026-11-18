@@ -462,6 +462,49 @@ async def test_comicinfo_update_distinguishes_omission_from_removal(repair_db):
     assert result.page_count is None and result.volume == "1.5"
 
 
+@pytest.mark.parametrize("number", ["2", None])
+async def test_comicinfo_editor_protects_number_used_for_library_matching(repair_db, number):
+    session, _, series, path = repair_db
+    first = series.chapters[0]
+    second = Chapter(number=2)
+    first.downloaded, first.file_path = False, ""
+    series.chapters.append(second)
+    path = path.rename(path.with_name("Bonus Story.cbz"))
+    await session.commit()
+
+    await library_api.scan(series.id, session)
+    before = await issues_api.get_chapter_comicinfo(series.id, first.id, session)
+    original = path.read_bytes()
+    with pytest.raises(HTTPException, match="uses ComicInfo Number") as exc:
+        await issues_api.update_chapter_comicinfo(
+            series.id, first.id, ComicInfoUpdateIn(revision=before.revision, number=number), session,
+        )
+    assert exc.value.status_code == 409
+    assert path.read_bytes() == original
+
+    edited = await issues_api.update_chapter_comicinfo(
+        series.id, first.id,
+        ComicInfoUpdateIn(revision=before.revision, title="Bonus", number="1.0"), session,
+    )
+    assert edited.title == "Bonus"
+    assert edited.number == "1.0"
+    await library_api.scan(series.id, session)
+    assert first.downloaded and first.file_path == str(path)
+    assert not second.downloaded and not second.file_path
+
+
+async def test_comicinfo_number_can_be_removed_when_filename_matches_chapter(repair_db):
+    session, _, series, path = repair_db
+    chapter = series.chapters[0]
+    before = await issues_api.get_chapter_comicinfo(series.id, chapter.id, session)
+    edited = await issues_api.update_chapter_comicinfo(
+        series.id, chapter.id, ComicInfoUpdateIn(revision=before.revision, number=None), session,
+    )
+    assert edited.number is None
+    await library_api.scan(series.id, session)
+    assert chapter.downloaded and chapter.file_path == str(path)
+
+
 async def test_invalid_xml_keeps_archive_and_valid_write_runs_off_event_loop(repair_db, monkeypatch):
     session, _, series, path = repair_db
     chapter_id = series.chapters[0].id

@@ -13,7 +13,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
-from mangarr import automation, db as db_module
+from mangarr import automation, db as db_module, metadata_issues
 from mangarr.api.search import search_releases
 from mangarr.api.series import update_series
 from mangarr.jobs import tasks
@@ -26,6 +26,7 @@ from mangarr.models import (
     DownloadKind,
     DownloadStatus,
     HistoryEvent,
+    LibraryIssue,
     RootFolder,
     Series,
     SeriesSourceLink,
@@ -757,7 +758,7 @@ def test_finished_and_complete():
     assert not automation.finished_and_complete(series, [missing_unmonitored])
 
 
-async def _run_monitor(db_session, monkeypatch, settings):
+async def _run_monitor(db_session, monkeypatch, settings, *, scan_files=False):
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
@@ -783,11 +784,52 @@ async def _run_monitor(db_session, monkeypatch, settings):
     monkeypatch.setattr(tasks, "session_scope", scope)
     monkeypatch.setattr(tasks, "update_chapters", fake_update)
     monkeypatch.setattr(tasks, "link_sources", no_op)
-    monkeypatch.setattr(tasks, "scan_series_folder", no_op)
+    if not scan_files:
+        monkeypatch.setattr(tasks, "scan_series_folder", no_op)
     monkeypatch.setattr(tasks, "grab_missing_chapters", no_op)
     monkeypatch.setattr(tasks.registry, "apply_settings", apply_settings)
     await tasks.monitor_all()
     return calls
+
+
+@pytest.mark.parametrize("shared_archive", [False, True])
+async def test_monitor_indexes_archives_once_after_adopting_new_files(
+    db_session, monkeypatch, shared_archive,
+):
+    root = db_session.info["library"]
+    paths = []
+    for title in ("Alpha", "Beta"):
+        folder = Path(root.path) / title
+        folder.mkdir()
+        path = folder / f"{title} Ch. 1.cbz"
+        if paths and shared_archive:
+            path.hardlink_to(paths[0])
+        else:
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("001.png", PNG)
+                archive.writestr("ComicInfo.xml", "<ComicInfo><Number>2</Number></ComicInfo>")
+        paths.append(path)
+        db_session.add(Series(
+            title=title, folder_name=title, root_folder=root, chapters=[_chapter(1)],
+            metadata_refreshed_at=datetime.now(timezone.utc),
+        ))
+    await db_session.commit()
+
+    original_chapter_paths = metadata_issues.chapter_paths
+    ownership_snapshots = []
+
+    async def record_chapter_paths(session):
+        rows = await original_chapter_paths(session)
+        ownership_snapshots.append({path for _, path in rows})
+        return rows
+
+    monkeypatch.setattr(metadata_issues, "chapter_paths", record_chapter_paths)
+    await _run_monitor(db_session, monkeypatch, {}, scan_files=True)
+
+    adopted_paths = {str(path) for path in paths}
+    assert ownership_snapshots == [adopted_paths]
+    issue_paths = set(await db_session.scalars(select(LibraryIssue.file_path)))
+    assert issue_paths == (set() if shared_archive else adopted_paths)
 
 
 async def test_slow_mode_skips_recently_checked_complete_series(db_session, monkeypatch):

@@ -899,8 +899,6 @@ async def refresh_series_full(
 
 async def scan_all_series() -> None:
     """Scan every series' folder to adopt on-disk files (background job)."""
-    from ..metadata_issues import detect_series_issues, load_archive_ownership
-
     async with session_scope() as session:
         series_ids = [row[0] for row in (await session.execute(select(Series.id))).all()]
     scanned_ids = []
@@ -913,13 +911,18 @@ async def scan_all_series() -> None:
                         scanned_ids.append(series_id)
                 except Exception as exc:
                     log.warning("library scan failed for series %d: %s", series_id, exc)
-    if not scanned_ids:
+    await _scan_metadata_issues(scanned_ids)
+
+
+async def _scan_metadata_issues(series_ids: list[int]) -> None:
+    """Build one ownership snapshot after all file mappings have been committed."""
+    from ..metadata_issues import detect_series_issues, load_archive_ownership
+
+    if not series_ids:
         return
-    # Build the index after adoption so newly mapped chapters, including
-    # shared archives across series, are visible in this pass.
     async with session_scope() as session:
         ownership = await load_archive_ownership(session)
-    for series_id in scanned_ids:
+    for series_id in series_ids:
         async with series_lock(series_id), session_scope() as session:
             try:
                 series = await _load_series(session, series_id)
@@ -2158,6 +2161,7 @@ async def monitor_all() -> None:
         result = await session.execute(select(Series.id).where(Series.monitored == True))  # noqa: E712
         series_ids = [row[0] for row in result.all()]
 
+    scanned_ids = []
     for series_id in series_ids:
         lock = await try_acquire_series_lock(series_id)
         if lock is None:
@@ -2191,7 +2195,8 @@ async def monitor_all() -> None:
                     # adopt whatever is on disk before deciding what's missing, so
                     # files that appeared since the last pass aren't re-downloaded
                     try:
-                        await scan_series_folder(session, series)
+                        if await scan_series_folder(session, series, scan_issues=False):
+                            scanned_ids.append(series_id)
                     except Exception as exc:
                         log.warning("library scan failed for series %d: %s", series_id, exc)
                     await grab_missing_chapters(session, series, values,
@@ -2224,3 +2229,4 @@ async def monitor_all() -> None:
                 log.exception("monitor pass failed for series %d", series_id)
         finally:
             lock.release()
+    await _scan_metadata_issues(scanned_ids)

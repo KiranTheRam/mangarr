@@ -148,6 +148,17 @@ def inspect_chapter_archive(
     return _inspect_chapter_archive(series, chapter, _archive_folders(series), ArchiveOwnership(paths))
 
 
+def preserves_chapter_number_mapping(chapter: Chapter, path: Path, number: str | None) -> bool:
+    if _numeric(number) == chapter.number:
+        return True
+    # Match the library scanner's filename interpretation. If an alias and
+    # its target differ, a scan may discover either name first.
+    return all(
+        parse_filename(name).chapter_number == chapter.number
+        for name in {Path(chapter.file_path).stem, path.stem}
+    )
+
+
 def find_candidates(
     series: Series, ownership: ArchiveOwnership, expect_content: bool = True
 ) -> list[Candidate] | None:

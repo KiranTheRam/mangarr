@@ -51,6 +51,21 @@ _TAGS = {
     "title": "Title",
     "page_count": "PageCount",
 }
+# ComicInfo 2.0 defines an ordered sequence. Index all standard fields so
+# sparse documents can accept missing tags without moving existing metadata.
+_TAG_ORDER = {
+    tag: index
+    for index, tag in enumerate((
+        "Title", "Series", "Number", "Count", "Volume", "AlternateSeries",
+        "AlternateNumber", "AlternateCount", "Summary", "Notes", "Year",
+        "Month", "Day", "Writer", "Penciller", "Inker", "Colorist", "Letterer",
+        "CoverArtist", "Editor", "Publisher", "Imprint", "Genre", "Web",
+        "PageCount", "LanguageISO", "Format", "BlackAndWhite", "Manga",
+        "Characters", "Teams", "Locations", "ScanInformation", "StoryArc",
+        "SeriesGroup", "AgeRating", "Pages", "CommunityRating",
+        "MainCharacterOrTeam", "Review",
+    ))
+}
 _NUMBER_SPAN = re.compile(r"\d+(?:\.\d+)?(?:\s*[-–—,&/]\s*\d+(?:\.\d+)?)+")
 _POSIX_ACCESS_ACL = "system.posix_acl_access"
 _ARCHIVE_ERRORS = (
@@ -195,6 +210,27 @@ def read_comicinfo(path: Path) -> ComicInfoMetadata:
         raise ComicInfoError(f"Cannot read ComicInfo.xml: {exc}") from exc
 
 
+def _update_field(root: ElementTree.Element, tag: str, raw: str | int | None) -> None:
+    value = " ".join(str(raw).split()) if raw is not None else ""
+    matches = root.findall(tag)
+    if matches or not value:
+        if matches and value:
+            matches[0].text = value
+            matches = matches[1:]
+        for duplicate in matches:
+            root.remove(duplicate)
+        return
+
+    element = ElementTree.Element(tag)
+    element.text = value
+    rank = _TAG_ORDER[tag]
+    for index, child in enumerate(root):
+        if _TAG_ORDER.get(child.tag, -1) > rank:
+            root.insert(index, element)
+            return
+    root.append(element)
+
+
 def update_comicinfo(
     path: Path, updates: dict[str, str | int | None], *, expected_revision: str | None = None
 ) -> ComicInfoMetadata:
@@ -212,12 +248,7 @@ def update_comicinfo(
             member, pages = _members(source)
             root = _read_root(source, member) if member is not None else ElementTree.Element("ComicInfo")
             for field, raw in updates.items():
-                tag = _TAGS[field]
-                for existing in root.findall(tag):
-                    root.remove(existing)
-                value = " ".join(str(raw).split()) if raw is not None else ""
-                if value:
-                    ElementTree.SubElement(root, tag).text = value
+                _update_field(root, _TAGS[field], raw)
 
             payload = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
             if len(payload) > min(MAX_COMICINFO_BYTES, MAX_MEMBER_BYTES):
