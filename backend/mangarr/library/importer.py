@@ -26,6 +26,7 @@ from .matcher import (
 )
 from .naming import chapter_filename, series_folder, volume_filename
 from .publish import publish_new_file
+from .zip_limits import COPY_CHUNK_BYTES
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,30 @@ def _validate_existing(dest: Path) -> None:
                     raise ValueError("empty or damaged archive")
         except (zipfile.BadZipFile, ValueError) as exc:
             raise ValueError(f"Existing library archive is damaged; repair or remove it before retrying: {dest}") from exc
+
+
+def _same_contents(source, destination) -> bool:
+    while data := source.read(COPY_CHUNK_BYTES):
+        if destination.read(len(data)) != data:
+            return False
+    return not destination.read(1)
+
+
+def _matches_payload(media: MediaFile, dest: Path, only: set[Path] | None) -> bool:
+    if media.is_dir:
+        with zipfile.ZipFile(dest) as archive:
+            images = _loose_images(media.path, only)
+            if archive.namelist() != [image.name for image in images]:
+                return False
+            for image in images:
+                with image.open("rb") as source, archive.open(image.name) as installed:
+                    if not _same_contents(source, installed):
+                        return False
+        return True
+    if media.path.samefile(dest):
+        return True
+    with media.path.open("rb") as source, dest.open("rb") as installed:
+        return _same_contents(source, installed)
 
 
 def _archive_revision(path: Path) -> ArchiveRevision:
@@ -290,6 +315,12 @@ def import_torrent_payload(
         dest = destination(media, chapter, volume)
         if dest == media.path or dest.exists():
             _validate_existing(dest)
+            recorded_here = (
+                chapter is not None and chapter.downloaded
+                and chapter.file_path == str(dest)
+            )
+            if dest != media.path and not recorded_here and not _matches_payload(media, dest, only):
+                raise FileExistsError(f"Library file already exists and differs from the torrent: {dest}")
             _require_archive_revision(media.path, revisions.get(media.path))
         else:
             if media.is_dir:
@@ -305,14 +336,18 @@ def import_torrent_payload(
     return imported
 
 
-def _pack_images(img_dir: Path, dest: Path, only: set[Path] | None = None) -> None:
-    images = sorted(
+def _loose_images(img_dir: Path, only: set[Path] | None) -> list[Path]:
+    return sorted(
         (
             p for p in img_dir.iterdir()
             if p.is_file() and p.suffix.lower() in IMAGE_EXTS and (only is None or p in only)
         ),
         key=lambda p: natural_key(p.name),  # 1, 2, 10 — not 1, 10, 2
     )
+
+
+def _pack_images(img_dir: Path, dest: Path, only: set[Path] | None = None) -> None:
+    images = _loose_images(img_dir, only)
     with _atomic_destination(dest) as temporary:
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as zf:
             for img in images:

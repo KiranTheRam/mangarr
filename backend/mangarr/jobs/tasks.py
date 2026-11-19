@@ -48,6 +48,7 @@ from ..library.archive_members import ArchiveVersion, archive_version
 from ..library.importer import import_torrent_payload
 from ..library.matcher import find_media_files, find_series_media_files, match_files
 from ..library.naming import chapter_path, series_folder, volume_filename
+from ..library.publish import publish_new_file
 from ..library.volume_merge import merge_chapter_archives
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
@@ -75,7 +76,7 @@ from ..titles import (
     set_display_title,
 )
 from ..torrent_selection import select_best_torrent
-from ..util import is_transient_error, normalize_title, run_file_work, safe_error_reason
+from ..util import finish_before_cancel, is_transient_error, normalize_title, run_file_work, safe_error_reason
 
 if TYPE_CHECKING:
     from ..metadata_issues import ArchiveOwnership
@@ -1343,7 +1344,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             last_progress_commit = now
             await session.commit()
 
-    async def check_destination_owner(dest: Path) -> None:
+    async def check_destination_owner(dest: Path) -> ArchiveVersion | None:
         # A template that drops precision can map two chapters to one file.
         owner = await session.scalar(
             select(Chapter.number).where(
@@ -1362,14 +1363,27 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         try:
             dest_stat = dest.stat()
         except FileNotFoundError:
-            return
+            return None
         ownership = await load_archive_ownership(session)
-        others = ownership.owners.get((dest_stat.st_dev, dest_stat.st_ino), set()) - {chapter_id}
+        version = archive_version(dest_stat)
+        owners = ownership.owners.get(version[:2], set())
+        others = owners - {chapter_id}
         if others or str(dest) in ownership.unavailable:
             raise RuntimeError(
                 f"{dest.name} is mapped by another chapter or series; remap or rename "
                 "that file before downloading this chapter"
             )
+        if not owners:
+            raise FileExistsError(f"{dest.name} already exists without a chapter mapping")
+        return version
+
+    def destination_path(directory: str) -> Path:
+        return chapter_path(
+            Path(directory),
+            values["naming_template"], values["naming_template_no_volume"],
+            series.title, series.folder_name,
+            chapter.number, chapter.volume, chapter.title,
+        )
 
     staged: Path | None = None
     download_task: asyncio.Task | None = None
@@ -1377,12 +1391,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         # inside the try: a broken naming template must fail THIS download
         # (visibly, with an error) instead of crashing the queue worker and
         # leaving the row stuck in "downloading"
-        dest = chapter_path(
-            Path(root),
-            values["naming_template"], values["naming_template_no_volume"],
-            series.title, series.folder_name,
-            chapter.number, chapter.volume, chapter.title,
-        )
+        dest = destination_path(root)
         await check_destination_owner(dest)
         # A scan must not adopt the download before the worker updates its
         # mapping. Keep it on the destination filesystem for atomic install.
@@ -1418,10 +1427,13 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             # while pages were in flight. Install against the current mapping.
             await ensure_not_cancelled(force=True)
             await session.refresh(chapter)
-            await check_destination_owner(dest)
-            await _install_direct_download(
-                session, dl, series, chapter, staged, dest, check_still_wanted,
-            )
+            await session.refresh(series, ["root_folder_id", "root_folder", "folder_name", "title"])
+            if series.root_folder is None or destination_path(series.root_folder.path) != dest:
+                raise LibraryUnavailableError("the chapter destination changed while downloading")
+            expected_destination = await check_destination_owner(dest)
+            await finish_before_cancel(asyncio.create_task(_install_direct_download(
+                session, dl, series, chapter, staged, dest, check_still_wanted, expected_destination,
+            )))
     except DownloadCancelled as cancel_exc:
         await session.rollback()
         current = await session.get(Download, download_id)
@@ -1524,6 +1536,7 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
 async def _install_direct_download(
     session: AsyncSession, dl: Download, series: Series, chapter: Chapter, staged: Path, dest: Path,
     check_still_wanted: Callable[[], Awaitable[None]],
+    expected_destination: ArchiveVersion | None = None,
 ) -> None:
     from ..metadata_issues import load_archive_ownership
 
@@ -1535,20 +1548,24 @@ async def _install_direct_download(
         replaced and replaced != str(dest)
         and replaced_source in registry.DIRECT_SOURCES
     )
+    replaced_version = None
     if discard_replaced:
         # Match owners by inode, like every other ownership check: another
         # chapter can reach this archive through a symlink or another path
         # spelling, and a re-syncing series still claims its archives.
         ownership = await load_archive_ownership(session)
-        try:
-            replaced_stat = Path(replaced).stat()
-        except OSError:
-            discard_replaced = False
-        else:
-            others = ownership.owners.get((replaced_stat.st_dev, replaced_stat.st_ino), set()) - {chapter.id}
-            discard_replaced = not others and replaced not in ownership.unavailable
+        replaced_version = ownership.versions.get(replaced)
+        discard_replaced = (
+            replaced_version is not None
+            and ownership.owners.get(replaced_version[:2]) == {chapter.id}
+        )
     await check_still_wanted()
-    staged.replace(dest)
+    if expected_destination is None:
+        publish_new_file(staged, dest)
+    else:
+        if archive_version(dest.stat()) != expected_destination:
+            raise FileExistsError(f"{dest.name} changed while the download was being installed")
+        staged.replace(dest)
     chapter.downloaded = True
     chapter.file_path = str(dest)
     chapter.file_source = dl.source_name
@@ -1571,8 +1588,12 @@ async def _install_direct_download(
         ))
     await session.commit()
     if discard_replaced:
+        previous = Path(replaced)
         try:
-            Path(replaced).unlink(missing_ok=True)
+            if archive_version(previous.stat()) == replaced_version:
+                previous.unlink()
+        except FileNotFoundError:
+            pass
         except OSError as exc:
             log.warning("could not remove replaced file %s: %s", replaced, exc)
 
@@ -2205,7 +2226,6 @@ async def merge_complete_volumes(
         )
     )).scalars().all())
     from ..metadata_issues import detect_series_issues, load_archive_ownership, manual_archive_lock
-    from ..library.publish import publish_new_file
 
     merged: list[int] = []
     if not mergeable_volumes(series, series.chapters, busy):

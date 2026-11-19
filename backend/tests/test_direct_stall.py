@@ -191,6 +191,59 @@ async def test_retry_reuses_the_staging_path_a_crash_could_leave(db_session, tmp
     assert not list(first.parent.glob(".mangarr-direct-*"))
 
 
+async def test_download_preserves_an_unmapped_archive_that_appears_mid_download(db_session, tmp_path, monkeypatch):
+    from mangarr import settings_service
+
+    download = await _make_download(db_session, tmp_path)
+    chapter_id = download.chapter_id
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    defaults = settings_service.DEFAULTS
+    destination = tasks.chapter_path(
+        tmp_path, defaults["naming_template"], defaults["naming_template_no_volume"],
+        "Test Series", "Test Series", 1.0, None, "",
+    )
+
+    async def compete(source, payload, series, chapter, staged, **kwargs):
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"direct contents")
+        destination.write_bytes(b"torrent contents")
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", compete)
+    await tasks._run_direct_download(db_session, download)
+
+    assert destination.read_bytes() == b"torrent contents"
+    assert download.status == DownloadStatus.FAILED
+    assert "already exists" in download.error
+    chapter = await db_session.get(Chapter, chapter_id)
+    assert not chapter.downloaded and not chapter.file_path
+
+
+async def test_download_does_not_install_in_the_old_root_after_a_root_change(db_session, tmp_path, monkeypatch):
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    new_root = tmp_path / "new"
+    new_root.mkdir()
+    download = await _make_download(db_session, original_root)
+    chapter_id = download.chapter_id
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+
+    async def change_root(source, payload, series, chapter, staged, **kwargs):
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"download contents")
+        series.root_folder = RootFolder(path=str(new_root))
+        await db_session.commit()
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", change_root)
+    await tasks._run_direct_download(db_session, download)
+
+    assert download.status == DownloadStatus.FAILED
+    assert "destination changed" in download.error
+    assert not list(original_root.rglob("*.cbz"))
+    assert not list(original_root.rglob("*.staged"))
+    chapter = await db_session.get(Chapter, chapter_id)
+    assert not chapter.downloaded and not chapter.file_path
+
+
 async def test_download_refuses_to_replace_a_file_another_series_maps(db_session, tmp_path, monkeypatch):
     from mangarr import settings_service
 

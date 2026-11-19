@@ -33,7 +33,10 @@ from ..jobs.tasks import (
     try_acquire_series_lock,
 )
 from ..library.move import MoveError, anchor_extra_folders, move_series_folder
-from ..metadata_issues import detect_series_issues, manual_archive_lock, relocate_archive_issues
+from ..metadata_issues import (
+    ArchiveOwnership, detect_series_issues, load_archive_ownership, manual_archive_lock,
+    relocate_archive_issues,
+)
 from ..models import Chapter, Download, DownloadKind, DownloadStatus, RootFolder, Series
 from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
@@ -518,8 +521,9 @@ async def apply_title_preference(session: AsyncSession = Depends(get_session)):
         await session.commit()
     # Series recommendations compare against the title; refresh them per
     # series in lock order (series lock, then archive lock).
+    ownership = await load_archive_ownership(session) if retitled else None
     for series_id in retitled:
-        await _refresh_issues_when_free(session, series_id)
+        await _refresh_issues_when_free(session, series_id, ownership)
     return ApplyTitlePreferenceOut(count=len(retitled), updated=len(retitled))
 
 
@@ -548,12 +552,14 @@ async def update_series(
 _issue_refreshes: set[asyncio.Task] = set()
 
 
-async def _refresh_issues_when_free(session: AsyncSession, series_id: int) -> None:
+async def _refresh_issues_when_free(
+    session: AsyncSession, series_id: int, ownership: ArchiveOwnership | None = None,
+) -> None:
     """Refresh warnings now if the series is idle, else once its holder finishes."""
     lock = series_lock(series_id)
     if not (lock.locked() or getattr(lock, "_waiters", None)):
         async with lock, manual_archive_lock:
-            await _refresh_issues(session, series_id)
+            await _refresh_issues(session, series_id, ownership)
         return
 
     async def later() -> None:
@@ -568,11 +574,13 @@ async def _refresh_issues_when_free(session: AsyncSession, series_id: int) -> No
     task.add_done_callback(_issue_refreshes.discard)
 
 
-async def _refresh_issues(session: AsyncSession, series_id: int) -> None:
+async def _refresh_issues(
+    session: AsyncSession, series_id: int, ownership: ArchiveOwnership | None = None,
+) -> None:
     """Recompute warnings after a title or layout change, under both locks."""
     series = await session.get(Series, series_id, populate_existing=True)
     if series is not None and not series.deletion_pending:
-        await detect_series_issues(session, series)
+        await detect_series_issues(session, series, ownership)
         await session.commit()
 
 

@@ -4,7 +4,7 @@ import pytest
 
 from mangarr.api import issues as issues_api, library as library_api
 from mangarr.jobs import tasks
-from mangarr.models import Chapter, SeriesFolder
+from mangarr.models import Chapter, Series, SeriesFolder
 from mangarr.schemas import FileMapIn, FileMapRangeIn, SeriesFolderUpdateIn
 from tests.test_metadata_issues import archive, repair_db  # noqa: F401
 
@@ -109,6 +109,28 @@ async def test_title_preference_refreshes_series_recommendations(repair_db, monk
     assert result.updated == 1
     [series_warning] = [w for w in await _warnings(session, series.id) if w.field == "series"]
     assert series_warning.suggested_value == "Preferred Title"
+
+
+async def test_bulk_title_preference_indexes_archive_ownership_once(repair_db, monkeypatch):
+    from mangarr import metadata_issues
+    from mangarr.api import series as series_api
+
+    session, _, series, _ = repair_db
+    session.add(Series(title="Another series", root_folder_id=series.root_folder_id))
+    await session.commit()
+    monkeypatch.setattr(series_api, "_apply_title_preference", lambda *_: True)
+    load = metadata_issues.load_archive_ownership
+    calls = []
+
+    async def count(session):
+        calls.append(1)
+        return await load(session)
+
+    monkeypatch.setattr(metadata_issues, "load_archive_ownership", count)
+    monkeypatch.setattr(series_api, "load_archive_ownership", count)
+    result = await series_api.apply_title_preference(session)
+    assert result.updated == 2
+    assert len(calls) == 1
 
 
 async def test_chapter_volume_edit_refreshes_volume_recommendations(repair_db):
