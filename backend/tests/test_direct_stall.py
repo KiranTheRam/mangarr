@@ -165,3 +165,27 @@ async def test_disabled_source_is_rejected_before_network(db_session, tmp_path, 
     download.assert_not_awaited()
     assert dl.status == DownloadStatus.FAILED
     assert "disabled" in dl.error
+
+
+async def test_retry_reuses_the_staging_path_a_crash_could_leave(db_session, tmp_path, monkeypatch):
+    dl = await _make_download(db_session, tmp_path)
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    staged_paths = []
+
+    async def failing_download(source, payload, series, chapter, dest,
+                               progress_cb=None, cancel_cb=None, web_url="", optimization=None):
+        staged_paths.append(dest)
+        raise RuntimeError("source went away")
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", failing_download)
+    for _ in range(2):
+        await tasks._run_direct_download(db_session, dl)
+        await db_session.refresh(dl)
+        assert dl.status == DownloadStatus.FAILED
+        dl.status = DownloadStatus.QUEUED
+        await db_session.commit()
+
+    first, second = staged_paths
+    assert first == second
+    assert first.name == f".mangarr-direct-{dl.id}.staged"
+    assert not list(first.parent.glob(".mangarr-direct-*"))

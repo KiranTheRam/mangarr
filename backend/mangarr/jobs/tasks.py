@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
 
 from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1369,7 +1368,8 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         await check_destination_owner(dest)
         # A scan must not adopt the download before the worker updates its
         # mapping. Keep it on the destination filesystem for atomic install.
-        staged = dest.with_name(f".mangarr-direct-{uuid4().hex}.staged")
+        # Name it for the download so a retry overwrites what a crash left.
+        staged = dest.with_name(f".mangarr-direct-{download_id}.staged")
         download_task = asyncio.create_task(download_chapter_to_cbz(
             source, dl.payload, series, chapter, staged,
             progress_cb=on_progress,
