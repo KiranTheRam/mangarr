@@ -2139,6 +2139,20 @@ async def grab_missing_chapters(
     return queued
 
 
+def _owned_only_by(chapters: list[Chapter], ownership) -> bool:
+    """Whether no chapter outside `chapters` maps any of their archives."""
+    ids = {chapter.id for chapter in chapters}
+    for chapter in chapters:
+        try:
+            file_stat = Path(chapter.file_path).stat()
+        except OSError:
+            return False
+        owners = ownership.owners.get((file_stat.st_dev, file_stat.st_ino), set())
+        if chapter.file_path in ownership.unavailable or owners - ids:
+            return False
+    return True
+
+
 async def merge_complete_volumes(
     session: AsyncSession, series: Series, values: dict[str, str], force: bool = False,
 ) -> list[int]:
@@ -2161,51 +2175,62 @@ async def merge_complete_volumes(
             ]),
         )
     )).scalars().all())
-    merged: list[int] = []
-    for volume, members in mergeable_volumes(series, series.chapters, busy).items():
-        dest = folders[0] / volume_filename(series_folder(series.title), volume)
-        localized_series = (
-            series.provider_title
-            if series.provider_title and series.title != series.provider_title
-            else None
-        )
-        try:
-            await asyncio.to_thread(
-                merge_chapter_archives,
-                [(c.number, Path(c.file_path)) for c in members],
-                dest, series.title, volume,
-                series.description if volume == 1 else "",
-                localized_series=localized_series,
-            )
-        except Exception as exc:
-            log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
-            continue
-        old_paths = [c.file_path for c in members]
-        for chapter in members:
-            chapter.file_path = str(dest)
-            chapter.file_source = MERGED_FILE_SOURCE
-        session.add(HistoryEvent(
-            series_id=series.id, event="merged",
-            detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
-        ))
-        await session.commit()
-        for old in old_paths:
-            if old == str(dest):
-                continue
-            try:
-                Path(old).unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("could not remove merged chapter file %s: %s", old, exc)
-        merged.append(volume)
-    if merged:
-        from ..metadata_issues import detect_series_issues, manual_archive_lock
+    from ..metadata_issues import detect_series_issues, load_archive_ownership, manual_archive_lock
 
-        log.info("Merged volume(s) %s of %r", merged, series.title)
-        # The chapter archives are gone; drop their warnings now rather than
-        # listing repairs for missing files until the next scan.
-        async with manual_archive_lock:
+    merged: list[int] = []
+    if not mergeable_volumes(series, series.chapters, busy):
+        return merged
+    # Another series can map the same chapter archive. Hold the archive lock
+    # from this ownership check until the old files are gone and warnings are
+    # reconciled, so a cross-series repair or mapping cannot interleave.
+    async with manual_archive_lock:
+        ownership = await load_archive_ownership(session)
+        for volume, members in mergeable_volumes(series, series.chapters, busy).items():
+            if not _owned_only_by(members, ownership):
+                log.info("merge of %r volume %d skipped: a chapter file is shared or unavailable",
+                         series.title, volume)
+                continue
+            dest = folders[0] / volume_filename(series_folder(series.title), volume)
+            localized_series = (
+                series.provider_title
+                if series.provider_title and series.title != series.provider_title
+                else None
+            )
+            try:
+                await asyncio.to_thread(
+                    merge_chapter_archives,
+                    [(c.number, Path(c.file_path)) for c in members],
+                    dest, series.title, volume,
+                    series.description if volume == 1 else "",
+                    localized_series=localized_series,
+                )
+            except Exception as exc:
+                log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
+                continue
+            old_paths = [c.file_path for c in members]
+            for chapter in members:
+                chapter.file_path = str(dest)
+                chapter.file_source = MERGED_FILE_SOURCE
+            session.add(HistoryEvent(
+                series_id=series.id, event="merged",
+                detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
+            ))
+            await session.commit()
+            for old in old_paths:
+                if old == str(dest):
+                    continue
+                try:
+                    Path(old).unlink(missing_ok=True)
+                except OSError as exc:
+                    log.warning("could not remove merged chapter file %s: %s", old, exc)
+            merged.append(volume)
+        if merged:
+            log.info("Merged volume(s) %s of %r", merged, series.title)
+            # The chapter archives are gone; drop their warnings now rather than
+            # listing repairs for missing files until the next scan.
             await detect_series_issues(session, series)
             await session.commit()
+    if merged:
         _notify_kavita(values, series)
     return merged
 

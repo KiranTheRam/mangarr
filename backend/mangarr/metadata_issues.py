@@ -337,12 +337,27 @@ def find_candidates(
     # catches imported one-off bonus chapters without pretending disk-inferred
     # assignments are authoritative enough to validate the bad tag.
     by_volume: dict[int, list[tuple[Chapter, Path, ComicInfoMetadata]]] = {}
+    # A sibling whose tags are unknown (skipped as ineligible, shared, or
+    # unreadable) or whose identity is disputed may also declare the volume,
+    # so no archive in that volume can be shown to be the only tagged file.
+    inspected = {chapter.id for chapter, *_ in files}
+    uncertain_volumes = {
+        chapter.volume for chapter in series.chapters
+        if chapter.volume is not None and not chapter.excluded and chapter.downloaded
+        and chapter.file_path and chapter.id not in inspected
+    }
     for chapter, path, info, offset, mapping_conflict in files:
         # Siblings in differently numbered editions do not establish whether
         # a volume tag is isolated in the archive's physical edition.
-        if not mapping_conflict and chapter.volume is not None and offset == 0:
-            by_volume.setdefault(chapter.volume, []).append((chapter, path, info))
+        if chapter.volume is None or (offset is not None and offset != 0):
+            continue
+        if mapping_conflict or offset is None:
+            uncertain_volumes.add(chapter.volume)
+            continue
+        by_volume.setdefault(chapter.volume, []).append((chapter, path, info))
     for volume, peers in by_volume.items():
+        if volume in uncertain_volumes:
+            continue
         declared = [item for item in peers if item[2].volume is not None]
         if len(peers) < 2 or len(declared) != 1:
             continue

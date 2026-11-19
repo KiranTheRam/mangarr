@@ -363,8 +363,10 @@ def find_series_media_files(
                 resolved_media = media.path.resolve(strict=True)
             except (OSError, RuntimeError):
                 continue
-            if resolved_media.is_relative_to(resolved_folder):
-                found.setdefault(str(resolved_media), media)
+            # A symlink may point outside the folder (a seeding or shared copy).
+            # Adopt it; ComicInfo editing separately refuses files outside the
+            # series folders, and aliases resolve to one key and one owner set.
+            found.setdefault(str(resolved_media), media)
     return list(found.values())
 
 
