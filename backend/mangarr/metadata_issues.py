@@ -33,6 +33,18 @@ from .util import normalize_title
 # series lock and hold it from ownership validation through archive replacement.
 manual_archive_lock = asyncio.Lock()
 
+# A series whose chapter rows are being rebuilt keeps claiming its archives,
+# so another series never treats a shared archive as its own in the meantime.
+_reserved_owners: dict[int, tuple[str, ...]] = {}
+
+
+def reserve_archive_owners(series_id: int, paths: list[str]) -> None:
+    _reserved_owners[series_id] = tuple(path for path in paths if path)
+
+
+def release_archive_owners(series_id: int) -> None:
+    _reserved_owners.pop(series_id, None)
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -101,7 +113,12 @@ class ArchiveOwnership:
 
 async def chapter_paths(session: AsyncSession) -> list[tuple[int, str]]:
     rows = await session.execute(select(Chapter.id, Chapter.file_path).where(Chapter.file_path != ""))
-    return [(chapter_id, path) for chapter_id, path in rows]
+    paths = [(chapter_id, path) for chapter_id, path in rows]
+    # Negative ids never match a chapter, so reserved archives read as shared.
+    paths.extend(
+        (-series_id, path) for series_id, reserved in _reserved_owners.items() for path in reserved
+    )
+    return paths
 
 
 async def load_archive_ownership(session: AsyncSession) -> ArchiveOwnership:

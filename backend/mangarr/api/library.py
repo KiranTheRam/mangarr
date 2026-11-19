@@ -23,7 +23,10 @@ from ..library.scanner import (
     unavailable_extra_folders,
 )
 from ..jobs.tasks import series_lock
-from ..metadata_issues import detect_series_issues, manual_archive_lock, relocate_archive_issues
+from ..metadata_issues import (
+    detect_series_issues, manual_archive_lock, release_archive_owners, relocate_archive_issues,
+    reserve_archive_owners,
+)
 from ..models import Chapter, LibraryIssue, RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     CleanupApplyIn,
@@ -541,7 +544,6 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     from ..models import Download, DownloadStatus, HistoryEvent
 
     lock = await acquire_series_lock(series_id)
-    archive_guard = None
     try:
         active = [DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING]
         series = await _load(session, series_id)
@@ -576,11 +578,10 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
         }
         values = await registry.apply_settings(session)
         # Deleting the chapter rows hides this series' mappings from every
-        # ownership snapshot until the rescan restores them. Hold the archive
-        # lock across that window so another series cannot treat a shared
-        # archive as its own and rewrite it.
-        archive_guard = manual_archive_lock
-        await archive_guard.acquire()
+        # ownership snapshot until the rescan restores them. Keep claiming the
+        # archives meanwhile, without holding the global archive lock through
+        # the network fetch, so another series cannot rewrite a shared one.
+        reserve_archive_owners(series_id, [ch.file_path for ch in series.chapters])
         await session.execute(sa_delete(Download).where(
             Download.series_id == series_id,
             or_(Download.chapter_id.isnot(None), Download.status.notin_(active)),
@@ -597,42 +598,44 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
 
         series = await _load(session, series_id)
         await update_chapters(session, series, values)
-        # a locked chapter no source re-lists (e.g. a manually mapped extra)
-        # must survive the rebuild — recreate it rather than dropping the
-        # very metadata the lock promised to keep
-        present = {ch.number for ch in series.chapters}
-        for number, saved in preserved_metadata.items():
-            if number not in present:
-                series.chapters.append(
-                    Chapter(number=number, monitored=saved[7], excluded=saved[6])
-                )
-        for ch in series.chapters:
-            saved = preserved_metadata.get(ch.number)
-            if saved is None:
-                continue
-            (
-                title, volume, title_source, volume_source,
-                title_locked, volume_locked, excluded, monitored,
-                downloaded, file_path, released_at, available_sources,
-            ) = saved
-            if excluded:
-                ch.title, ch.volume = title, volume
-                ch.title_source, ch.volume_source = title_source, volume_source
-                ch.title_locked, ch.volume_locked = title_locked, volume_locked
-                ch.excluded, ch.monitored = True, monitored
-                ch.downloaded, ch.file_path = downloaded, file_path
-                ch.released_at, ch.available_sources = released_at, available_sources
-                continue
-            if title_locked:
-                ch.title, ch.title_source, ch.title_locked = title, title_source, True
-            if volume_locked:
-                ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
-        await session.commit()
-        scan = await _scan_now(session, series)
-        return ResyncOut(chapters=len(_active_chapters(series)), matched_chapters=scan)
+        async with manual_archive_lock:
+            # The archive lock now covers the rows until the rescan commits.
+            release_archive_owners(series_id)
+            # a locked chapter no source re-lists (e.g. a manually mapped extra)
+            # must survive the rebuild — recreate it rather than dropping the
+            # very metadata the lock promised to keep
+            present = {ch.number for ch in series.chapters}
+            for number, saved in preserved_metadata.items():
+                if number not in present:
+                    series.chapters.append(
+                        Chapter(number=number, monitored=saved[7], excluded=saved[6])
+                    )
+            for ch in series.chapters:
+                saved = preserved_metadata.get(ch.number)
+                if saved is None:
+                    continue
+                (
+                    title, volume, title_source, volume_source,
+                    title_locked, volume_locked, excluded, monitored,
+                    downloaded, file_path, released_at, available_sources,
+                ) = saved
+                if excluded:
+                    ch.title, ch.volume = title, volume
+                    ch.title_source, ch.volume_source = title_source, volume_source
+                    ch.title_locked, ch.volume_locked = title_locked, volume_locked
+                    ch.excluded, ch.monitored = True, monitored
+                    ch.downloaded, ch.file_path = downloaded, file_path
+                    ch.released_at, ch.available_sources = released_at, available_sources
+                    continue
+                if title_locked:
+                    ch.title, ch.title_source, ch.title_locked = title, title_source, True
+                if volume_locked:
+                    ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
+            await session.commit()
+            scan = await _scan_now(session, series)
+            return ResyncOut(chapters=len(_active_chapters(series)), matched_chapters=scan)
     finally:
-        if archive_guard is not None:
-            archive_guard.release()
+        release_archive_owners(series_id)
         lock.release()
 
 

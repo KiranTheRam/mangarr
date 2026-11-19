@@ -50,7 +50,7 @@ def test_isolated_volume_requires_every_sibling_to_be_known(tmp_path, sibling):
     assert [item.chapter_id for item in isolated] == ([1] if sibling == "untagged" else [])
 
 
-async def test_resync_holds_shared_archives_until_mappings_return(repair_db, monkeypatch):
+async def test_resync_keeps_shared_archives_claimed_without_stalling_others(repair_db, monkeypatch):
     session, maker, series, path = repair_db
     other = Series(
         title="Other", folder_name=series.folder_name, root_folder=series.root_folder,
@@ -83,13 +83,14 @@ async def test_resync_holds_shared_archives_until_mappings_return(repair_db, mon
     async with asyncio.timeout(10):
         resyncing = asyncio.create_task(resync())
         await rebuilding.wait()
-        repairing = asyncio.create_task(scan_and_repair())
         try:
-            done, _ = await asyncio.wait({repairing}, timeout=0.05)
-            assert not done, "another series scanned the archive while its co-owner was rebuilding"
+            # The other series is not stalled behind the source fetch, but it
+            # still sees the archive as shared and leaves it alone.
+            await scan_and_repair()
+            assert await issues_api.list_issues(ignored=False, series_id=series.id, session=session) == []
         finally:
             release.set()
-            await asyncio.gather(resyncing, repairing)
+            await resyncing
 
     assert read_comicinfo(path).volume == "9"
 
@@ -128,3 +129,75 @@ async def test_volume_merge_skips_a_volume_another_series_maps(repair_db):
 
     assert await tasks.merge_complete_volumes(session, series, {}, force=True) == []
     assert path.exists() and second.exists()
+
+
+async def test_cancelled_resync_releases_its_claims_and_no_foreign_lock(repair_db, monkeypatch):
+    session, maker, series, path = repair_db
+    rebuilding = asyncio.Event()
+
+    async def rebuild(*_args):
+        rebuilding.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(tasks, "update_chapters", rebuild)
+    archive_lock = library_api.manual_archive_lock
+    await archive_lock.acquire()  # another operation is mid-write
+
+    async def resync():
+        async with maker() as db:
+            await library_api.resync_chapters(series.id, db)
+
+    async with asyncio.timeout(10):
+        task = asyncio.create_task(resync())
+        await rebuilding.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert archive_lock.locked(), "the cancelled resync released a lock it did not hold"
+    archive_lock.release()
+    from mangarr import metadata_issues
+    assert metadata_issues._reserved_owners == {}
+
+
+@pytest.mark.parametrize("shared_while_packing", [False, True])
+async def test_volume_merge_packs_outside_the_archive_lock(repair_db, monkeypatch, shared_while_packing):
+    from mangarr import metadata_issues
+
+    session, _, series, path = repair_db
+    second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
+    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
+    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
+    for number, volume, file_path in ((2, 1, second), (3, 2, later)):
+        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(file_path)))
+    for chapter in series.chapters:
+        chapter.file_source = "alpha"
+    await session.commit()
+    await session.refresh(series, ["extra_folders"])
+    pack = tasks.merge_chapter_archives
+    lock_held_while_packing = []
+
+    def packing(*args, **kwargs):
+        lock_held_while_packing.append(metadata_issues.manual_archive_lock.locked())
+        return pack(*args, **kwargs)
+
+    monkeypatch.setattr(tasks, "merge_chapter_archives", packing)
+    load = metadata_issues.load_archive_ownership
+    calls = []
+
+    async def ownership(db):
+        current = await load(db)
+        calls.append(current)
+        if shared_while_packing and len(calls) == 2:
+            current.owners[(second.stat().st_dev, second.stat().st_ino)].add(999)  # mapped by another series
+        return current
+
+    monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
+    merged = await tasks.merge_complete_volumes(session, series, {}, force=True)
+
+    assert lock_held_while_packing == [False]
+    dest = path.with_name("Tracked - Vol. 01.cbz")
+    if shared_while_packing:
+        assert merged == [] and path.exists() and second.exists() and not dest.exists()
+        assert {c.file_path for c in series.chapters if c.number in (1, 2)} == {str(path), str(second)}
+    else:
+        assert merged == [1] and dest.exists() and not path.exists()

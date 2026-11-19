@@ -133,6 +133,18 @@ class _ArchiveCache:
             return default
         key = str(path)
         try:
+            # A hit only needs a stat, which matters on network mounts. A miss
+            # reads through the descriptor whose fstat forms the cached version.
+            current = path.stat()
+        except OSError:
+            return default
+        if stat.S_ISREG(current.st_mode):
+            with self._lock:
+                cached = self._items.get(key)
+                if cached is not None and cached[0] == archive_version(current):
+                    self._items.move_to_end(key)
+                    return cached[1]
+        try:
             # O_NONBLOCK keeps a FIFO with an archive suffix from hanging a scan.
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError:

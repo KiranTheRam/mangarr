@@ -2180,32 +2180,37 @@ async def merge_complete_volumes(
     merged: list[int] = []
     if not mergeable_volumes(series, series.chapters, busy):
         return merged
-    # Another series can map the same chapter archive. Hold the archive lock
-    # from this ownership check until the old files are gone and warnings are
-    # reconciled, so a cross-series repair or mapping cannot interleave.
-    async with manual_archive_lock:
-        ownership = await load_archive_ownership(session)
-        for volume, members in mergeable_volumes(series, series.chapters, busy).items():
-            if not _owned_only_by(members, ownership):
-                log.info("merge of %r volume %d skipped: a chapter file is shared or unavailable",
-                         series.title, volume)
-                continue
-            dest = folders[0] / volume_filename(series_folder(series.title), volume)
-            localized_series = (
-                series.provider_title
-                if series.provider_title and series.title != series.provider_title
-                else None
+    # Another series can map the same chapter archive. Packing can take a
+    # long time, so it runs outside the global archive lock; ownership is
+    # checked again under the lock before the merge is published.
+    snapshot = await load_archive_ownership(session)
+    for volume, members in mergeable_volumes(series, series.chapters, busy).items():
+        if not _owned_only_by(members, snapshot):
+            log.info("merge of %r volume %d skipped: a chapter file is shared or unavailable",
+                     series.title, volume)
+            continue
+        dest = folders[0] / volume_filename(series_folder(series.title), volume)
+        localized_series = (
+            series.provider_title
+            if series.provider_title and series.title != series.provider_title
+            else None
+        )
+        try:
+            await asyncio.to_thread(
+                merge_chapter_archives,
+                [(c.number, Path(c.file_path)) for c in members],
+                dest, series.title, volume,
+                series.description if volume == 1 else "",
+                localized_series=localized_series,
             )
-            try:
-                await asyncio.to_thread(
-                    merge_chapter_archives,
-                    [(c.number, Path(c.file_path)) for c in members],
-                    dest, series.title, volume,
-                    series.description if volume == 1 else "",
-                    localized_series=localized_series,
-                )
-            except Exception as exc:
-                log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
+        except Exception as exc:
+            log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
+            continue
+        async with manual_archive_lock:
+            if not _owned_only_by(members, await load_archive_ownership(session)):
+                log.info("merge of %r volume %d discarded: a chapter file became shared",
+                         series.title, volume)
+                dest.unlink(missing_ok=True)
                 continue
             old_paths = [c.file_path for c in members]
             for chapter in members:
@@ -2223,11 +2228,12 @@ async def merge_complete_volumes(
                     Path(old).unlink(missing_ok=True)
                 except OSError as exc:
                     log.warning("could not remove merged chapter file %s: %s", old, exc)
-            merged.append(volume)
-        if merged:
-            log.info("Merged volume(s) %s of %r", merged, series.title)
-            # The chapter archives are gone; drop their warnings now rather than
-            # listing repairs for missing files until the next scan.
+        merged.append(volume)
+    if merged:
+        log.info("Merged volume(s) %s of %r", merged, series.title)
+        # The chapter archives are gone; drop their warnings now rather than
+        # listing repairs for missing files until the next scan.
+        async with manual_archive_lock:
             await detect_series_issues(session, series)
             await session.commit()
     if merged:
