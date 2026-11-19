@@ -29,7 +29,7 @@ async def _series_row(maker, series_id):
 
 
 async def _finish_deletions():
-    await asyncio.gather(*list(series_api._deletions))
+    await asyncio.gather(*list(series_api._deletions.values()))
 
 
 @pytest.mark.parametrize("bulk", [False, True])
@@ -77,7 +77,7 @@ async def test_delete_returns_at_once_and_waits_for_an_in_flight_write(repair_db
 
     assert read_comicinfo(path).volume == "1"
     assert await _series_row(maker, series.id) is None
-    assert series.id not in series_api.DELETING
+    assert series.id not in series_api._deletions
 
 
 async def test_repair_requested_after_a_deferred_delete_does_not_touch_the_archive(repair_db):
@@ -119,3 +119,26 @@ async def test_repair_requested_after_a_deferred_delete_does_not_touch_the_archi
     assert await _series_row(maker, series.id) is None
     async with maker() as check:
         assert (await check.scalars(select(Chapter))).all() == []
+
+
+async def test_deferred_delete_is_recovered_after_its_task_is_cancelled(repair_db):
+    _, maker, series, path = repair_db
+    series_id = series.id
+    async with series_api.series_lock(series_id):
+        await _delete(maker, series_id, False)
+        task = series_api._deletions[series_id]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async with maker() as check:
+        saved = await check.get(Series, series_id)
+        assert saved is not None and saved.deletion_pending
+        with pytest.raises(HTTPException) as hidden:
+            await series_api.get_series(series_id, check)
+        assert hidden.value.status_code == 404
+
+    await series_api.resume_pending_deletions()
+    await _finish_deletions()
+    assert await _series_row(maker, series_id) is None
+    assert path.exists()

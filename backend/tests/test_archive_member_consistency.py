@@ -78,3 +78,18 @@ def test_hidden_and_nas_members_are_not_pages_but_survive_metadata_edits(tmp_pat
     assert merge_chapter_archives([(1, path)], merged, "Tracked", 1) == 1
     with ZipFile(merged) as archive:
         assert archive.read("0001-0001.jpg") == page
+
+
+def test_relative_page_names_survive_a_volume_merge_in_reading_order(tmp_path):
+    path = tmp_path / "Tracked Ch. 1.cbz"
+    with ZipFile(path, "w") as archive:
+        archive.writestr("./002.jpg", b"second")
+        archive.writestr("001.jpg", b"first")
+        archive.writestr("./.thumb.jpg", b"thumbnail")
+
+    assert read_comicinfo(path).actual_page_count == 2
+    merged = tmp_path / "Volume 1.cbz"
+    assert merge_chapter_archives([(1, path)], merged, "Tracked", 1) == 2
+    with ZipFile(merged) as archive:
+        assert archive.read("0001-0001.jpg") == b"first"
+        assert archive.read("0001-0002.jpg") == b"second"

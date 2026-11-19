@@ -25,6 +25,7 @@ from .matcher import (
     match_files,
 )
 from .naming import chapter_filename, series_folder, volume_filename
+from .publish import publish_new_file
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def _atomic_destination(dest: Path, keep_mode: bool = False):
         yield temporary
         if not keep_mode:
             temporary.chmod(NEW_FILE_MODE)
-        temporary.replace(dest)
+        publish_new_file(temporary, dest)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -100,7 +101,7 @@ def place_file(src: Path, dest: Path, mode: str, *, revision: ArchiveRevision | 
                 _require_archive_revision(src, revision)
             log.info("Hardlinked %s -> %s", src.name, dest)
             return
-        except FileNotFoundError:
+        except (FileNotFoundError, FileExistsError):
             raise
         except OSError as exc:
             log.warning("hardlink %s -> %s failed (%s); copying instead",

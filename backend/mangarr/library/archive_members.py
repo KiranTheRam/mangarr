@@ -49,11 +49,10 @@ def archive_files(entries: Iterable[ZipInfo]) -> Iterator[ArchiveFile]:
 
 
 def archive_pages(files: Iterable[ArchiveFile]) -> Iterator[ArchiveFile]:
-    # Readers skip dot-prefixed ZIP names when counting pages. Use the raw
-    # name because PurePosixPath removes a leading "./".
+    # Normalize relative prefixes before checking for genuinely hidden pages.
     return (
         (entry, path) for entry, path in files
-        if not entry.filename.startswith(".") and path.suffix.lower() in IMAGE_EXTS
+        if path.suffix.lower() in IMAGE_EXTS and not path.parts[0].startswith(".")
     )
 
 

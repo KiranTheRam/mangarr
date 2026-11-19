@@ -74,7 +74,7 @@ async def _load(session: AsyncSession, series_id: int) -> Series:
             selectinload(Series.root_folder),
             selectinload(Series.extra_folders),
         )
-        .where(Series.id == series_id)
+        .where(Series.id == series_id, Series.deletion_pending.is_(False))
     )
     series = result.scalar_one_or_none()
     if series is None:

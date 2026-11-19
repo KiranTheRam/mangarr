@@ -81,6 +81,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("series", "title_romaji", "VARCHAR NOT NULL DEFAULT ''", None),
     ("series", "title_native", "VARCHAR NOT NULL DEFAULT ''", None),
     ("series", "title_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("series", "deletion_pending", "BOOLEAN NOT NULL DEFAULT 0", None),
     ("library_issues", "public_id", "VARCHAR NOT NULL DEFAULT ''", "ux_library_issues_public_id"),
     ("library_issues", "revision", "VARCHAR NOT NULL DEFAULT ''", None),
 ]

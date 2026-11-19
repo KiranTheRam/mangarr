@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
@@ -74,6 +75,7 @@ class Series(Base):
     total_chapters: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_volumes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     monitored: Mapped[bool] = mapped_column(Boolean, default=True)
+    deletion_pending: Mapped[bool] = mapped_column(Boolean, server_default=false())
     root_folder_id: Mapped[int | None] = mapped_column(ForeignKey("root_folders.id"), nullable=True)
     folder_name: Mapped[str] = mapped_column(String, default="")
     # the folder was chosen explicitly by the user — scans must not re-adopt

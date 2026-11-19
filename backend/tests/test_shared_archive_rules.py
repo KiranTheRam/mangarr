@@ -445,3 +445,45 @@ async def test_failed_merge_commit_removes_the_published_volume(repair_db, monke
     assert not dest.exists() and not staged.exists()
     assert path.exists() and second.exists()
 
+
+async def test_merge_cancelled_during_sqlite_commit_keeps_the_mapped_volume(repair_db, monkeypatch):
+    from threading import Event
+
+    session, series, first, second, dest, staged = await _merge_setup(repair_db)
+    _, maker, _, _ = repair_db
+    connection = await session.connection()
+    sqlite = (await connection.get_raw_connection()).driver_connection
+    execute = sqlite._execute
+    loop = asyncio.get_running_loop()
+    committed, release = asyncio.Event(), Event()
+
+    async def pause_commit_result(fn, *args, **kwargs):
+        if fn != sqlite._conn.commit:
+            return await execute(fn, *args, **kwargs)
+
+        def commit():
+            fn(*args, **kwargs)
+            loop.call_soon_threadsafe(committed.set)
+            assert release.wait(10)
+
+        return await execute(commit)
+
+    monkeypatch.setattr(sqlite, "_execute", pause_commit_result)
+    merge = asyncio.create_task(tasks.merge_complete_volumes(session, series, {}, force=True))
+    try:
+        await asyncio.wait_for(committed.wait(), 10)
+        merge.cancel()
+        await asyncio.sleep(0)
+        assert not merge.done()
+        assert dest.exists() and first.exists() and second.exists()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await merge
+
+    from sqlalchemy import select
+
+    async with maker() as fresh:
+        paths = (await fresh.scalars(select(Chapter.file_path).where(Chapter.number.in_([1, 2])))).all()
+        assert paths == [str(dest), str(dest)]
+    assert dest.exists() and not staged.exists()

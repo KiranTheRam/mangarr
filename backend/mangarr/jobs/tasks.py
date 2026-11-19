@@ -3,7 +3,6 @@ processing, qBittorrent sync, and the monitor loop."""
 
 import asyncio
 import logging
-import os
 import re
 import time
 from collections import defaultdict
@@ -916,7 +915,7 @@ async def refresh_series_full(
 async def scan_all_series() -> None:
     """Scan every series' folder to adopt on-disk files (background job)."""
     async with session_scope() as session:
-        series_ids = [row[0] for row in (await session.execute(select(Series.id))).all()]
+        series_ids = (await session.scalars(select(Series.id).where(Series.deletion_pending.is_(False)))).all()
     scanned_ids = []
     for series_id in series_ids:
         async with series_lock(series_id), session_scope() as session:
@@ -980,7 +979,7 @@ async def _load_series(session: AsyncSession, series_id: int) -> Series | None:
         select(Series)
         .options(selectinload(Series.chapters), selectinload(Series.source_links),
                  selectinload(Series.root_folder), selectinload(Series.extra_folders))
-        .where(Series.id == series_id)
+        .where(Series.id == series_id, Series.deletion_pending.is_(False))
     )
     return result.scalar_one_or_none()
 
@@ -2164,21 +2163,6 @@ async def grab_missing_chapters(
     return queued
 
 
-def _publish_without_replacing(staged: Path, dest: Path) -> bool:
-    """Give the staged archive its final name unless something already has it."""
-    try:
-        os.link(staged, dest)
-    except FileExistsError:
-        return False
-    except OSError:
-        # Some network filesystems refuse hard links. The archive lock keeps
-        # Mangarr from creating dest in between; only an outside writer could.
-        if dest.exists():
-            return False
-        staged.replace(dest)
-    return True
-
-
 def _owned_only_by(chapters: list[Chapter], ownership, *extra: Path) -> bool:
     """Whether no chapter outside `chapters` maps any of their archives (or `extra`)."""
     ids = {chapter.id for chapter in chapters}
@@ -2220,6 +2204,7 @@ async def merge_complete_volumes(
         )
     )).scalars().all())
     from ..metadata_issues import detect_series_issues, load_archive_ownership, manual_archive_lock
+    from ..library.publish import publish_new_file
 
     merged: list[int] = []
     if not mergeable_volumes(series, series.chapters, busy):
@@ -2263,11 +2248,14 @@ async def merge_complete_volumes(
                     log.info("merge of %r volume %d discarded: a chapter file became shared",
                              series.title, volume)
                     continue
-                if not _publish_without_replacing(staged, dest):
+                try:
+                    publish_new_file(staged, dest)
+                except FileExistsError:
                     log.warning("merge of %r volume %d discarded: %s appeared meanwhile",
                                 series.title, volume, dest)
                     continue
                 old_paths = [c.file_path for c in members]
+                cancelled = None
                 try:
                     for chapter in members:
                         chapter.file_path = str(dest)
@@ -2276,11 +2264,19 @@ async def merge_complete_volumes(
                         series_id=series.id, event="merged",
                         detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
                     ))
-                    await session.commit()
-                except BaseException:
-                    # Nothing maps the new file yet, and no scan can adopt it
-                    # while this lock is held.
+                    # SQLite can finish a commit after the caller is cancelled.
+                    # Hold the lock until the commit outcome is known.
+                    commit = asyncio.create_task(session.commit())
+                    while not commit.done():
+                        try:
+                            await asyncio.shield(commit)
+                        except asyncio.CancelledError as exc:
+                            cancelled = exc
+                    commit.result()
+                except Exception:
                     dest.unlink(missing_ok=True)
+                    if cancelled is not None:
+                        raise cancelled
                     raise
                 for old in old_paths:
                     if old == str(dest):
@@ -2289,6 +2285,8 @@ async def merge_complete_volumes(
                         Path(old).unlink(missing_ok=True)
                     except OSError as exc:
                         log.warning("could not remove merged chapter file %s: %s", old, exc)
+                if cancelled is not None:
+                    raise cancelled
         finally:
             staged.unlink(missing_ok=True)
         merged.append(volume)
@@ -2347,7 +2345,9 @@ def _finished_series_policy(values: dict[str, str]) -> tuple[str, int]:
 async def monitor_all() -> None:
     """Refresh monitored series and grab missing monitored chapters."""
     async with session_scope() as session:
-        result = await session.execute(select(Series.id).where(Series.monitored == True))  # noqa: E712
+        result = await session.execute(select(Series.id).where(
+            Series.monitored.is_(True), Series.deletion_pending.is_(False),
+        ))
         series_ids = [row[0] for row in result.all()]
 
     scanned_ids = []

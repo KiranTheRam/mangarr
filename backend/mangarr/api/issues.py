@@ -42,7 +42,7 @@ async def _series(session: AsyncSession, series_id: int) -> Series | None:
             selectinload(Series.root_folder),
             selectinload(Series.extra_folders),
         )
-        .where(Series.id == series_id)
+        .where(Series.id == series_id, Series.deletion_pending.is_(False))
     )).scalar_one_or_none()
 
 
@@ -201,7 +201,7 @@ async def list_issues(
         .outerjoin(
             Chapter, (Chapter.id == LibraryIssue.chapter_id) & (Chapter.series_id == LibraryIssue.series_id),
         )
-        .where(LibraryIssue.ignored == ignored)  # noqa: E712
+        .where(LibraryIssue.ignored == ignored, Series.deletion_pending.is_(False))  # noqa: E712
         .order_by(LibraryIssue.updated_at.desc(), LibraryIssue.id.desc())
     )
     if series_id is not None:
@@ -214,7 +214,7 @@ async def list_issues(
 
 @router.post("/issues/scan", response_model=IssueScanOut)
 async def scan_issues(session: AsyncSession = Depends(get_session)):
-    series_ids = list((await session.scalars(select(Series.id))).all())
+    series_ids = list((await session.scalars(select(Series.id).where(Series.deletion_pending.is_(False)))).all())
     ownership = await load_archive_ownership(session)
     await session.commit()
     for series_id in series_ids:
@@ -232,13 +232,17 @@ async def scan_issues(session: AsyncSession = Depends(get_session)):
 @asynccontextmanager
 async def _locked_issue(session: AsyncSession, issue_id: str):
     series_id = await session.scalar(
-        select(LibraryIssue.series_id).where(LibraryIssue.public_id == issue_id)
+        select(LibraryIssue.series_id)
+        .join(Series, Series.id == LibraryIssue.series_id)
+        .where(LibraryIssue.public_id == issue_id, Series.deletion_pending.is_(False))
     )
     if series_id is None:
         raise HTTPException(404, "Issue not found")
     async with series_lock(series_id):
         issue = await session.scalar(
-            select(LibraryIssue).where(LibraryIssue.public_id == issue_id)
+            select(LibraryIssue)
+            .join(Series, Series.id == LibraryIssue.series_id)
+            .where(LibraryIssue.public_id == issue_id, Series.deletion_pending.is_(False))
         )
         if issue is None:
             raise HTTPException(404, "Issue not found")

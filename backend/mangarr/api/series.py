@@ -193,7 +193,7 @@ async def list_series(session: AsyncSession = Depends(get_session)):
     for series_id, *totals in rows.all():
         counts[series_id] = _Counts(*(int(t or 0) for t in totals))
     result = await session.execute(
-        select(Series).where(Series.id.notin_(DELETING)).order_by(Series.sort_title, Series.title)
+        select(Series).where(Series.deletion_pending.is_(False)).order_by(Series.sort_title, Series.title)
     )
     return [
         _series_out(s, counts.get(s.id, _Counts()))
@@ -239,7 +239,9 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
 
 async def _series_in_order(session: AsyncSession, series_ids: list[int], *options) -> list[Series]:
     """The requested series that exist, in the order they were given."""
-    result = await session.execute(select(Series).options(*options).where(Series.id.in_(series_ids)))
+    result = await session.execute(select(Series).options(*options).where(
+        Series.id.in_(series_ids), Series.deletion_pending.is_(False),
+    ))
     by_id = {s.id: s for s in result.scalars().all()}
     return [by_id[i] for i in dict.fromkeys(series_ids) if i in by_id]
 
@@ -272,7 +274,7 @@ async def _change_root_folder(
                         selectinload(Series.chapters), selectinload(Series.extra_folders),
                         selectinload(Series.root_folder),
                     )
-                    .where(Series.id == series.id)
+                    .where(Series.id == series.id, Series.deletion_pending.is_(False))
                     .execution_options(populate_existing=True)
                 )
                 if current is None:
@@ -394,11 +396,21 @@ async def delete_series_bulk(body: SeriesBulkIn, session: AsyncSession = Depends
     return SeriesBulkOut(count=deleted)
 
 
-# Series whose deletion waits for the operation holding their lock (a refresh
-# or monitor pass can hold it through slow source fetches). They are hidden
-# from the API meanwhile and deleted as soon as the holder finishes.
-DELETING: set[int] = set()
-_deletions: set[asyncio.Task] = set()
+_deletions: dict[int, asyncio.Task[None]] = {}
+
+
+def _schedule_deletion(series_id: int) -> None:
+    if series_id not in _deletions:
+        task = asyncio.create_task(_delete_when_free(series_id))
+        _deletions[series_id] = task
+        task.add_done_callback(lambda _: _deletions.pop(series_id, None))
+
+
+async def resume_pending_deletions() -> None:
+    async with session_scope() as session:
+        pending = (await session.scalars(select(Series.id).where(Series.deletion_pending))).all()
+    for series_id in pending:
+        _schedule_deletion(series_id)
 
 
 async def _delete_series_locked(session: AsyncSession, series_id: int) -> bool:
@@ -409,18 +421,15 @@ async def _delete_series_locked(session: AsyncSession, series_id: int) -> bool:
     When the lock is busy, stop the series' downloads now and finish the
     deletion in the background instead of making the request wait.
     """
-    if series_id in DELETING:
-        return True
-    if await session.get(Series, series_id, populate_existing=True) is None:
+    series = await session.get(Series, series_id, populate_existing=True)
+    if series is None:
         return False
     lock = series_lock(series_id)
     if lock.locked() or getattr(lock, "_waiters", None):
+        series.deletion_pending = True
         await _cancel_direct_downloads(session, [series_id])
         await session.commit()
-        DELETING.add(series_id)
-        task = asyncio.get_running_loop().create_task(_delete_when_free(series_id))
-        _deletions.add(task)
-        task.add_done_callback(_deletions.discard)
+        _schedule_deletion(series_id)
         return True
     async with lock:
         series = await session.get(Series, series_id, populate_existing=True)
@@ -436,14 +445,12 @@ async def _delete_when_free(series_id: int) -> None:
     try:
         async with series_lock(series_id), session_scope() as session:
             series = await session.get(Series, series_id)
-            if series is not None:
+            if series is not None and series.deletion_pending:
                 await _cancel_direct_downloads(session, [series_id])
                 await session.delete(series)
                 await session.commit()
     except Exception:
         log.exception("deleting series %d failed", series_id)
-    finally:
-        DELETING.discard(series_id)
 
 
 @router.get("/{series_id}", response_model=SeriesDetailOut)
@@ -451,10 +458,10 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     result = await session.execute(
         select(Series)
         .options(selectinload(Series.chapters), selectinload(Series.source_links))
-        .where(Series.id == series_id)
+        .where(Series.id == series_id, Series.deletion_pending.is_(False))
     )
     series = result.scalar_one_or_none()
-    if series is None or series_id in DELETING:
+    if series is None:
         raise HTTPException(404, "Series not found")
     out = SeriesDetailOut.model_validate(series)
     out.english_title = series.title_english or english_title(
@@ -501,7 +508,9 @@ async def apply_title_preference(session: AsyncSession = Depends(get_session)):
         await session.execute(text("BEGIN IMMEDIATE"))
         values = await settings_service.get_all(session)
         pref = values.get("preferred_title_language", "provider")
-        unlocked = await session.scalars(select(Series).where(Series.title_locked.is_(False)))
+        unlocked = await session.scalars(select(Series).where(
+            Series.title_locked.is_(False), Series.deletion_pending.is_(False),
+        ))
         retitled = [series.id for series in unlocked if _apply_title_preference(series, pref)]
         await session.commit()
     # Series recommendations compare against the title; refresh them per
@@ -559,7 +568,7 @@ async def _refresh_issues_when_free(session: AsyncSession, series_id: int) -> No
 async def _refresh_issues(session: AsyncSession, series_id: int) -> None:
     """Recompute warnings after a title or layout change, under both locks."""
     series = await session.get(Series, series_id, populate_existing=True)
-    if series is not None:
+    if series is not None and not series.deletion_pending:
         await detect_series_issues(session, series)
         await session.commit()
 
@@ -573,7 +582,9 @@ async def _apply_series_edit(
     if new_title is not None or body.title_locked is not None:
         await session.execute(text("BEGIN IMMEDIATE"))
     result = await session.execute(
-        select(Series).options(selectinload(Series.chapters)).where(Series.id == series_id)
+        select(Series).options(selectinload(Series.chapters)).where(
+            Series.id == series_id, Series.deletion_pending.is_(False),
+        )
     )
     series = result.scalar_one_or_none()
     if series is None:
