@@ -121,3 +121,33 @@ async def test_conflicting_mapping_still_reports_invalid_volume_syntax(repair_db
     info = read_comicinfo(path)
     assert info.number == "2"
     assert info.volume is None
+
+
+async def test_mapping_conflict_invalidates_series_recommendation(repair_db):
+    session, _, series, original_path = repair_db
+    chapter = series.chapters[0]
+    original_path.unlink()
+    path = original_path.with_name("Tracked Ch. 2.cbz")
+    archive(path, "<ComicInfo><Series>Another Series</Series><Number>2</Number><PageCount>4</PageCount></ComicInfo>")
+    await session.commit()
+    await library_api.map_file(series.id, FileMapIn(chapter_id=chapter.id, file_path=str(path)), session)
+    await issues_api.scan_issues(session)
+    warnings = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    prior = next(warning for warning in warnings if warning.field == "series")
+
+    # Once the filename names another tracked chapter, the archive may belong
+    # elsewhere, so its embedded series name is no longer comparable.
+    series.chapters.append(Chapter(number=2))
+    await session.commit()
+    before = path.read_bytes()
+    with pytest.raises(HTTPException, match="issue changed") as stale:
+        await issues_api.resolve_issue(prior.id, IssueResolveIn(revision=prior.revision), session)
+    assert stale.value.status_code == 409
+    assert path.read_bytes() == before
+
+    # Archive-intrinsic checks still apply to the disputed file.
+    [page_count] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    assert page_count.field == "page_count"
+    await issues_api.resolve_issue(page_count.id, IssueResolveIn(revision=page_count.revision), session)
+    info = read_comicinfo(path)
+    assert (info.series, info.number, info.page_count) == ("Another Series", "2", "1")

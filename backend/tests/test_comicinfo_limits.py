@@ -26,7 +26,7 @@ def test_compressed_oversized_metadata_not_opened(tmp_path, monkeypatch, reader,
     open_member.assert_not_called()
 
 
-def test_bounded_stream_even_if_declared_size_is_small(monkeypatch):
+def test_bounded_stream_even_if_declared_size_is_small():
     info = zipfile.ZipInfo("ComicInfo.xml")
     info.file_size = 10
     archive = Mock()
@@ -34,8 +34,7 @@ def test_bounded_stream_even_if_declared_size_is_small(monkeypatch):
     stream = Mock(wraps=io.BytesIO(b"x" * (matcher.MAX_COMICINFO_BYTES + 5)))
     archive.open.return_value.__enter__ = Mock(return_value=stream)
     archive.open.return_value.__exit__ = Mock(return_value=False)
-    monkeypatch.setattr(zipfile, "ZipFile", Mock(return_value=Mock(__enter__=Mock(return_value=archive), __exit__=Mock(return_value=False))))
-    assert matcher._read_comicinfo_title(None) == ""
+    assert matcher._read_comicinfo_title(archive) == ""
     stream.read.assert_called_once_with(matcher.MAX_COMICINFO_BYTES + 1)
     archive.open.assert_called_once_with(info)
 

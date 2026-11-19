@@ -2198,7 +2198,14 @@ async def merge_complete_volumes(
                 log.warning("could not remove merged chapter file %s: %s", old, exc)
         merged.append(volume)
     if merged:
+        from ..metadata_issues import detect_series_issues, manual_archive_lock
+
         log.info("Merged volume(s) %s of %r", merged, series.title)
+        # The chapter archives are gone; drop their warnings now rather than
+        # listing repairs for missing files until the next scan.
+        async with manual_archive_lock:
+            await detect_series_issues(session, series)
+            await session.commit()
         _notify_kavita(values, series)
     return merged
 

@@ -1,5 +1,6 @@
 """Identify library files inside ZIP archives without reading their payloads."""
 
+import os
 from collections.abc import Iterable, Iterator
 from pathlib import PurePosixPath
 from zipfile import ZipInfo
@@ -19,6 +20,17 @@ _EXCLUDED_COMPONENTS = {
 }
 
 ArchiveFile = tuple[ZipInfo, PurePosixPath]
+ArchiveVersion = tuple[int, int, int, int]
+
+
+def archive_version(file_stat: os.stat_result) -> ArchiveVersion:
+    """Identify one version of a physical archive for caches and revision checks.
+
+    The inode distinguishes a replacement that kept the size and mtime, as
+    rsync or copy2 can. ctime is excluded because a new hardlink changes it
+    without changing the archive bytes.
+    """
+    return file_stat.st_dev, file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns
 
 
 def archive_files(entries: Iterable[ZipInfo]) -> Iterator[ArchiveFile]:

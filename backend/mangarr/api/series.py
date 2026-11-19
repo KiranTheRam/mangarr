@@ -383,12 +383,26 @@ async def _cancel_direct_downloads(session: AsyncSession, series_ids: list[int])
 @router.post("/editor/delete", response_model=SeriesBulkOut)
 async def delete_series_bulk(body: SeriesBulkIn, session: AsyncSession = Depends(get_session)):
     """Remove many series from the library. Files on disk are kept."""
-    series_list = await _series_in_order(session, body.series_ids)
-    await _cancel_direct_downloads(session, [series.id for series in series_list])
-    for series in series_list:
+    deleted = 0
+    for series_id in dict.fromkeys(body.series_ids):
+        deleted += await _delete_series_locked(session, series_id)
+    return SeriesBulkOut(count=deleted)
+
+
+async def _delete_series_locked(session: AsyncSession, series_id: int) -> bool:
+    """Delete one series after in-flight archive writes and imports finish.
+
+    Repairs, downloads, and imports validate the series under its lock and
+    write files before releasing it, so deletion must take the same lock.
+    """
+    async with series_lock(series_id):
+        series = await session.get(Series, series_id, populate_existing=True)
+        if series is None:
+            return False
+        await _cancel_direct_downloads(session, [series.id])
         await session.delete(series)
-    await session.commit()
-    return SeriesBulkOut(count=len(series_list))
+        await session.commit()
+        return True
 
 
 @router.get("/{series_id}", response_model=SeriesDetailOut)
@@ -535,12 +549,8 @@ async def _apply_series_edit(
 
 @router.delete("/{series_id}", status_code=204)
 async def delete_series(series_id: int, session: AsyncSession = Depends(get_session)):
-    series = await session.get(Series, series_id)
-    if series is None:
+    if not await _delete_series_locked(session, series_id):
         raise HTTPException(404, "Series not found")
-    await _cancel_direct_downloads(session, [series.id])
-    await session.delete(series)
-    await session.commit()
 
 
 @router.post("/{series_id}/refresh", status_code=202)

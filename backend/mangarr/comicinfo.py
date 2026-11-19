@@ -17,7 +17,7 @@ from xml.etree import ElementTree
 
 from .filename import parse_filename
 from .library.archive_members import (
-    MAX_COMICINFO_BYTES, archive_files, archive_pages, find_comicinfo_member,
+    MAX_COMICINFO_BYTES, archive_files, archive_pages, archive_version, find_comicinfo_member,
 )
 from .library.zip_limits import (
     BoundedZipReader, COPY_CHUNK_BYTES, MAX_EXPANDED_BYTES, MAX_MEMBER_BYTES,
@@ -91,8 +91,7 @@ def _archive_reader(path: Path, *, check_suffix: bool = True) -> BoundedZipReade
 
 
 def _revision(file_stat: os.stat_result) -> str:
-    identity = (file_stat.st_dev, file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns)
-    return hashlib.sha256(repr(identity).encode()).hexdigest()
+    return hashlib.sha256(repr(archive_version(file_stat)).encode()).hexdigest()
 
 
 def _copy_posix_access_acl(source_fd: int, target_fd: int) -> None:

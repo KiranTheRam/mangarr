@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ..models import Chapter, Series
 from ..util import NAME_MAX_BYTES, NEW_FILE_MODE, natural_key, sanitize_filename
+from .archive_members import ArchiveVersion, archive_version
 from .matcher import (
     ARCHIVE_EXTS,
     IMAGE_EXTS,
@@ -27,7 +28,7 @@ from .naming import chapter_filename, series_folder, volume_filename
 
 log = logging.getLogger(__name__)
 
-ArchiveRevision = tuple[int, int, int, int]
+ArchiveRevision = ArchiveVersion
 
 _SEASON_EPISODE = re.compile(
     r"(?:\bseason\s*|\bs\s*)(\d+)\b.*?\b(?:episode|ep)\.?\s*(\d+(?:\.\d+)?)",
@@ -79,9 +80,7 @@ def _validate_existing(dest: Path) -> None:
 
 
 def _archive_revision(path: Path) -> ArchiveRevision:
-    stat = path.stat()
-    # A new hardlink updates ctime without changing the archive bytes.
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+    return archive_version(path.stat())
 
 
 def _require_archive_revision(path: Path, expected: ArchiveRevision | None) -> None:

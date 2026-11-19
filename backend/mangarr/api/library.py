@@ -266,6 +266,7 @@ async def map_file(
         media_path = _require_series_media_path(series, body.file_path)
         chapter.downloaded = True
         chapter.file_path = str(media_path)
+        await _reconcile_issues(session, series)
         await session.commit()
 
 
@@ -305,6 +306,7 @@ async def cleanup_apply(
             series, _active_chapters(series), _folders_of(series), body.delete,
             media=_media_of(series),
         )
+        await _reconcile_issues(session, series)
         await session.commit()
         return CleanupResultOut(
             deleted=result.deleted, repointed=result.repointed,
@@ -338,6 +340,7 @@ async def map_file_range(
                 mapped += 1
         if mapped == 0:
             raise HTTPException(400, "No tracked chapters in that range")
+        await _reconcile_issues(session, series)
         await session.commit()
         return FileMapRangeOut(mapped=mapped, volume=volume)
 
@@ -386,6 +389,9 @@ async def add_folder(
             series_id=series.id, path=path, volume_offset=body.volume_offset
         )
         session.add(folder)
+        await session.flush()
+        await session.refresh(series, ["extra_folders"])
+        await _reconcile_issues(session, series)
         await session.commit()
         await session.refresh(folder)
     resolved = root / path
@@ -408,6 +414,7 @@ async def update_folder(
         if folder is None:
             raise HTTPException(404, "Folder not found")
         folder.volume_offset = body.volume_offset
+        await _reconcile_issues(session, series)
         await session.commit()
         root = _root_of(series)
     resolved = root / folder.path
@@ -422,10 +429,12 @@ async def remove_folder(
     series_id: int, folder_id: int, session: AsyncSession = Depends(get_session)
 ):
     async with series_lock(series_id), manual_archive_lock:
-        folder = await session.get(SeriesFolder, folder_id)
-        if folder is None or folder.series_id != series_id:
+        series = await _load(session, series_id)
+        folder = next((item for item in series.extra_folders if item.id == folder_id), None)
+        if folder is None:
             raise HTTPException(404, "Folder not found")
-        await session.delete(folder)
+        series.extra_folders.remove(folder)  # delete-orphan removes the row
+        await _reconcile_issues(session, series)
         await session.commit()
 
 
@@ -794,6 +803,16 @@ async def resync_volumes(
         )
     finally:
         lock.release()
+
+
+async def _reconcile_issues(session: AsyncSession, series: Series) -> None:
+    """Refresh warnings after a mapping or repair-input change, under both locks.
+
+    Resolve always recomputes its recommendation, so this keeps the listing
+    from offering stale repairs until the next scan.
+    """
+    await session.flush()
+    await detect_series_issues(session, series)
 
 
 async def _scan_now(session: AsyncSession, series: Series) -> int:

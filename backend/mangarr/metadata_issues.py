@@ -276,7 +276,13 @@ def find_candidates(
                     info.revision,
                 ))
 
-        if info.series and valid_titles and _archive_title_key(info.series) not in valid_titles:
+        # A filename naming another tracked chapter disputes whether this
+        # archive belongs to the chapter, and therefore to this series. Only
+        # archive-intrinsic checks (page count, Volume syntax) still apply.
+        if (
+            not mapping_conflict and info.series and valid_titles
+            and _archive_title_key(info.series) not in valid_titles
+        ):
             candidates.append(Candidate(
                 chapter.id, "comicinfo_series_mismatch", str(path), "series",
                 info.series, series.title,
