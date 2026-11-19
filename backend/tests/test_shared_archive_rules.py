@@ -19,6 +19,7 @@ from pathlib import Path
 from mangarr.api import library as library_api
 from mangarr.models import Chapter, Download, DownloadKind, DownloadStatus, Series
 from mangarr.sources import registry
+from mangarr.metadata_issues import load_archive_ownership
 
 
 def _volume_series(tmp_path, chapters):
@@ -345,3 +346,79 @@ async def test_discarded_merge_keeps_a_volume_another_series_adopted(repair_db, 
     merged = await tasks.merge_complete_volumes(session, series, {}, force=True)
     assert merged == []
     assert dest.exists(), "the adopted volume archive was deleted"
+
+
+async def test_direct_upgrade_keeps_an_archive_another_series_maps_via_alias(repair_db):
+    session, maker, series, path = repair_db
+    src = next(iter(registry.DIRECT_SOURCES))
+    chapter = series.chapters[0]
+    chapter.file_source = src
+    alias = path.with_name("Other Ch. 1.cbz")
+    os.symlink(path, alias)
+    other = Series(
+        title="Other", folder_name=series.folder_name, root_folder=series.root_folder,
+        chapters=[Chapter(number=1, downloaded=True, file_path=str(alias))],
+    )
+    session.add(other)
+    dl = Download(series_id=series.id, chapter_id=chapter.id, kind=DownloadKind.DIRECT,
+                  status=DownloadStatus.DOWNLOADING, source_name=src, title="x", payload="{}")
+    session.add(dl)
+    await session.commit()
+    own = await load_archive_ownership(session)
+    st = path.stat()
+    print("owners per ArchiveOwnership:", own.owners[(st.st_dev, st.st_ino)])
+    staged = path.with_name(".mangarr-direct-1.staged")
+    archive(staged, "<ComicInfo><Number>1</Number></ComicInfo>")
+    dest = path.with_name("Tracked Ch. 1 [new].cbz")
+
+    async def ok():
+        return None
+
+    await tasks._install_direct_download(session, dl, series, chapter, staged, dest, ok)
+    assert path.exists(), "archive Other maps through an alias was deleted (alias now dangles)"
+
+
+async def test_reservations_never_mutate_a_snapshot_a_reader_holds(tmp_path):
+    from mangarr import metadata_issues
+
+    path = tmp_path / "Shared.cbz"
+    archive(path, None)
+    held = metadata_issues._reserved_owners
+    before = dict(held)
+    await metadata_issues.reserve_archive_owners(41, [str(path)])
+    assert held == before  # worker threads iterate a mapping that never changes under them
+    assert metadata_issues.ArchiveOwnership([]).owners[(path.stat().st_dev, path.stat().st_ino)] == {-41}
+    claimed = metadata_issues._reserved_owners
+    metadata_issues.release_archive_owners(41)
+    assert set(claimed) == {41}
+    assert metadata_issues._reserved_owners == {}
+
+
+async def test_failed_merge_publish_removes_the_unreferenced_volume(repair_db, monkeypatch):
+    from mangarr import metadata_issues
+
+    session, _, series, path = repair_db
+    second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
+    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
+    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
+    for number, volume, file_path in ((2, 1, second), (3, 2, later)):
+        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(file_path)))
+    for chapter in series.chapters:
+        chapter.file_source = "alpha"
+    await session.commit()
+    await session.refresh(series, ["extra_folders"])
+    load = metadata_issues.load_archive_ownership
+    calls = []
+
+    async def ownership(db):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("ownership snapshot failed")
+        return await load(db)
+
+    monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
+    with pytest.raises(RuntimeError):
+        await tasks.merge_complete_volumes(session, series, {}, force=True)
+
+    assert not path.with_name("Tracked - Vol. 01.cbz").exists()
+    assert path.exists() and second.exists()

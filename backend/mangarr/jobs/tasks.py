@@ -1507,7 +1507,7 @@ async def _install_direct_download(
     session: AsyncSession, dl: Download, series: Series, chapter: Chapter, staged: Path, dest: Path,
     check_still_wanted: Callable[[], Awaitable[None]],
 ) -> None:
-    from ..metadata_issues import archive_is_reserved
+    from ..metadata_issues import load_archive_ownership
 
     # a file mangarr fetched itself is replaced outright; anything else (the
     # user's own files, a shared volume archive) stays where it is
@@ -1516,12 +1516,19 @@ async def _install_direct_download(
     discard_replaced = bool(
         replaced and replaced != str(dest)
         and replaced_source in registry.DIRECT_SOURCES
-        and await session.scalar(
-            select(Chapter.id).where(Chapter.id != chapter.id, Chapter.file_path == replaced).limit(1)
-        ) is None
-        # A series rebuilding its chapter rows still claims its archives.
-        and not archive_is_reserved(replaced)
     )
+    if discard_replaced:
+        # Match owners by inode, like every other ownership check: another
+        # chapter can reach this archive through a symlink or another path
+        # spelling, and a re-syncing series still claims its archives.
+        ownership = await load_archive_ownership(session)
+        try:
+            replaced_stat = Path(replaced).stat()
+        except OSError:
+            discard_replaced = False
+        else:
+            others = ownership.owners.get((replaced_stat.st_dev, replaced_stat.st_ino), set()) - {chapter.id}
+            discard_replaced = not others and replaced not in ownership.unavailable
     await check_still_wanted()
     staged.replace(dest)
     chapter.downloaded = True
@@ -2214,33 +2221,42 @@ async def merge_complete_volumes(
         except Exception as exc:
             log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
             continue
-        async with manual_archive_lock:
-            current = await load_archive_ownership(session)
-            if not _owned_only_by(members, current):
-                log.info("merge of %r volume %d discarded: a chapter file became shared",
-                         series.title, volume)
-                # A scan may already have adopted the new volume archive.
-                if not _owned_only_by([], current, dest):
-                    log.warning("keeping %s: another chapter now maps it", dest)
-                else:
-                    dest.unlink(missing_ok=True)
-                continue
-            old_paths = [c.file_path for c in members]
-            for chapter in members:
-                chapter.file_path = str(dest)
-                chapter.file_source = MERGED_FILE_SOURCE
-            session.add(HistoryEvent(
-                series_id=series.id, event="merged",
-                detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
-            ))
-            await session.commit()
-            for old in old_paths:
-                if old == str(dest):
+        published = False
+        try:
+            async with manual_archive_lock:
+                current = await load_archive_ownership(session)
+                if not _owned_only_by(members, current):
+                    log.info("merge of %r volume %d discarded: a chapter file became shared",
+                             series.title, volume)
+                    # A scan may already have adopted the new volume archive.
+                    if not _owned_only_by([], current, dest):
+                        log.warning("keeping %s: another chapter now maps it", dest)
+                    else:
+                        dest.unlink(missing_ok=True)
                     continue
-                try:
-                    Path(old).unlink(missing_ok=True)
-                except OSError as exc:
-                    log.warning("could not remove merged chapter file %s: %s", old, exc)
+                old_paths = [c.file_path for c in members]
+                for chapter in members:
+                    chapter.file_path = str(dest)
+                    chapter.file_source = MERGED_FILE_SOURCE
+                session.add(HistoryEvent(
+                    series_id=series.id, event="merged",
+                    detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
+                ))
+                await session.commit()
+                published = True
+                for old in old_paths:
+                    if old == str(dest):
+                        continue
+                    try:
+                        Path(old).unlink(missing_ok=True)
+                    except OSError as exc:
+                        log.warning("could not remove merged chapter file %s: %s", old, exc)
+        except BaseException:
+            # Failing or being cancelled between packing and publishing must
+            # not leave an unreferenced volume that blocks every later merge.
+            if not published:
+                dest.unlink(missing_ok=True)
+            raise
         merged.append(volume)
     if merged:
         log.info("Merged volume(s) %s of %r", merged, series.title)

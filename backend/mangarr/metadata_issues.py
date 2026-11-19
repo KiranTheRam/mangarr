@@ -50,21 +50,18 @@ def _archive_inodes(paths: list[str]) -> frozenset[tuple[int, int]]:
     return frozenset(inodes)
 
 
+# Ownership snapshots read the claims from worker threads, so the mapping is
+# replaced wholesale on the event loop and never mutated in place.
 async def reserve_archive_owners(series_id: int, paths: list[str]) -> None:
-    _reserved_owners[series_id] = await asyncio.to_thread(_archive_inodes, [path for path in paths if path])
+    global _reserved_owners
+    inodes = await asyncio.to_thread(_archive_inodes, [path for path in paths if path])
+    _reserved_owners = {**_reserved_owners, series_id: inodes}
 
 
 def release_archive_owners(series_id: int) -> None:
-    _reserved_owners.pop(series_id, None)
-
-
-def archive_is_reserved(path: str) -> bool:
-    try:
-        file_stat = Path(path).stat()
-    except OSError:
-        return False
-    key = (file_stat.st_dev, file_stat.st_ino)
-    return any(key in inodes for inodes in _reserved_owners.values())
+    global _reserved_owners
+    if series_id in _reserved_owners:
+        _reserved_owners = {key: value for key, value in _reserved_owners.items() if key != series_id}
 
 
 @dataclass(frozen=True)
