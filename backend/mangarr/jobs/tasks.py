@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +44,7 @@ from ..download.images import ImageOptimization
 from ..download.qbittorrent import QbtClient
 from ..download.torrent import magnet_btih_hex
 from ..filename import parse_filename
+from ..library.archive_members import ArchiveVersion, archive_version
 from ..library.importer import import_torrent_payload
 from ..library.matcher import find_media_files, find_series_media_files, match_files
 from ..library.naming import chapter_path, series_folder, volume_filename
@@ -73,7 +75,10 @@ from ..titles import (
     set_display_title,
 )
 from ..torrent_selection import select_best_torrent
-from ..util import is_transient_error, normalize_title, safe_error_reason
+from ..util import is_transient_error, normalize_title, run_file_work, safe_error_reason
+
+if TYPE_CHECKING:
+    from ..metadata_issues import ArchiveOwnership
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
 
 log = logging.getLogger(__name__)
@@ -2163,22 +2168,18 @@ async def grab_missing_chapters(
     return queued
 
 
-def _owned_only_by(chapters: list[Chapter], ownership, *extra: Path) -> bool:
-    """Whether no chapter outside `chapters` maps any of their archives (or `extra`)."""
-    ids = {chapter.id for chapter in chapters}
-    for path in [*(chapter.file_path for chapter in chapters), *map(str, extra)]:
-        try:
-            file_stat = Path(path).stat()
-        except FileNotFoundError:
-            if path in map(str, extra):
-                continue
-            return False
-        except OSError:
-            return False
-        owners = ownership.owners.get((file_stat.st_dev, file_stat.st_ino), set())
-        if path in ownership.unavailable or owners - ids:
-            return False
-    return True
+def _merge_input_versions(
+    chapters: list[Chapter], ownership: "ArchiveOwnership",
+) -> dict[str, ArchiveVersion] | None:
+    """Require a distinct physical archive owned by each chapter."""
+    versions = {}
+    for chapter in chapters:
+        path = chapter.file_path
+        version = ownership.versions.get(path)
+        if version is None or ownership.owners.get(version[:2]) != {chapter.id}:
+            return None
+        versions[path] = version
+    return versions
 
 
 async def merge_complete_volumes(
@@ -2214,7 +2215,8 @@ async def merge_complete_volumes(
     # checked again under the lock before the merge is published.
     snapshot = await load_archive_ownership(session)
     for volume, members in mergeable_volumes(series, series.chapters, busy).items():
-        if not _owned_only_by(members, snapshot):
+        originals = _merge_input_versions(members, snapshot)
+        if originals is None:
             log.info("merge of %r volume %d skipped: a chapter file is shared or unavailable",
                      series.title, volume)
             continue
@@ -2233,7 +2235,7 @@ async def merge_complete_volumes(
         try:
             staged.unlink(missing_ok=True)
             try:
-                await asyncio.to_thread(
+                await run_file_work(
                     merge_chapter_archives,
                     [(c.number, Path(c.file_path)) for c in members],
                     staged, series.title, volume,
@@ -2244,8 +2246,9 @@ async def merge_complete_volumes(
                 log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
                 continue
             async with manual_archive_lock:
-                if not _owned_only_by(members, await load_archive_ownership(session)):
-                    log.info("merge of %r volume %d discarded: a chapter file became shared",
+                current = _merge_input_versions(members, await load_archive_ownership(session))
+                if current != originals:
+                    log.info("merge of %r volume %d discarded: an input archive changed",
                              series.title, volume)
                     continue
                 try:
@@ -2254,7 +2257,6 @@ async def merge_complete_volumes(
                     log.warning("merge of %r volume %d discarded: %s appeared meanwhile",
                                 series.title, volume, dest)
                     continue
-                old_paths = [c.file_path for c in members]
                 cancelled = None
                 try:
                     for chapter in members:
@@ -2278,11 +2280,13 @@ async def merge_complete_volumes(
                     if cancelled is not None:
                         raise cancelled
                     raise
-                for old in old_paths:
-                    if old == str(dest):
-                        continue
+                for old, version in originals.items():
+                    path = Path(old)
                     try:
-                        Path(old).unlink(missing_ok=True)
+                        if archive_version(path.stat()) == version:
+                            path.unlink()
+                    except FileNotFoundError:
+                        pass
                     except OSError as exc:
                         log.warning("could not remove merged chapter file %s: %s", old, exc)
                 if cancelled is not None:

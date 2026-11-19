@@ -30,6 +30,7 @@ from ..schemas import (
     IssueScanOut,
     LibraryIssueOut,
 )
+from ..util import run_file_work
 
 router = APIRouter(tags=["issues"])
 
@@ -112,7 +113,7 @@ async def _write_archive(
             f"chapter {chapter.number:g} or rename the file to identify that chapter before setting Volume.",
         )
     try:
-        return await run_in_threadpool(update_comicinfo, path, updates, expected_revision=current.revision)
+        return await run_file_work(update_comicinfo, path, updates, expected_revision=current.revision)
     except ArchiveChanged as exc:
         raise HTTPException(409, str(exc)) from exc
     except ComicInfoError as exc:

@@ -487,3 +487,54 @@ async def test_merge_cancelled_during_sqlite_commit_keeps_the_mapped_volume(repa
         paths = (await fresh.scalars(select(Chapter.file_path).where(Chapter.number.in_([1, 2])))).all()
         assert paths == [str(dest), str(dest)]
     assert dest.exists() and not staged.exists()
+
+
+async def test_cancelled_merge_waits_until_packing_stops_using_its_staging_path(repair_db, monkeypatch):
+    from threading import Event
+
+    session, series, first, second, dest, staged = await _merge_setup(repair_db)
+    loop = asyncio.get_running_loop()
+    packing, finished = asyncio.Event(), asyncio.Event()
+    release = Event()
+    pack = tasks.merge_chapter_archives
+
+    def pause_packing(*args, **kwargs):
+        loop.call_soon_threadsafe(packing.set)
+        try:
+            assert release.wait(10)
+            return pack(*args, **kwargs)
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    monkeypatch.setattr(tasks, "merge_chapter_archives", pause_packing)
+    merge = asyncio.create_task(tasks.merge_complete_volumes(session, series, {}, force=True))
+    try:
+        await asyncio.wait_for(packing.wait(), 10)
+        merge.cancel()
+        await asyncio.sleep(0)
+        assert not merge.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await merge
+        await asyncio.wait_for(finished.wait(), 10)
+
+    assert first.exists() and second.exists()
+    assert not dest.exists() and not staged.exists()
+
+
+async def test_merge_discards_a_staged_volume_if_an_input_was_replaced(repair_db, monkeypatch):
+    session, series, first, second, dest, staged = await _merge_setup(repair_db)
+    pack = tasks.merge_chapter_archives
+    newer = first.with_suffix(".new")
+    archive(newer, "<ComicInfo><Number>1</Number><Title>New edition</Title></ComicInfo>")
+    expected = newer.read_bytes()
+
+    def replace_input_after_packing(*args, **kwargs):
+        pack(*args, **kwargs)
+        newer.replace(first)
+
+    monkeypatch.setattr(tasks, "merge_chapter_archives", replace_input_after_packing)
+    assert await tasks.merge_complete_volumes(session, series, {}, force=True) == []
+    assert first.read_bytes() == expected and second.exists()
+    assert not dest.exists() and not staged.exists()

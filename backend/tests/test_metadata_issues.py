@@ -1148,3 +1148,32 @@ def test_concurrent_archive_replacement_keeps_newer_file(tmp_path, monkeypatch):
         update_comicinfo(path, {"number": 1}, expected_revision=original_revision)
     monkeypatch.setattr(comicinfo, "_require_revision", require_revision)
     assert read_comicinfo(path).number == "99"
+
+
+async def test_cancelled_comicinfo_edit_holds_the_archive_lock_until_the_writer_finishes(repair_db, monkeypatch):
+    session, _, series, path = repair_db
+    chapter = series.chapters[0]
+    info = read_comicinfo(path)
+    loop = asyncio.get_running_loop()
+    writing, release = asyncio.Event(), threading.Event()
+
+    def pause_write(*args, **kwargs):
+        loop.call_soon_threadsafe(writing.set)
+        assert release.wait(10)
+        return update_comicinfo(*args, **kwargs)
+
+    monkeypatch.setattr(issues_api, "update_comicinfo", pause_write)
+    request = asyncio.create_task(issues_api.update_chapter_comicinfo(
+        series.id, chapter.id, ComicInfoUpdateIn(revision=info.revision, volume=1), session,
+    ))
+    try:
+        await asyncio.wait_for(writing.wait(), 10)
+        request.cancel()
+        await asyncio.sleep(0)
+        assert issues_api.manual_archive_lock.locked()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    assert read_comicinfo(path).volume == "1"

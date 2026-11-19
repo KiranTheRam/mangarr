@@ -234,6 +234,49 @@ async def test_move_carries_the_folder_and_repoints_chapters(session, roots):
     assert a.root_folder_id == new_root.id
 
 
+async def test_cancelled_root_move_still_saves_the_new_chapter_path(session, roots, monkeypatch):
+    old, new = roots
+    old_root, new_root = RootFolder(path=str(old)), RootFolder(path=str(new))
+    session.add(new_root)
+    series = await _add(session, "Alpha", old_root, numbers=(1,))
+    original = old / "Alpha" / "Ch 1.cbz"
+    original.parent.mkdir()
+    original.write_bytes(b"archive")
+    chapter = series.chapters[0]
+    chapter.downloaded = True
+    chapter.file_path = str(original)
+    await session.commit()
+
+    moved, release = asyncio.Event(), asyncio.Event()
+    move = series_api.move_series_folder
+
+    async def pause_after_move(*args):
+        result = await move(*args)
+        moved.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(series_api, "move_series_folder", pause_after_move)
+    request = asyncio.create_task(_edit(
+        session, series_ids=[series.id], root_folder_id=new_root.id, move_files=True,
+    ))
+    try:
+        await asyncio.wait_for(moved.wait(), 10)
+        request.cancel()
+        await asyncio.sleep(0)
+        assert series_api.manual_archive_lock.locked()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    await session.refresh(series, ["root_folder_id"])
+    await session.refresh(chapter)
+    expected = new / "Alpha" / original.name
+    assert series.root_folder_id == new_root.id
+    assert chapter.file_path == str(expected) and expected.is_file()
+
+
 @pytest.mark.parametrize("extra_available", [False, True])
 async def test_move_carries_ignored_archive_warning_to_new_root(session, roots, extra_available):
     old, new = roots

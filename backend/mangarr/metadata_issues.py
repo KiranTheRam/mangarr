@@ -20,6 +20,7 @@ from .comicinfo import (
     ArchiveChanged, ComicInfoError, ComicInfoMetadata, parse_comicinfo_int, read_comicinfo,
 )
 from .filename import parse_filename
+from .library.archive_members import ArchiveVersion, archive_version
 from .library.scanner import (
     chapters_under_folders, resolve_folders, resolve_volume_offsets, root_unavailable,
     unavailable_extra_folders,
@@ -118,11 +119,14 @@ class ArchiveOwnership:
         for chapter_id, raw_path in paths:
             by_path[raw_path].add(chapter_id)
         self.owners = defaultdict(set)
+        self.versions: dict[str, ArchiveVersion] = {}
         self.unavailable: dict[str, OSError] = {}
         for raw_path, chapter_ids in by_path.items():
             try:
                 file_stat = Path(raw_path).stat()
-                self.owners[file_stat.st_dev, file_stat.st_ino].update(chapter_ids)
+                version = archive_version(file_stat)
+                self.versions[raw_path] = version
+                self.owners[version[:2]].update(chapter_ids)
             except FileNotFoundError:
                 continue
             except OSError as exc:

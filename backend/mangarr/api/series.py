@@ -64,7 +64,7 @@ from ..titles import (
     set_display_title,
     split_alt_titles,
 )
-from ..util import is_special_chapter
+from ..util import finish_before_cancel, is_special_chapter
 
 log = logging.getLogger(__name__)
 
@@ -299,23 +299,26 @@ async def _change_root_folder(
             if in_flight is not None:
                 raise MoveError("downloads are in progress; move it once they finish")
 
-            old_root = Path(current.root_folder.path)
-            old_paths = {chapter.id: chapter.file_path for chapter in current.chapters}
-            moved = await move_series_folder(current, new_root)
-            anchor_extra_folders(current, old_root)
-            current.root_folder = new_root
-            if moved:
-                renames = list(dict.fromkeys(
-                    (old_paths[chapter.id], chapter.file_path)
-                    for chapter in current.chapters
-                    if old_paths[chapter.id] and old_paths[chapter.id] != chapter.file_path
-                ))
-                if await relocate_archive_issues(session, current.id, renames):
-                    await detect_series_issues(session, current)
-            await session.commit()
+            async def move_and_save() -> bool:
+                old_root = Path(current.root_folder.path)
+                old_paths = {chapter.id: chapter.file_path for chapter in current.chapters}
+                moved = await move_series_folder(current, new_root)
+                anchor_extra_folders(current, old_root)
+                current.root_folder = new_root
+                if moved:
+                    renames = list(dict.fromkeys(
+                        (old_paths[chapter.id], chapter.file_path)
+                        for chapter in current.chapters
+                        if old_paths[chapter.id] and old_paths[chapter.id] != chapter.file_path
+                    ))
+                    if await relocate_archive_issues(session, current.id, renames):
+                        await detect_series_issues(session, current)
+                await session.commit()
+                return moved
+
+            return await finish_before_cancel(asyncio.create_task(move_and_save()))
     finally:
         lock.release()
-    return moved
 
 
 @router.put("/editor", response_model=SeriesEditorOut)
