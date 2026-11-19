@@ -12,6 +12,13 @@ from mangarr.metadata_issues import ArchiveOwnership, find_candidates
 from mangarr.models import Chapter, RootFolder, Series
 from mangarr.schemas import IssueResolveIn
 from tests.test_metadata_issues import archive, repair_db  # noqa: F401
+import os
+from mangarr import metadata_issues
+from mangarr.models import Chapter, Series
+from pathlib import Path
+from mangarr.api import library as library_api
+from mangarr.models import Chapter, Download, DownloadKind, DownloadStatus, Series
+from mangarr.sources import registry
 
 
 def _volume_series(tmp_path, chapters):
@@ -201,3 +208,140 @@ async def test_volume_merge_packs_outside_the_archive_lock(repair_db, monkeypatc
         assert {c.file_path for c in series.chapters if c.number in (1, 2)} == {str(path), str(second)}
     else:
         assert merged == [1] and dest.exists() and not path.exists()
+
+# --- Reservations made during a re-sync must hold through renames, installs, and merges.
+
+
+async def test_reserved_archive_stays_claimed_after_a_rename(repair_db, monkeypatch):
+    session, maker, series, path = repair_db
+    other = Series(
+        title="Other", folder_name=series.folder_name, root_folder=series.root_folder,
+        chapters=[Chapter(number=1, downloaded=True, file_path=str(path))],
+    )
+    session.add(other)
+    await session.commit()
+    rebuilding, release = asyncio.Event(), asyncio.Event()
+
+    async def rebuild(rebuild_session, rebuilding_series, _values):
+        rebuilding.set()
+        await release.wait()
+        rebuilding_series.chapters = [Chapter(number=1)]
+        await rebuild_session.commit()
+
+    monkeypatch.setattr(tasks, "update_chapters", rebuild)
+
+    async def resync():
+        async with maker() as db:
+            await library_api.resync_chapters(other.id, db)
+
+    renamed = path.with_name("Tracked - Ch. 001.cbz")
+    async with asyncio.timeout(10):
+        resyncing = asyncio.create_task(resync())
+        await rebuilding.wait()
+        try:
+            # What rename_apply does for Tracked (series lock + archive lock).
+            async with tasks.series_lock(series.id), metadata_issues.manual_archive_lock:
+                os.rename(path, renamed)
+                series.chapters[0].file_path = str(renamed)
+                await session.commit()
+            async with maker() as db:
+                await library_api.scan(series.id, db)
+                for issue in await issues_api.list_issues(ignored=False, series_id=series.id, session=db):
+                    await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), db)
+        finally:
+            release.set()
+            await resyncing
+    # Other re-adopted the renamed file after its rescan...
+    async with maker() as db:
+        from sqlalchemy import select
+        rows = (await db.execute(select(Chapter.series_id, Chapter.file_path))).all()
+    # ...but its ComicInfo was rewritten while Other's claim was in place.
+    assert read_comicinfo(renamed).volume == "9"
+
+
+async def test_direct_install_keeps_an_archive_a_resync_reserved(repair_db, monkeypatch):
+    session, maker, series, path = repair_db
+    src = next(iter(registry.DIRECT_SOURCES))
+    chapter = series.chapters[0]
+    chapter.file_source = src
+    other = Series(
+        title="Other", folder_name=series.folder_name, root_folder=series.root_folder,
+        chapters=[Chapter(number=1, downloaded=True, file_path=str(path))],
+    )
+    session.add(other)
+    dl = Download(series_id=series.id, chapter_id=chapter.id, kind=DownloadKind.DIRECT,
+                  status=DownloadStatus.DOWNLOADING, source_name=src, title="x", payload="{}")
+    session.add(dl)
+    await session.commit()
+    rebuilding, release = asyncio.Event(), asyncio.Event()
+
+    async def rebuild(rebuild_session, rebuilding_series, _values):
+        rebuilding.set()
+        await release.wait()
+        rebuilding_series.chapters = [Chapter(number=1)]
+        await rebuild_session.commit()
+
+    monkeypatch.setattr(tasks, "update_chapters", rebuild)
+
+    async def resync():
+        async with maker() as db:
+            await library_api.resync_chapters(other.id, db)
+
+    staged = path.with_name(".mangarr-direct-1.staged")
+    archive(staged, "<ComicInfo><Number>1</Number></ComicInfo>")
+    dest = path.with_name("Tracked Ch. 1 [new].cbz")
+
+    async def ok():
+        return None
+
+    async with asyncio.timeout(10):
+        resyncing = asyncio.create_task(resync())
+        await rebuilding.wait()
+        assert metadata_issues._reserved_owners  # Other still claims the archive
+        try:
+            async with tasks.series_lock(series.id), metadata_issues.manual_archive_lock:
+                await tasks._install_direct_download(session, dl, series, chapter, staged, dest, ok)
+        finally:
+            release.set()
+            await resyncing
+    # Shared archive that Other reserved during its resync was deleted.
+    assert path.exists(), "a reserved archive was discarded"
+
+
+async def test_discarded_merge_keeps_a_volume_another_series_adopted(repair_db, monkeypatch):
+    session, maker, series, path = repair_db
+    second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
+    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
+    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
+    for number, volume, file_path in ((2, 1, second), (3, 2, later)):
+        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(file_path)))
+    for chapter in series.chapters:
+        chapter.file_source = "alpha"
+    await session.commit()
+    await session.refresh(series, ["extra_folders"])
+    dest = path.with_name("Tracked - Vol. 01.cbz")
+    root_id = series.root_folder_id
+
+    from mangarr import metadata_issues
+    load = metadata_issues.load_archive_ownership
+    calls = []
+
+    async def ownership(db):
+        calls.append(1)
+        if len(calls) == 2:
+            # Between packing and the lock, a series sharing the folder scans
+            # and adopts chapter 2's file plus the new volume archive.
+            assert dest.exists()
+            async with maker() as s2:
+                other = Series(title="Other", folder_name="Tracked", root_folder_id=root_id, chapters=[
+                    Chapter(number=2, downloaded=True, file_path=str(second)),
+                    Chapter(number=1, downloaded=True, file_path=str(dest)),
+                ])
+                s2.add(other)
+                await s2.commit()
+        return await load(db)
+
+    monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
+    merged = await tasks.merge_complete_volumes(session, series, {}, force=True)
+    assert merged == []
+    assert dest.exists(), "the adopted volume archive was deleted"

@@ -1507,6 +1507,8 @@ async def _install_direct_download(
     session: AsyncSession, dl: Download, series: Series, chapter: Chapter, staged: Path, dest: Path,
     check_still_wanted: Callable[[], Awaitable[None]],
 ) -> None:
+    from ..metadata_issues import archive_is_reserved
+
     # a file mangarr fetched itself is replaced outright; anything else (the
     # user's own files, a shared volume archive) stays where it is
     replaced = chapter.file_path if chapter.downloaded else ""
@@ -1517,6 +1519,8 @@ async def _install_direct_download(
         and await session.scalar(
             select(Chapter.id).where(Chapter.id != chapter.id, Chapter.file_path == replaced).limit(1)
         ) is None
+        # A series rebuilding its chapter rows still claims its archives.
+        and not archive_is_reserved(replaced)
     )
     await check_still_wanted()
     staged.replace(dest)
@@ -2139,16 +2143,20 @@ async def grab_missing_chapters(
     return queued
 
 
-def _owned_only_by(chapters: list[Chapter], ownership) -> bool:
-    """Whether no chapter outside `chapters` maps any of their archives."""
+def _owned_only_by(chapters: list[Chapter], ownership, *extra: Path) -> bool:
+    """Whether no chapter outside `chapters` maps any of their archives (or `extra`)."""
     ids = {chapter.id for chapter in chapters}
-    for chapter in chapters:
+    for path in [*(chapter.file_path for chapter in chapters), *map(str, extra)]:
         try:
-            file_stat = Path(chapter.file_path).stat()
+            file_stat = Path(path).stat()
+        except FileNotFoundError:
+            if path in map(str, extra):
+                continue
+            return False
         except OSError:
             return False
         owners = ownership.owners.get((file_stat.st_dev, file_stat.st_ino), set())
-        if chapter.file_path in ownership.unavailable or owners - ids:
+        if path in ownership.unavailable or owners - ids:
             return False
     return True
 
@@ -2207,10 +2215,15 @@ async def merge_complete_volumes(
             log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
             continue
         async with manual_archive_lock:
-            if not _owned_only_by(members, await load_archive_ownership(session)):
+            current = await load_archive_ownership(session)
+            if not _owned_only_by(members, current):
                 log.info("merge of %r volume %d discarded: a chapter file became shared",
                          series.title, volume)
-                dest.unlink(missing_ok=True)
+                # A scan may already have adopted the new volume archive.
+                if not _owned_only_by([], current, dest):
+                    log.warning("keeping %s: another chapter now maps it", dest)
+                else:
+                    dest.unlink(missing_ok=True)
                 continue
             old_paths = [c.file_path for c in members]
             for chapter in members:

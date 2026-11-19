@@ -581,7 +581,7 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
         # ownership snapshot until the rescan restores them. Keep claiming the
         # archives meanwhile, without holding the global archive lock through
         # the network fetch, so another series cannot rewrite a shared one.
-        reserve_archive_owners(series_id, [ch.file_path for ch in series.chapters])
+        await reserve_archive_owners(series_id, [ch.file_path for ch in series.chapters])
         await session.execute(sa_delete(Download).where(
             Download.series_id == series_id,
             or_(Download.chapter_id.isnot(None), Download.status.notin_(active)),

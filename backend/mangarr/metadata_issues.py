@@ -35,15 +35,36 @@ manual_archive_lock = asyncio.Lock()
 
 # A series whose chapter rows are being rebuilt keeps claiming its archives,
 # so another series never treats a shared archive as its own in the meantime.
-_reserved_owners: dict[int, tuple[str, ...]] = {}
+# Claims follow the inode, so a rename or root move cannot shed them.
+_reserved_owners: dict[int, frozenset[tuple[int, int]]] = {}
 
 
-def reserve_archive_owners(series_id: int, paths: list[str]) -> None:
-    _reserved_owners[series_id] = tuple(path for path in paths if path)
+def _archive_inodes(paths: list[str]) -> frozenset[tuple[int, int]]:
+    inodes = set()
+    for path in paths:
+        try:
+            file_stat = Path(path).stat()
+        except OSError:
+            continue
+        inodes.add((file_stat.st_dev, file_stat.st_ino))
+    return frozenset(inodes)
+
+
+async def reserve_archive_owners(series_id: int, paths: list[str]) -> None:
+    _reserved_owners[series_id] = await asyncio.to_thread(_archive_inodes, [path for path in paths if path])
 
 
 def release_archive_owners(series_id: int) -> None:
     _reserved_owners.pop(series_id, None)
+
+
+def archive_is_reserved(path: str) -> bool:
+    try:
+        file_stat = Path(path).stat()
+    except OSError:
+        return False
+    key = (file_stat.st_dev, file_stat.st_ino)
+    return any(key in inodes for inodes in _reserved_owners.values())
 
 
 @dataclass(frozen=True)
@@ -109,16 +130,15 @@ class ArchiveOwnership:
                 continue
             except OSError as exc:
                 self.unavailable[raw_path] = exc
+        # Negative ids never match a chapter, so reserved archives read as shared.
+        for series_id, inodes in _reserved_owners.items():
+            for key in inodes:
+                self.owners[key].add(-series_id)
 
 
 async def chapter_paths(session: AsyncSession) -> list[tuple[int, str]]:
     rows = await session.execute(select(Chapter.id, Chapter.file_path).where(Chapter.file_path != ""))
-    paths = [(chapter_id, path) for chapter_id, path in rows]
-    # Negative ids never match a chapter, so reserved archives read as shared.
-    paths.extend(
-        (-series_id, path) for series_id, reserved in _reserved_owners.items() for path in reserved
-    )
-    return paths
+    return [(chapter_id, path) for chapter_id, path in rows]
 
 
 async def load_archive_ownership(session: AsyncSession) -> ArchiveOwnership:
