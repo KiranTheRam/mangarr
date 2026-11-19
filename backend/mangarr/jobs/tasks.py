@@ -3,6 +3,7 @@ processing, qBittorrent sync, and the monitor loop."""
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections import defaultdict
@@ -1230,7 +1231,7 @@ async def process_direct_queue() -> None:
 
 
 async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
-    from ..metadata_issues import manual_archive_lock
+    from ..metadata_issues import load_archive_ownership, manual_archive_lock
 
     download_id = dl.id
     source_name = dl.source_name
@@ -1351,6 +1352,19 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             raise RuntimeError(
                 f"{dest.name} already holds chapter {owner:g}; "
                 "use a naming template that keeps chapter numbers distinct"
+            )
+        # Another series (or an alias) can map the same file; installing
+        # would replace that chapter's archive with this download.
+        try:
+            dest_stat = dest.stat()
+        except FileNotFoundError:
+            return
+        ownership = await load_archive_ownership(session)
+        others = ownership.owners.get((dest_stat.st_dev, dest_stat.st_ino), set()) - {chapter_id}
+        if others or str(dest) in ownership.unavailable:
+            raise RuntimeError(
+                f"{dest.name} is mapped by another chapter or series; remap or rename "
+                "that file before downloading this chapter"
             )
 
     staged: Path | None = None
@@ -2150,6 +2164,21 @@ async def grab_missing_chapters(
     return queued
 
 
+def _publish_without_replacing(staged: Path, dest: Path) -> bool:
+    """Give the staged archive its final name unless something already has it."""
+    try:
+        os.link(staged, dest)
+    except FileExistsError:
+        return False
+    except OSError:
+        # Some network filesystems refuse hard links. The archive lock keeps
+        # Mangarr from creating dest in between; only an outside writer could.
+        if dest.exists():
+            return False
+        staged.replace(dest)
+    return True
+
+
 def _owned_only_by(chapters: list[Chapter], ownership, *extra: Path) -> bool:
     """Whether no chapter outside `chapters` maps any of their archives (or `extra`)."""
     ids = {chapter.id for chapter in chapters}
@@ -2166,32 +2195,6 @@ def _owned_only_by(chapters: list[Chapter], ownership, *extra: Path) -> bool:
         if path in ownership.unavailable or owners - ids:
             return False
     return True
-
-
-async def _discard_unpublished_volume(session: AsyncSession, dest: Path) -> None:
-    """Remove a packed volume no chapter maps; keep it when that cannot be shown.
-
-    A scan may adopt the new archive while the merge waits for the archive
-    lock, so it is deleted only after an ownership check under that lock.
-    Cleanup never waits for the lock (shutdown may be cancelling the holder).
-    """
-    from ..metadata_issues import load_archive_ownership, manual_archive_lock
-
-    # asyncio.Lock.acquire only skips suspending when the lock is free and no
-    # waiter is queued (a released lock first wakes its next waiter).
-    if manual_archive_lock.locked() or getattr(manual_archive_lock, "_waiters", None):
-        log.warning("keeping unpublished volume %s: ownership cannot be checked now", dest)
-        return
-    try:
-        async with manual_archive_lock:
-            await session.rollback()
-            if _owned_only_by([], await load_archive_ownership(session), dest):
-                dest.unlink(missing_ok=True)
-                return
-    except Exception as exc:  # a new cancellation propagates; other errors keep the file
-        log.warning("keeping unpublished volume %s: ownership could not be checked (%s)", dest, exc)
-        return
-    log.warning("keeping unpublished volume %s: another chapter maps it", dest)
 
 
 async def merge_complete_volumes(
@@ -2231,45 +2234,54 @@ async def merge_complete_volumes(
                      series.title, volume)
             continue
         dest = folders[0] / volume_filename(series_folder(series.title), volume)
+        if dest.exists():
+            log.warning("merge of %r volume %d skipped: %s already exists", series.title, volume, dest)
+            continue
+        # Pack under a hidden, non-media name that scans never adopt, named for
+        # the volume so a retry replaces whatever an interrupted attempt left.
+        staged = dest.with_name(f".mangarr-merge-{series.id}-{volume}.staged")
         localized_series = (
             series.provider_title
             if series.provider_title and series.title != series.provider_title
             else None
         )
         try:
-            await asyncio.to_thread(
-                merge_chapter_archives,
-                [(c.number, Path(c.file_path)) for c in members],
-                dest, series.title, volume,
-                series.description if volume == 1 else "",
-                localized_series=localized_series,
-            )
-        except Exception as exc:
-            log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
-            continue
-        published = False
-        try:
+            staged.unlink(missing_ok=True)
+            try:
+                await asyncio.to_thread(
+                    merge_chapter_archives,
+                    [(c.number, Path(c.file_path)) for c in members],
+                    staged, series.title, volume,
+                    series.description if volume == 1 else "",
+                    localized_series=localized_series,
+                )
+            except Exception as exc:
+                log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
+                continue
             async with manual_archive_lock:
-                current = await load_archive_ownership(session)
-                if not _owned_only_by(members, current):
+                if not _owned_only_by(members, await load_archive_ownership(session)):
                     log.info("merge of %r volume %d discarded: a chapter file became shared",
                              series.title, volume)
-                    # A scan may already have adopted the new volume archive.
-                    if not _owned_only_by([], current, dest):
-                        log.warning("keeping %s: another chapter now maps it", dest)
-                    else:
-                        dest.unlink(missing_ok=True)
+                    continue
+                if not _publish_without_replacing(staged, dest):
+                    log.warning("merge of %r volume %d discarded: %s appeared meanwhile",
+                                series.title, volume, dest)
                     continue
                 old_paths = [c.file_path for c in members]
-                for chapter in members:
-                    chapter.file_path = str(dest)
-                    chapter.file_source = MERGED_FILE_SOURCE
-                session.add(HistoryEvent(
-                    series_id=series.id, event="merged",
-                    detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
-                ))
-                await session.commit()
-                published = True
+                try:
+                    for chapter in members:
+                        chapter.file_path = str(dest)
+                        chapter.file_source = MERGED_FILE_SOURCE
+                    session.add(HistoryEvent(
+                        series_id=series.id, event="merged",
+                        detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
+                    ))
+                    await session.commit()
+                except BaseException:
+                    # Nothing maps the new file yet, and no scan can adopt it
+                    # while this lock is held.
+                    dest.unlink(missing_ok=True)
+                    raise
                 for old in old_paths:
                     if old == str(dest):
                         continue
@@ -2277,12 +2289,8 @@ async def merge_complete_volumes(
                         Path(old).unlink(missing_ok=True)
                     except OSError as exc:
                         log.warning("could not remove merged chapter file %s: %s", old, exc)
-        except BaseException:
-            # Failing or being cancelled between packing and publishing must
-            # not leave an unreferenced volume that blocks every later merge.
-            if not published:
-                await _discard_unpublished_volume(session, dest)
-            raise
+        finally:
+            staged.unlink(missing_ok=True)
         merged.append(volume)
     if merged:
         log.info("Merged volume(s) %s of %r", merged, series.title)

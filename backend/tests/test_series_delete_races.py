@@ -1,4 +1,5 @@
-"""Series deletion must not interleave with archive writes that validated the series."""
+"""Series deletion must not interleave with archive writes that validated the series,
+and must not make the request wait behind a long refresh."""
 
 import asyncio
 
@@ -8,7 +9,8 @@ from sqlalchemy import select
 
 from mangarr.api import issues as issues_api, series as series_api
 from mangarr.comicinfo import read_comicinfo
-from mangarr.models import Series
+from mangarr.jobs.tasks import REMOVED_BY_USER
+from mangarr.models import Chapter, Download, DownloadKind, DownloadStatus, Series
 from mangarr.schemas import ComicInfoUpdateIn, IssueResolveIn, SeriesBulkIn
 from tests.test_metadata_issues import repair_db  # noqa: F401
 
@@ -21,9 +23,18 @@ async def _delete(maker, series_id, bulk):
             await series_api.delete_series(series_id, session)
 
 
+async def _series_row(maker, series_id):
+    async with maker() as session:
+        return await session.scalar(select(Series.id).where(Series.id == series_id))
+
+
+async def _finish_deletions():
+    await asyncio.gather(*list(series_api._deletions))
+
+
 @pytest.mark.parametrize("bulk", [False, True])
 @pytest.mark.parametrize("operation", ["resolve", "edit"])
-async def test_delete_waits_for_an_in_flight_archive_write(repair_db, monkeypatch, bulk, operation):
+async def test_delete_returns_at_once_and_waits_for_an_in_flight_write(repair_db, monkeypatch, bulk, operation):
     session, maker, series, path = repair_db
     await issues_api.scan_issues(session)
     [issue] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
@@ -51,38 +62,60 @@ async def test_delete_waits_for_an_in_flight_archive_write(repair_db, monkeypatc
     async with asyncio.timeout(10):
         repairing = asyncio.create_task(repair())
         await validated.wait()
-        deleting = asyncio.create_task(_delete(maker, series.id, bulk))
         try:
-            done, _ = await asyncio.wait({deleting}, timeout=0.05)
-            assert not done, "deletion committed while a repair still held the series"
+            await _delete(maker, series.id, bulk)  # does not wait for the repair
+            assert await _series_row(maker, series.id) == series.id, "deleted under a running repair"
+            async with maker() as check:
+                with pytest.raises(HTTPException) as hidden:
+                    await series_api.get_series(series.id, check)
+                assert hidden.value.status_code == 404
+                assert series.id not in {item.id for item in await series_api.list_series(check)}
         finally:
             release.set()
-            await asyncio.gather(repairing, deleting)
+            await repairing
+        await _finish_deletions()
 
     assert read_comicinfo(path).volume == "1"
-    async with maker() as check:
-        assert await check.scalar(select(Series.id).where(Series.id == series.id)) is None
+    assert await _series_row(maker, series.id) is None
+    assert series.id not in series_api.DELETING
 
 
-async def test_repair_queued_behind_delete_does_not_touch_the_archive(repair_db):
+async def test_repair_requested_after_a_deferred_delete_does_not_touch_the_archive(repair_db):
     session, maker, series, path = repair_db
     await issues_api.scan_issues(session)
     [issue] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    session.add(Download(
+        series_id=series.id, chapter_id=series.chapters[0].id, kind=DownloadKind.DIRECT,
+        status=DownloadStatus.DOWNLOADING, source_name="fake", payload="c1", title="Tracked 1",
+    ))
+    await session.commit()
     before = path.read_bytes()
     lock = series_api.series_lock(series.id)
-    await lock.acquire()
-
-    async def repair():
-        async with maker() as repair_session:
-            await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), repair_session)
+    await lock.acquire()  # a refresh holds the series through slow source fetches
 
     async with asyncio.timeout(10):
-        repairing = asyncio.create_task(repair())
-        deleting = asyncio.create_task(_delete(maker, series.id, False))
-        await asyncio.sleep(0)
-        lock.release()
-        results = await asyncio.gather(repairing, deleting, return_exceptions=True)
+        try:
+            await _delete(maker, series.id, False)
+            async with maker() as check:
+                [download] = (await check.scalars(select(Download))).all()
+                assert (download.status, download.error) == (DownloadStatus.FAILED, REMOVED_BY_USER)
+            while not getattr(lock, "_waiters", None):
+                await asyncio.sleep(0)  # the deletion is queued on the lock
 
-    assert isinstance(results[0], HTTPException) and results[0].status_code == 404
-    assert results[1] is None
+            async def repair():
+                async with maker() as repair_session:
+                    await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), repair_session)
+
+            repairing = asyncio.create_task(repair())
+            await asyncio.sleep(0)
+        finally:
+            lock.release()
+        with pytest.raises(HTTPException) as rejected:
+            await repairing
+        await _finish_deletions()
+
+    assert rejected.value.status_code == 404
     assert path.read_bytes() == before
+    assert await _series_row(maker, series.id) is None
+    async with maker() as check:
+        assert (await check.scalars(select(Chapter))).all() == []

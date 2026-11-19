@@ -151,3 +151,32 @@ async def test_mapping_conflict_invalidates_series_recommendation(repair_db):
     await issues_api.resolve_issue(page_count.id, IssueResolveIn(revision=page_count.revision), session)
     info = read_comicinfo(path)
     assert (info.series, info.number, info.page_count) == ("Another Series", "2", "1")
+
+
+@pytest.mark.parametrize("update,allowed", [
+    ({"series": "Tracked"}, False),
+    ({"volume": 1}, False),
+    ({"volume": None}, True),  # removes the invalid tag, an archive-intrinsic repair
+    ({"title": "Bonus"}, True),
+    ({"series": "Another Series"}, True),  # unchanged value
+])
+async def test_manual_editor_limits_disputed_archives_to_intrinsic_edits(repair_db, update, allowed):
+    session, _, series, original_path = repair_db
+    chapter = series.chapters[0]
+    original_path.unlink()
+    path = original_path.with_name("Tracked Ch. 2.cbz")
+    archive(path, "<ComicInfo><Series>Another Series</Series><Number>2</Number><Volume>2.5</Volume></ComicInfo>")
+    series.chapters.append(Chapter(number=2))
+    await session.commit()
+    await library_api.map_file(series.id, FileMapIn(chapter_id=chapter.id, file_path=str(path)), session)
+    current = await issues_api.get_chapter_comicinfo(series.id, chapter.id, session)
+    before = path.read_bytes()
+
+    body = ComicInfoUpdateIn(revision=current.revision, **update)
+    if allowed:
+        await issues_api.update_chapter_comicinfo(series.id, chapter.id, body, session)
+    else:
+        with pytest.raises(HTTPException, match="different tracked chapter") as rejected:
+            await issues_api.update_chapter_comicinfo(series.id, chapter.id, body, session)
+        assert rejected.value.status_code == 409
+        assert path.read_bytes() == before

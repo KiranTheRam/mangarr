@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import Iterable
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -20,7 +21,7 @@ from ..adding import (
     start_refreshes,
 )
 from ..automation import RESOLVED_MODES, apply_monitor_mode, order_sources
-from ..db import get_session
+from ..db import get_session, session_scope
 from ..jobs.tasks import (
     REFRESHING,
     REMOVED_BY_USER,
@@ -64,6 +65,8 @@ from ..titles import (
     split_alt_titles,
 )
 from ..util import is_special_chapter
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/series", tags=["series"])
 
@@ -189,7 +192,9 @@ async def list_series(session: AsyncSession = Depends(get_session)):
     )
     for series_id, *totals in rows.all():
         counts[series_id] = _Counts(*(int(t or 0) for t in totals))
-    result = await session.execute(select(Series).order_by(Series.sort_title, Series.title))
+    result = await session.execute(
+        select(Series).where(Series.id.notin_(DELETING)).order_by(Series.sort_title, Series.title)
+    )
     return [
         _series_out(s, counts.get(s.id, _Counts()))
         for s in result.scalars().all()
@@ -389,13 +394,35 @@ async def delete_series_bulk(body: SeriesBulkIn, session: AsyncSession = Depends
     return SeriesBulkOut(count=deleted)
 
 
+# Series whose deletion waits for the operation holding their lock (a refresh
+# or monitor pass can hold it through slow source fetches). They are hidden
+# from the API meanwhile and deleted as soon as the holder finishes.
+DELETING: set[int] = set()
+_deletions: set[asyncio.Task] = set()
+
+
 async def _delete_series_locked(session: AsyncSession, series_id: int) -> bool:
     """Delete one series after in-flight archive writes and imports finish.
 
     Repairs, downloads, and imports validate the series under its lock and
     write files before releasing it, so deletion must take the same lock.
+    When the lock is busy, stop the series' downloads now and finish the
+    deletion in the background instead of making the request wait.
     """
-    async with series_lock(series_id):
+    if series_id in DELETING:
+        return True
+    if await session.get(Series, series_id, populate_existing=True) is None:
+        return False
+    lock = series_lock(series_id)
+    if lock.locked() or getattr(lock, "_waiters", None):
+        await _cancel_direct_downloads(session, [series_id])
+        await session.commit()
+        DELETING.add(series_id)
+        task = asyncio.get_running_loop().create_task(_delete_when_free(series_id))
+        _deletions.add(task)
+        task.add_done_callback(_deletions.discard)
+        return True
+    async with lock:
         series = await session.get(Series, series_id, populate_existing=True)
         if series is None:
             return False
@@ -403,6 +430,20 @@ async def _delete_series_locked(session: AsyncSession, series_id: int) -> bool:
         await session.delete(series)
         await session.commit()
         return True
+
+
+async def _delete_when_free(series_id: int) -> None:
+    try:
+        async with series_lock(series_id), session_scope() as session:
+            series = await session.get(Series, series_id)
+            if series is not None:
+                await _cancel_direct_downloads(session, [series_id])
+                await session.delete(series)
+                await session.commit()
+    except Exception:
+        log.exception("deleting series %d failed", series_id)
+    finally:
+        DELETING.discard(series_id)
 
 
 @router.get("/{series_id}", response_model=SeriesDetailOut)
@@ -413,7 +454,7 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
         .where(Series.id == series_id)
     )
     series = result.scalar_one_or_none()
-    if series is None:
+    if series is None or series_id in DELETING:
         raise HTTPException(404, "Series not found")
     out = SeriesDetailOut.model_validate(series)
     out.english_title = series.title_english or english_title(
@@ -461,9 +502,14 @@ async def apply_title_preference(session: AsyncSession = Depends(get_session)):
         values = await settings_service.get_all(session)
         pref = values.get("preferred_title_language", "provider")
         unlocked = await session.scalars(select(Series).where(Series.title_locked.is_(False)))
-        changed = sum(_apply_title_preference(series, pref) for series in unlocked)
+        retitled = [series.id for series in unlocked if _apply_title_preference(series, pref)]
         await session.commit()
-    return ApplyTitlePreferenceOut(count=changed, updated=changed)
+    # Series recommendations compare against the title; refresh them per
+    # series in lock order (series lock, then archive lock).
+    for series_id in retitled:
+        async with series_lock(series_id), manual_archive_lock:
+            await _refresh_issues(session, series_id)
+    return ApplyTitlePreferenceOut(count=len(retitled), updated=len(retitled))
 
 
 @router.put("/{series_id}", response_model=SeriesDetailOut)
@@ -471,15 +517,25 @@ async def update_series(
     series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
 ):
     changes_layout = body.root_folder_id is not None or body.folder_name is not None
+    changes_repair_inputs = changes_layout or body.title is not None or body.title_locked is not None
     async with AsyncExitStack() as locks:
-        if changes_layout:
-            await locks.enter_async_context(series_lock(series_id))
-        if changes_layout or body.title is not None or body.title_locked is not None:
+        if changes_repair_inputs:
             # A repair uses both the library layout and title to validate its
             # recommendation. Acquire archive locks before SQLite's write lock.
+            await locks.enter_async_context(series_lock(series_id))
             await locks.enter_async_context(manual_archive_lock)
         await _apply_series_edit(series_id, body, session)
+        if changes_repair_inputs:
+            await _refresh_issues(session, series_id)
     return await get_series(series_id, session)
+
+
+async def _refresh_issues(session: AsyncSession, series_id: int) -> None:
+    """Recompute warnings after a title or layout change, under both locks."""
+    series = await session.get(Series, series_id, populate_existing=True)
+    if series is not None:
+        await detect_series_issues(session, series)
+        await session.commit()
 
 
 async def _apply_series_edit(
@@ -589,7 +645,7 @@ async def update_chapter_metadata(
     body: ChapterMetadataIn,
     session: AsyncSession = Depends(get_session),
 ):
-    async with series_lock(series_id):
+    async with series_lock(series_id), manual_archive_lock:
         chapter = await session.get(Chapter, chapter_id)
         if chapter is None or chapter.series_id != series_id:
             raise HTTPException(404, "Chapter not found")
@@ -607,6 +663,8 @@ async def update_chapter_metadata(
         if body.excluded is not None:
             chapter.excluded = body.excluded
         await session.commit()
+        # Volume and exclusion feed the volume recommendations.
+        await _refresh_issues(session, series_id)
         await session.refresh(chapter)
         return chapter
 

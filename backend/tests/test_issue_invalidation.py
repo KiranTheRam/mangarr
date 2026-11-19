@@ -75,3 +75,53 @@ async def test_volume_merge_drops_warnings_for_removed_chapter_archives(repair_d
 
     assert not path.exists()
     assert await _warnings(session, series.id) == []
+
+
+async def test_title_edit_refreshes_series_recommendations(repair_db):
+    from mangarr.api import series as series_api
+    from mangarr.schemas import SeriesUpdateIn
+
+    from mangarr.comicinfo import update_comicinfo
+
+    session, _, series, path = repair_db
+    update_comicinfo(path, {"series": "Renamed Series"})
+    await issues_api.scan_issues(session)
+    assert "series" in {w.field for w in await _warnings(session, series.id)}
+
+    await series_api.update_series(series.id, SeriesUpdateIn(title="Renamed Series"), session)
+
+    assert [w.field for w in await _warnings(session, series.id)] == ["volume"]
+
+
+async def test_title_preference_refreshes_series_recommendations(repair_db, monkeypatch):
+    from mangarr.api import series as series_api
+
+    session, _, series, _ = repair_db
+    await issues_api.scan_issues(session)
+
+    def retitle(target, _preference):
+        target.title = "Preferred Title"
+        return True
+
+    monkeypatch.setattr(series_api, "_apply_title_preference", retitle)
+    result = await series_api.apply_title_preference(session)
+
+    assert result.updated == 1
+    [series_warning] = [w for w in await _warnings(session, series.id) if w.field == "series"]
+    assert series_warning.suggested_value == "Preferred Title"
+
+
+async def test_chapter_volume_edit_refreshes_volume_recommendations(repair_db):
+    from mangarr.api import series as series_api
+    from mangarr.schemas import ChapterMetadataIn
+
+    session, _, series, _ = repair_db
+    await issues_api.scan_issues(session)
+    [warning] = await _warnings(session, series.id)
+    assert warning.field == "volume" and warning.suggested_value == "1"
+
+    await series_api.update_chapter_metadata(
+        series.id, series.chapters[0].id, ChapterMetadataIn(volume=9), session,
+    )
+
+    assert await _warnings(session, series.id) == []

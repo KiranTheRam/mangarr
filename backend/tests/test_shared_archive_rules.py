@@ -309,45 +309,6 @@ async def test_direct_install_keeps_an_archive_a_resync_reserved(repair_db, monk
     assert path.exists(), "a reserved archive was discarded"
 
 
-async def test_discarded_merge_keeps_a_volume_another_series_adopted(repair_db, monkeypatch):
-    session, maker, series, path = repair_db
-    second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
-    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
-    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
-    for number, volume, file_path in ((2, 1, second), (3, 2, later)):
-        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(file_path)))
-    for chapter in series.chapters:
-        chapter.file_source = "alpha"
-    await session.commit()
-    await session.refresh(series, ["extra_folders"])
-    dest = path.with_name("Tracked - Vol. 01.cbz")
-    root_id = series.root_folder_id
-
-    from mangarr import metadata_issues
-    load = metadata_issues.load_archive_ownership
-    calls = []
-
-    async def ownership(db):
-        calls.append(1)
-        if len(calls) == 2:
-            # Between packing and the lock, a series sharing the folder scans
-            # and adopts chapter 2's file plus the new volume archive.
-            assert dest.exists()
-            async with maker() as s2:
-                other = Series(title="Other", folder_name="Tracked", root_folder_id=root_id, chapters=[
-                    Chapter(number=2, downloaded=True, file_path=str(second)),
-                    Chapter(number=1, downloaded=True, file_path=str(dest)),
-                ])
-                s2.add(other)
-                await s2.commit()
-        return await load(db)
-
-    monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
-    merged = await tasks.merge_complete_volumes(session, series, {}, force=True)
-    assert merged == []
-    assert dest.exists(), "the adopted volume archive was deleted"
-
-
 async def test_direct_upgrade_keeps_an_archive_another_series_maps_via_alias(repair_db):
     session, maker, series, path = repair_db
     src = next(iter(registry.DIRECT_SOURCES))
@@ -394,10 +355,7 @@ async def test_reservations_never_mutate_a_snapshot_a_reader_holds(tmp_path):
     assert metadata_issues._reserved_owners == {}
 
 
-@pytest.mark.parametrize("failure", ["unreferenced", "adopted", "cancelled_during_cleanup"])
-async def test_failed_merge_publish_cleans_up_only_an_unreferenced_volume(repair_db, monkeypatch, failure):
-    from mangarr import metadata_issues
-
+async def _merge_setup(repair_db):
     session, maker, series, path = repair_db
     second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
     archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
@@ -408,113 +366,82 @@ async def test_failed_merge_publish_cleans_up_only_an_unreferenced_volume(repair
         chapter.file_source = "alpha"
     await session.commit()
     await session.refresh(series, ["extra_folders"])
-    load = metadata_issues.load_archive_ownership
-    calls = []
-
     dest = path.with_name("Tracked - Vol. 01.cbz")
-    root_id = series.root_folder_id
+    staged = dest.with_name(f".mangarr-merge-{series.id}-1.staged")
+    return session, series, path, second, dest, staged
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_merge_failure_before_publishing_leaves_no_volume_or_staging(repair_db, monkeypatch, failure):
+    from mangarr import metadata_issues
+
+    session, series, path, second, dest, staged = await _merge_setup(repair_db)
+    load, calls = metadata_issues.load_archive_ownership, []
 
     async def ownership(db):
         calls.append(1)
         if len(calls) == 2:
-            if failure == "adopted":
-                # A scan of a series sharing the folder adopted the new volume.
-                async with maker() as other_session:
-                    other_session.add(Series(
-                        title="Other", folder_name="Tracked", root_folder_id=root_id,
-                        chapters=[Chapter(number=1, downloaded=True, file_path=str(dest))],
-                    ))
-                    await other_session.commit()
-            raise RuntimeError("ownership snapshot failed")
-        if len(calls) == 3 and failure == "cancelled_during_cleanup":
-            raise asyncio.CancelledError
+            raise failure("interrupted before publishing")
         return await load(db)
 
     monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
-    expected = asyncio.CancelledError if failure == "cancelled_during_cleanup" else RuntimeError
-    with pytest.raises(expected):
+    with pytest.raises(failure):
         await tasks.merge_complete_volumes(session, series, {}, force=True)
-
-    assert len(calls) == 3, "cleanup ran its ownership check without waiting"
-    assert dest.exists() == (failure != "unreferenced")
+    assert not dest.exists() and not staged.exists()
     assert path.exists() and second.exists()
 
 
-async def test_cancelled_merge_keeps_a_volume_another_series_adopted(repair_db):
+async def test_merge_never_exposes_the_volume_before_publishing(repair_db, monkeypatch):
     from mangarr import metadata_issues
-    session, maker, series, path = repair_db
-    second = path.with_name("Tracked Ch. 2.cbz")
-    later = path.with_name("Tracked Ch. 3.cbz")
-    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
-    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
-    for number, volume, fp in ((2, 1, second), (3, 2, later)):
-        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(fp)))
-    for c in series.chapters:
-        c.file_source = "alpha"
-    await session.commit()
-    await session.refresh(series, ["extra_folders"])
-    dest = path.with_name("Tracked - Vol. 01.cbz")
-    root_id = series.root_folder_id
+    from mangarr.library.matcher import find_media_files
 
-    # Another series' scan holds the archive lock and adopts the new volume.
-    await metadata_issues.manual_archive_lock.acquire()
-    task = asyncio.create_task(tasks.merge_complete_volumes(session, series, {}, force=True))
-    for _ in range(200):
-        await asyncio.sleep(0.01)
-        if dest.exists():
-            break
-    assert dest.exists()
-    async with maker() as s2:
-        s2.add(Series(title="Other", folder_name="Tracked", root_folder_id=root_id, chapters=[
-            Chapter(number=1, downloaded=True, file_path=str(dest)),
-        ]))
-        await s2.commit()
-    await asyncio.sleep(0.05)
-    task.cancel()  # e.g. shutdown
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    metadata_issues.manual_archive_lock.release()
-    assert dest.exists(), "volume archive another series maps was deleted"
-
-
-async def test_merge_cleanup_does_not_queue_behind_a_woken_lock_waiter(repair_db, monkeypatch):
-    from mangarr import metadata_issues
-
-    session, _, series, path = repair_db
-    second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
-    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
-    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
-    for number, volume, file_path in ((2, 1, second), (3, 2, later)):
-        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(file_path)))
-    for chapter in series.chapters:
-        chapter.file_source = "alpha"
-    await session.commit()
-    await session.refresh(series, ["extra_folders"])
-    lock = metadata_issues.manual_archive_lock
-    load = metadata_issues.load_archive_ownership
-    calls = []
-
-    async def other_holder():
-        async with lock:  # e.g. a scan or repair, queued behind the merge
-            for _ in range(5):
-                await asyncio.sleep(0)
+    session, series, path, second, dest, staged = await _merge_setup(repair_db)
+    load, seen = metadata_issues.load_archive_ownership, []
 
     async def ownership(db):
-        calls.append(1)
-        if len(calls) == 2:
-            other.append(asyncio.create_task(other_holder()))
-            while not getattr(lock, "_waiters", None):
-                await asyncio.sleep(0)
-            raise RuntimeError("publish failed")
+        if staged.exists():
+            # Packed but unpublished: a scan right now finds nothing to adopt.
+            seen.append((dest.exists(), staged in {m.path for m in find_media_files(dest.parent)}))
         return await load(db)
 
-    other = []
     monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
-    async with asyncio.timeout(5):
-        with pytest.raises(RuntimeError):
-            await tasks.merge_complete_volumes(session, series, {}, force=True)
-        await other[0]
-    # The failure released the lock to the queued holder; cleanup kept the
-    # file instead of waiting behind it for another ownership check.
-    assert len(calls) == 2
-    assert path.with_name("Tracked - Vol. 01.cbz").exists()
+    assert await tasks.merge_complete_volumes(session, series, {}, force=True) == [1]
+    assert seen == [(False, False)]
+    assert dest.exists() and not staged.exists() and not path.exists()
+
+
+async def test_merge_retry_replaces_a_staging_leftover(repair_db):
+    session, series, path, second, dest, staged = await _merge_setup(repair_db)
+    staged.write_bytes(b"left by an interrupted merge")
+    assert await tasks.merge_complete_volumes(session, series, {}, force=True) == [1]
+    assert dest.exists() and not staged.exists()
+
+
+async def test_merge_never_replaces_a_volume_that_appears_while_packing(repair_db, monkeypatch):
+    session, series, path, second, dest, staged = await _merge_setup(repair_db)
+    pack = tasks.merge_chapter_archives
+
+    def packing(*args, **kwargs):
+        pack(*args, **kwargs)
+        dest.write_bytes(b"the user's own volume")
+
+    monkeypatch.setattr(tasks, "merge_chapter_archives", packing)
+    assert await tasks.merge_complete_volumes(session, series, {}, force=True) == []
+    assert dest.read_bytes() == b"the user's own volume"
+    assert path.exists() and second.exists() and not staged.exists()
+
+
+async def test_failed_merge_commit_removes_the_published_volume(repair_db, monkeypatch):
+    session, series, path, second, dest, staged = await _merge_setup(repair_db)
+    commit = session.commit
+
+    async def failing_commit():
+        monkeypatch.setattr(session, "commit", commit)
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(session, "commit", failing_commit)
+    with pytest.raises(RuntimeError):
+        await tasks.merge_complete_volumes(session, series, {}, force=True)
+    assert not dest.exists() and not staged.exists()
+    assert path.exists() and second.exists()
+

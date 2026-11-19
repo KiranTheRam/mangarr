@@ -12,7 +12,9 @@ from sqlalchemy.orm import selectinload
 from starlette.concurrency import run_in_threadpool
 
 from .. import settings_service
-from ..comicinfo import ArchiveChanged, ComicInfoError, ComicInfoMetadata, update_comicinfo
+from ..comicinfo import (
+    ArchiveChanged, ComicInfoError, ComicInfoMetadata, parse_comicinfo_int, update_comicinfo,
+)
 from ..db import get_session
 from ..jobs.tasks import series_lock
 from ..metadata_issues import (
@@ -65,15 +67,33 @@ async def _inspect(
         raise HTTPException(400, "Chapter file is not available") from exc
 
 
+def _normalized(value: str | int | None) -> str | None:
+    return " ".join(str(value).split()) or None if value is not None else None
+
+
 async def _write_archive(
     series: Series, chapter: Chapter, path: Path, current: ComicInfoMetadata,
     updates: dict[str, str | int | None],
 ) -> ComicInfoMetadata:
     value = updates.get("number", current.number)
     number = str(value) if value is not None else None
+    tracked_numbers = {item.number for item in series.chapters if not item.excluded}
+    disputed = filename_conflicts_with_mapping(chapter, path, tracked_numbers)
+    if disputed:
+        # The archive may belong to another chapter (or series), so only
+        # archive-intrinsic edits are safe: removing an invalid Volume tag is.
+        for field in ("series", "volume"):
+            if field not in updates or _normalized(updates[field]) == _normalized(getattr(current, field)):
+                continue
+            if field == "volume" and updates[field] is None and parse_comicinfo_int(current.volume) is None:
+                continue
+            raise HTTPException(
+                409,
+                "The filename identifies a different tracked chapter. Correct the file mapping "
+                f"or rename the archive before changing ComicInfo {field.title()}.",
+            )
     if number != current.number:
-        tracked_numbers = {item.number for item in series.chapters if not item.excluded}
-        if filename_conflicts_with_mapping(chapter, path, tracked_numbers):
+        if disputed:
             raise HTTPException(
                 409,
                 "The filename identifies a different tracked chapter. Correct the file mapping "

@@ -189,3 +189,35 @@ async def test_retry_reuses_the_staging_path_a_crash_could_leave(db_session, tmp
     assert first == second
     assert first.name == f".mangarr-direct-{dl.id}.staged"
     assert not list(first.parent.glob(".mangarr-direct-*"))
+
+
+async def test_download_refuses_to_replace_a_file_another_series_maps(db_session, tmp_path, monkeypatch):
+    from mangarr import settings_service
+
+    dl = await _make_download(db_session, tmp_path)
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    series = await db_session.get(Series, dl.series_id)
+    chapter = await db_session.get(Chapter, dl.chapter_id)
+    defaults = settings_service.DEFAULTS
+    dest = tasks.chapter_path(
+        tmp_path, defaults["naming_template"], defaults["naming_template_no_volume"],
+        series.title, series.folder_name, chapter.number, chapter.volume, chapter.title,
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"another series' archive")
+    db_session.add(Series(
+        title="Other", sort_title="other", folder_name="Other", root_folder_id=series.root_folder_id,
+        chapters=[Chapter(number=5.0, downloaded=True, file_path=str(dest))],
+    ))
+    await db_session.commit()
+
+    async def unexpected(*_args, **_kwargs):
+        raise AssertionError("the download must not start")
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", unexpected)
+    await tasks._run_direct_download(db_session, dl)
+    await db_session.refresh(dl)
+
+    assert dl.status == DownloadStatus.FAILED
+    assert "mapped by another chapter" in dl.error
+    assert dest.read_bytes() == b"another series' archive"

@@ -807,6 +807,7 @@ async def resync_volumes(
             assigned, changed, repointed, cleared, _ = _run_resync(
                 series, _active_chapters(series), volume_map, map_sources
             )
+            await _reconcile_issues(session, series)
             await session.commit()
         return VolumeResyncOut(
             has_data=True, assigned=assigned, changed=changed,
