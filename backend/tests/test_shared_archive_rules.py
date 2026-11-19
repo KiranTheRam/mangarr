@@ -422,3 +422,40 @@ async def test_failed_merge_publish_removes_the_unreferenced_volume(repair_db, m
 
     assert not path.with_name("Tracked - Vol. 01.cbz").exists()
     assert path.exists() and second.exists()
+
+
+async def test_cancelled_merge_keeps_a_volume_another_series_adopted(repair_db):
+    from mangarr import metadata_issues
+    session, maker, series, path = repair_db
+    second = path.with_name("Tracked Ch. 2.cbz")
+    later = path.with_name("Tracked Ch. 3.cbz")
+    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
+    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
+    for number, volume, fp in ((2, 1, second), (3, 2, later)):
+        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(fp)))
+    for c in series.chapters:
+        c.file_source = "alpha"
+    await session.commit()
+    await session.refresh(series, ["extra_folders"])
+    dest = path.with_name("Tracked - Vol. 01.cbz")
+    root_id = series.root_folder_id
+
+    # Another series' scan holds the archive lock and adopts the new volume.
+    await metadata_issues.manual_archive_lock.acquire()
+    task = asyncio.create_task(tasks.merge_complete_volumes(session, series, {}, force=True))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if dest.exists():
+            break
+    assert dest.exists()
+    async with maker() as s2:
+        s2.add(Series(title="Other", folder_name="Tracked", root_folder_id=root_id, chapters=[
+            Chapter(number=1, downloaded=True, file_path=str(dest)),
+        ]))
+        await s2.commit()
+    await asyncio.sleep(0.05)
+    task.cancel()  # e.g. shutdown
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    metadata_issues.manual_archive_lock.release()
+    assert dest.exists(), "volume archive another series maps was deleted"

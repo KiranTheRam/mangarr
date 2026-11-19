@@ -2168,6 +2168,31 @@ def _owned_only_by(chapters: list[Chapter], ownership, *extra: Path) -> bool:
     return True
 
 
+async def _discard_unpublished_volume(session: AsyncSession, dest: Path) -> None:
+    """Remove a packed volume no chapter maps; keep it when that cannot be shown.
+
+    A scan may adopt the new archive while the merge waits for the archive
+    lock, so it is deleted only after an ownership check under that lock.
+    Cleanup never waits for the lock (shutdown may be cancelling the holder);
+    a free asyncio lock is acquired without suspending.
+    """
+    from ..metadata_issues import load_archive_ownership, manual_archive_lock
+
+    if manual_archive_lock.locked():
+        log.warning("keeping unpublished volume %s: ownership cannot be checked now", dest)
+        return
+    try:
+        async with manual_archive_lock:
+            await session.rollback()
+            if _owned_only_by([], await load_archive_ownership(session), dest):
+                dest.unlink(missing_ok=True)
+                return
+    except BaseException as exc:  # noqa: BLE001 - cleanup must not mask the original failure
+        log.warning("keeping unpublished volume %s: ownership could not be checked (%s)", dest, exc)
+        return
+    log.warning("keeping unpublished volume %s: another chapter maps it", dest)
+
+
 async def merge_complete_volumes(
     session: AsyncSession, series: Series, values: dict[str, str], force: bool = False,
 ) -> list[int]:
@@ -2255,7 +2280,7 @@ async def merge_complete_volumes(
             # Failing or being cancelled between packing and publishing must
             # not leave an unreferenced volume that blocks every later merge.
             if not published:
-                dest.unlink(missing_ok=True)
+                await _discard_unpublished_volume(session, dest)
             raise
         merged.append(volume)
     if merged:
