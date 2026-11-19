@@ -65,3 +65,59 @@ async def test_number_repair_preserves_rounded_filename_fallback(repair_db):
     assert scan.added_chapters == 0
     assert chapter.file_path == str(path)
     assert [item.number for item in series.chapters] == [370.371]
+
+
+@pytest.mark.parametrize(
+    "volume,source,embedded_volume,expected_kind",
+    [
+        (1, "viz", 2, "comicinfo_volume_mismatch"),
+        (None, "", 2, "comicinfo_volume_unexpected"),
+        (1, "disk-inferred", 1, "comicinfo_volume_isolated"),
+    ],
+)
+async def test_mapping_conflict_invalidates_volume_recommendation(
+    repair_db, volume, source, embedded_volume, expected_kind,
+):
+    session, _, series, original_path = repair_db
+    chapter = series.chapters[0]
+    chapter.volume = volume
+    chapter.volume_source = source
+    original_path.unlink()
+    path = original_path.with_name("Tracked Ch. 2.cbz")
+    archive(path, f"<ComicInfo><Number>2</Number><Volume>{embedded_volume}</Volume></ComicInfo>")
+    if expected_kind == "comicinfo_volume_isolated":
+        peer = path.with_name("Tracked Ch. 3.cbz")
+        archive(peer, "<ComicInfo><Number>3</Number></ComicInfo>")
+        series.chapters.append(Chapter(number=3, volume=1, downloaded=True, file_path=str(peer)))
+    await session.commit()
+    await library_api.map_file(series.id, FileMapIn(chapter_id=chapter.id, file_path=str(path)), session)
+    await issues_api.scan_issues(session)
+    warnings = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    prior = next(warning for warning in warnings if warning.field == "volume")
+    assert prior.kind == expected_kind
+
+    series.chapters.append(Chapter(number=2, volume=embedded_volume))
+    await session.commit()
+    before = path.read_bytes()
+    with pytest.raises(HTTPException, match="issue changed") as stale:
+        await issues_api.resolve_issue(prior.id, IssueResolveIn(revision=prior.revision), session)
+    assert stale.value.status_code == 409
+    assert path.read_bytes() == before
+    assert await issues_api.list_issues(ignored=False, series_id=series.id, session=session) == []
+
+
+async def test_conflicting_mapping_still_reports_invalid_volume_syntax(repair_db):
+    session, _, series, path = repair_db
+    series.chapters[0].file_path = str(path.with_name("Tracked Ch. 2.cbz"))
+    path = path.rename(series.chapters[0].file_path)
+    archive(path, "<ComicInfo><Number>2</Number><Volume>2.0</Volume></ComicInfo>")
+    series.chapters.append(Chapter(number=2, volume=2))
+    await session.commit()
+
+    await issues_api.scan_issues(session)
+    [issue] = await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    assert issue.kind == "comicinfo_volume_invalid"
+    await issues_api.resolve_issue(issue.id, IssueResolveIn(revision=issue.revision), session)
+    info = read_comicinfo(path)
+    assert info.number == "2"
+    assert info.volume is None

@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Iterable
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import NamedTuple
 
@@ -245,15 +246,10 @@ async def _change_root_folder(
 
     Returns whether files moved. A MoveError leaves the root and files in place.
     """
-    if not body.move_files:
-        _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
-        if series.root_folder_id == new_root.id:
-            return False
-        if series.root_folder is not None:
-            anchor_extra_folders(series, Path(series.root_folder.path))
-        series.root_folder = new_root
-        return False
-    lock = await try_acquire_series_lock(series.id)
+    lock = (
+        await try_acquire_series_lock(series.id)
+        if body.move_files else await acquire_series_lock(series.id)
+    )
     if lock is None:
         _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
         if series.root_folder_id == new_root.id:
@@ -261,7 +257,7 @@ async def _change_root_folder(
         raise MoveError("the series is refreshing; try again once it finishes")
     try:
         async with manual_archive_lock:
-            # Defer writes from bulk monitoring edits until the move commits.
+            # Defer writes from bulk monitoring edits until the root change commits.
             with session.no_autoflush:
                 # The bulk editor's preloaded paths can predate a rename or a
                 # scan. Re-read the series and its mappings before changing them.
@@ -279,8 +275,11 @@ async def _change_root_folder(
                 _apply_monitoring(current, body.monitored, body.monitor_mode, body.monitor_from)
                 if current.root_folder_id == new_root.id:
                     return False
-                if current.root_folder is None:
+                if not body.move_files or current.root_folder is None:
+                    if current.root_folder is not None:
+                        anchor_extra_folders(current, Path(current.root_folder.path))
                     current.root_folder = new_root
+                    await session.commit()
                     return False
                 in_flight = await session.scalar(
                     select(Download.id).where(
@@ -442,13 +441,14 @@ def _apply_title_preference(series: Series, preference: str) -> bool:
 @router.post("/apply-title-preference", response_model=ApplyTitlePreferenceOut)
 async def apply_title_preference(session: AsyncSession = Depends(get_session)):
     """Apply the preferred title language to all unlocked series."""
-    # Serialize with edits and refreshes before reading title locks.
-    await session.execute(text("BEGIN IMMEDIATE"))
-    values = await settings_service.get_all(session)
-    pref = values.get("preferred_title_language", "provider")
-    unlocked = await session.scalars(select(Series).where(Series.title_locked.is_(False)))
-    changed = sum(_apply_title_preference(series, pref) for series in unlocked)
-    await session.commit()
+    async with manual_archive_lock:
+        # Serialize with edits and refreshes before reading title locks.
+        await session.execute(text("BEGIN IMMEDIATE"))
+        values = await settings_service.get_all(session)
+        pref = values.get("preferred_title_language", "provider")
+        unlocked = await session.scalars(select(Series).where(Series.title_locked.is_(False)))
+        changed = sum(_apply_title_preference(series, pref) for series in unlocked)
+        await session.commit()
     return ApplyTitlePreferenceOut(count=changed, updated=changed)
 
 
@@ -456,6 +456,21 @@ async def apply_title_preference(session: AsyncSession = Depends(get_session)):
 async def update_series(
     series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
 ):
+    changes_layout = body.root_folder_id is not None or body.folder_name is not None
+    async with AsyncExitStack() as locks:
+        if changes_layout:
+            await locks.enter_async_context(series_lock(series_id))
+        if changes_layout or body.title is not None or body.title_locked is not None:
+            # A repair uses both the library layout and title to validate its
+            # recommendation. Acquire archive locks before SQLite's write lock.
+            await locks.enter_async_context(manual_archive_lock)
+        await _apply_series_edit(series_id, body, session)
+    return await get_series(series_id, session)
+
+
+async def _apply_series_edit(
+    series_id: int, body: SeriesUpdateIn, session: AsyncSession,
+) -> None:
     new_title = body.title.strip() if body.title is not None else None
     if new_title == "":
         raise HTTPException(422, "Title cannot be empty")
@@ -516,7 +531,6 @@ async def update_series(
     if body.folder_pinned is not None:
         series.folder_pinned = body.folder_pinned
     await session.commit()
-    return await get_series(series_id, session)
 
 
 @router.delete("/{series_id}", status_code=204)

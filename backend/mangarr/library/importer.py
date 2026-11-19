@@ -27,6 +27,8 @@ from .naming import chapter_filename, series_folder, volume_filename
 
 log = logging.getLogger(__name__)
 
+ArchiveRevision = tuple[int, int, int, int]
+
 _SEASON_EPISODE = re.compile(
     r"(?:\bseason\s*|\bs\s*)(\d+)\b.*?\b(?:episode|ep)\.?\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
@@ -76,20 +78,37 @@ def _validate_existing(dest: Path) -> None:
             raise ValueError(f"Existing library archive is damaged; repair or remove it before retrying: {dest}") from exc
 
 
-def place_file(src: Path, dest: Path, mode: str) -> None:
+def _archive_revision(path: Path) -> ArchiveRevision:
+    stat = path.stat()
+    # A new hardlink updates ctime without changing the archive bytes.
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _require_archive_revision(path: Path, expected: ArchiveRevision | None) -> None:
+    if expected is not None and _archive_revision(path) != expected:
+        raise FileNotFoundError(f"torrent archive changed while importing: {path}")
+
+
+def place_file(src: Path, dest: Path, mode: str, *, revision: ArchiveRevision | None = None) -> None:
     """Put a payload file into the library. Hardlink mode keeps the torrent
     seeding without doubling disk use; it needs src and dest on one
     filesystem, so cross-device (and any other) failure falls back to copy."""
     if mode == "hardlink":
         try:
-            os.link(src, dest)
+            with _atomic_destination(dest, keep_mode=True) as temporary:
+                temporary.unlink()
+                os.link(src, temporary)
+                _require_archive_revision(src, revision)
             log.info("Hardlinked %s -> %s", src.name, dest)
             return
+        except FileNotFoundError:
+            raise
         except OSError as exc:
             log.warning("hardlink %s -> %s failed (%s); copying instead",
                         src.name, dest, exc)
     with _atomic_destination(dest, keep_mode=True) as temporary:
         shutil.copy2(src, temporary)
+        _require_archive_revision(src, revision)
         if temporary.stat().st_size != src.stat().st_size:
             raise OSError("Incomplete library copy")
     log.info("Imported %s -> %s", src.name, dest)
@@ -231,6 +250,9 @@ def import_torrent_payload(
     folder.mkdir(parents=True, exist_ok=True)
     imported: list[tuple[Path, Chapter | None, int | None]] = []
     media = find_media_files(content_path, only)
+    # Capture archive identity before matching can read its ComicInfo. An
+    # external payload can become an editable library file during an import.
+    revisions = {item.path: _archive_revision(item.path) for item in media if not item.is_dir}
     _preflight_numbering(media)
     result = match_files(media, chapters)
     _preflight_duplicates(result, chapters)
@@ -268,11 +290,12 @@ def import_torrent_payload(
         dest = destination(media, chapter, volume)
         if dest == media.path or dest.exists():
             _validate_existing(dest)
+            _require_archive_revision(media.path, revisions.get(media.path))
         else:
             if media.is_dir:
                 _pack_images(media.path, dest, only)
             else:
-                place_file(media.path, dest, import_mode)
+                place_file(media.path, dest, import_mode, revision=revisions[media.path])
         imported.append((dest, chapter, volume if chapter is None else None))
 
     for mf in result.matched:

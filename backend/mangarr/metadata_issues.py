@@ -226,8 +226,8 @@ def find_candidates(
                     raise ownership.unavailable[chapter.file_path]
                 resolved, info = _inspect_chapter_archive(series, chapter, folders, ownership)
                 offset = _archive_volume_offset(resolved, folder_offsets)
-                number_conflict = filename_conflicts_with_mapping(chapter, resolved, tracked_numbers)
-                files.append((chapter, Path(chapter.file_path), info, offset, number_conflict))
+                mapping_conflict = filename_conflicts_with_mapping(chapter, resolved, tracked_numbers)
+                files.append((chapter, Path(chapter.file_path), info, offset, mapping_conflict))
             except FileNotFoundError:
                 # An accessible parent lets us distinguish a deleted archive
                 # from a missing mount. A configured extra may be its own mount.
@@ -245,11 +245,11 @@ def find_candidates(
     uncertain_volume_sources = {"", "legacy", "disk-inferred", "comicinfo"}
     valid_titles = _archive_title_keys(series)
 
-    for chapter, path, info, offset, number_conflict in files:
+    for chapter, path, info, offset, mapping_conflict in files:
         if not info.exists:
             continue
         number = _numeric(info.number)
-        if not number_conflict and info.number is not None and (
+        if not mapping_conflict and info.number is not None and (
             number is None or not math.isclose(number, chapter.number, abs_tol=1e-6)
         ):
             chapter_number = float(chapter.number)
@@ -301,6 +301,9 @@ def find_candidates(
                     "tag keeps the chapter available without inventing a volume.",
                     info.revision,
                 ))
+            elif mapping_conflict:
+                # A valid tag cannot be compared against an uncertain chapter.
+                continue
             elif chapter.volume is None and offset == 0:
                 candidates.append(Candidate(
                     chapter.id, "comicinfo_volume_unexpected", str(path), "volume",
@@ -328,10 +331,10 @@ def find_candidates(
     # catches imported one-off bonus chapters without pretending disk-inferred
     # assignments are authoritative enough to validate the bad tag.
     by_volume: dict[int, list[tuple[Chapter, Path, ComicInfoMetadata]]] = {}
-    for chapter, path, info, offset, _ in files:
+    for chapter, path, info, offset, mapping_conflict in files:
         # Siblings in differently numbered editions do not establish whether
         # a volume tag is isolated in the archive's physical edition.
-        if chapter.volume is not None and offset == 0:
+        if not mapping_conflict and chapter.volume is not None and offset == 0:
             by_volume.setdefault(chapter.volume, []).append((chapter, path, info))
     for volume, peers in by_volume.items():
         declared = [item for item in peers if item[2].volume is not None]

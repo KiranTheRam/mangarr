@@ -12,7 +12,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from mangarr.api import issues as issues_api, library as library_api, series as series_api
+from mangarr.api import system as system_api
 from mangarr.comicinfo import read_comicinfo
+from mangarr.jobs import tasks
 from mangarr.models import (
     Base,
     Chapter,
@@ -22,8 +24,12 @@ from mangarr.models import (
     RootFolder,
     Series,
     SeriesFolder,
+    Setting,
 )
-from mangarr.schemas import IssueResolveIn, RenameApplyIn, SeriesBulkIn, SeriesBulkRefreshIn, SeriesEditorIn
+from mangarr.schemas import (
+    ComicInfoUpdateIn, IssueResolveIn, RenameApplyIn, SeriesBulkIn, SeriesBulkRefreshIn,
+    SeriesEditorIn, SeriesUpdateIn,
+)
 
 
 @pytest.fixture
@@ -95,6 +101,108 @@ async def test_root_change_without_move_keeps_files_and_extra_folders_in_place(s
     assert a.root_folder_id == new_root.id
     # the relative extra folder still means the directory in the old root
     assert a.extra_folders[0].path == str(old / "Alpha Volumes")
+
+
+@pytest.mark.parametrize("change", ["root", "folder", "bulk_root", "delete_root", "title", "bulk_title"])
+async def test_primary_layout_and_title_edits_wait_for_archive_repairs(tmp_path, roots, monkeypatch, change):
+    old, new = roots
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'layout.db'}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    archive_lock = asyncio.Lock()
+    monkeypatch.setattr(tasks, "_SERIES_LOCKS", {})
+    monkeypatch.setattr(series_api, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(issues_api, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(system_api, "manual_archive_lock", archive_lock)
+    started, release, editing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_write = issues_api._write_archive
+
+    async def pause_write(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original_write(*args, **kwargs)
+
+    monkeypatch.setattr(issues_api, "_write_archive", pause_write)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with maker() as setup:
+            new_root = RootFolder(path=str(new))
+            setup.add(new_root)
+            series = await _add(setup, "Alpha", RootFolder(path=str(old)), numbers=(1,))
+            series_id, old_root_id = series.id, series.root_folder_id
+            new_root_id, chapter_id = new_root.id, series.chapters[0].id
+            folder = old / "Alpha"
+            folder.mkdir()
+            path = folder / "Ch 1.cbz"
+            with ZipFile(path, "w") as archive:
+                archive.writestr("001.jpg", b"page")
+                archive.writestr("ComicInfo.xml", "<ComicInfo><Number>1</Number></ComicInfo>")
+            chapter = series.chapters[0]
+            chapter.file_path, chapter.downloaded = str(path), True
+            if change == "bulk_title":
+                series.title_native = "物語"
+                setup.add(Setting(key="preferred_title_language", value="native"))
+            await setup.commit()
+            info = await issues_api.get_chapter_comicinfo(series_id, chapter_id, setup)
+
+        async def edit():
+            async with maker() as session:
+                editing.set()
+                if change == "bulk_root":
+                    return await _edit(session, series_ids=[series_id], root_folder_id=new_root_id)
+                if change == "bulk_title":
+                    return await series_api.apply_title_preference(session)
+                if change == "delete_root":
+                    return await system_api.delete_root_folder(old_root_id, session)
+                fields = {
+                    "root": {"root_folder_id": new_root_id},
+                    "folder": {"folder_name": "Other Folder"},
+                    "title": {"title": "New Title"},
+                }[change]
+                return await series_api.update_series(series_id, SeriesUpdateIn(**fields), session)
+
+        async def repair():
+            async with maker() as session:
+                return await issues_api.update_chapter_comicinfo(
+                    series_id, chapter_id, ComicInfoUpdateIn(title="Chapter Title", revision=info.revision),
+                    session,
+                )
+
+        async with asyncio.timeout(10):
+            repairing = asyncio.create_task(repair())
+            await started.wait()
+            updating = asyncio.create_task(edit())
+            await editing.wait()
+            try:
+                done, _ = await asyncio.wait({updating}, timeout=0.05)
+                assert not done
+            finally:
+                release.set()
+                repaired, result = await asyncio.gather(repairing, updating)
+        assert repaired.title == read_comicinfo(path).title == "Chapter Title"
+        if change == "bulk_root":
+            assert result.updated == 1 and result.moved == 0 and not result.problems
+        elif change == "title":
+            assert result.title == "New Title"
+        elif change == "bulk_title":
+            assert result.updated == 1
+        elif change == "root":
+            assert result.root_folder_id == new_root_id
+        elif change == "delete_root":
+            assert result is None
+        else:
+            assert result.folder_name == "Other Folder"
+        async with maker() as check:
+            if change == "bulk_title":
+                assert (await check.get(Series, series_id)).title == "物語"
+            elif change != "title":
+                if change == "delete_root":
+                    assert (await check.get(Series, series_id)).root_folder_id is None
+                with pytest.raises(HTTPException, match="outside the series folders") as err:
+                    await issues_api.get_chapter_comicinfo(series_id, chapter_id, check)
+                assert err.value.status_code == 400
+    finally:
+        await engine.dispose()
 
 
 async def test_move_carries_the_folder_and_repoints_chapters(session, roots):

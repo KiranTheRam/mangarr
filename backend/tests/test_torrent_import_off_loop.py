@@ -11,9 +11,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr import comicinfo, metadata_issues
-from mangarr.api import issues
+from mangarr.api import issues, library
 from mangarr.download.cbz import write_cbz
 from mangarr.jobs import tasks
+from mangarr.library import importer
 from mangarr.models import (
     Base,
     Chapter,
@@ -25,7 +26,7 @@ from mangarr.models import (
     Series,
     SeriesFolder,
 )
-from mangarr.schemas import ComicInfoUpdateIn
+from mangarr.schemas import ComicInfoUpdateIn, FileMapIn, SeriesFolderIn
 
 VALUES = {
     "naming_template": "{series} - Ch. {chapter:04.1f}",
@@ -205,6 +206,75 @@ async def test_torrent_import_waits_for_repair_before_adopting_shared_archive(
     assert by_number[1].downloaded
     assert comicinfo.read_comicinfo(Path(by_number[1].file_path)).number == "1"
     assert not by_number[2].downloaded and not by_number[2].file_path
+
+
+@pytest.mark.parametrize("mode", ["copy", "hardlink"])
+async def test_torrent_import_retries_when_new_extra_folder_archive_changes(
+    two_sessions, tmp_path, monkeypatch, mode,
+):
+    sync_session, api_session, notified = two_sessions
+    archive_lock = asyncio.Lock()
+    monkeypatch.setattr(issues, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(library, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(metadata_issues, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(tasks, "_SERIES_LOCKS", {})
+    monkeypatch.setattr(tasks, "_import_path_missing_counts", {})
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    source = tmp_path / "payload" / "Bonus Story.cbz"
+    write_cbz(source, [b"\xff\xd8\xffimage"], "<ComicInfo><Number>2</Number></ComicInfo>")
+    first = Series(title="First", root_folder=RootFolder(path=str(first_root)), chapters=[Chapter(number=1)])
+    second = Series(title="Second", folder_name="Second", root_folder=RootFolder(path=str(second_root)),
+                    chapters=[Chapter(number=1), Chapter(number=2)])
+    sync_session.add_all([first, second])
+    await sync_session.flush()
+    download = Download(series_id=second.id, kind=DownloadKind.TORRENT, status=DownloadStatus.IMPORTING)
+    sync_session.add(download)
+    await sync_session.commit()
+
+    values = dict(VALUES, import_mode=mode)
+    ready = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    place_file = importer.place_file
+
+    def pause_place(*args, **kwargs):
+        loop.call_soon_threadsafe(ready.set)
+        assert release.wait(timeout=8)
+        return place_file(*args, **kwargs)
+
+    monkeypatch.setattr(importer, "place_file", pause_place)
+
+    async def run_import():
+        async with tasks.series_lock(second.id):
+            await tasks._import_torrent(sync_session, download, source, values, files=[source])
+
+    importing = asyncio.create_task(run_import())
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        await library.add_folder(first.id, SeriesFolderIn(path=str(source.parent)), api_session)
+        chapter_id = first.chapters[0].id
+        await library.map_file(first.id, FileMapIn(file_path=str(source), chapter_id=chapter_id), api_session)
+        before = await issues.get_chapter_comicinfo(first.id, chapter_id, api_session)
+        await issues.update_chapter_comicinfo(
+            first.id, chapter_id, ComicInfoUpdateIn(revision=before.revision, number="1"), api_session,
+        )
+    finally:
+        release.set()
+        await importing
+
+    assert download.status == DownloadStatus.DOWNLOADING
+    assert "archive changed while importing" in download.error
+    assert not any(chapter.downloaded for chapter in second.chapters)
+    assert list((second_root / second.folder_name).iterdir()) == []
+    assert not notified
+
+    await run_import()
+    assert download.status == DownloadStatus.DONE
+    first_chapter, second_chapter = sorted(second.chapters, key=lambda chapter: chapter.number)
+    assert first_chapter.downloaded and not second_chapter.downloaded
+    assert comicinfo.read_comicinfo(Path(first_chapter.file_path)).number == "1"
 
 
 @pytest.mark.parametrize("outcome", ["imported", "payload deleted", "failed"])
