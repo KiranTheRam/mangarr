@@ -507,8 +507,7 @@ async def apply_title_preference(session: AsyncSession = Depends(get_session)):
     # Series recommendations compare against the title; refresh them per
     # series in lock order (series lock, then archive lock).
     for series_id in retitled:
-        async with series_lock(series_id), manual_archive_lock:
-            await _refresh_issues(session, series_id)
+        await _refresh_issues_when_free(session, series_id)
     return ApplyTitlePreferenceOut(count=len(retitled), updated=len(retitled))
 
 
@@ -517,17 +516,44 @@ async def update_series(
     series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
 ):
     changes_layout = body.root_folder_id is not None or body.folder_name is not None
-    changes_repair_inputs = changes_layout or body.title is not None or body.title_locked is not None
+    changes_title = body.title is not None or body.title_locked is not None
     async with AsyncExitStack() as locks:
-        if changes_repair_inputs:
+        if changes_layout:
+            await locks.enter_async_context(series_lock(series_id))
+        if changes_layout or changes_title:
             # A repair uses both the library layout and title to validate its
             # recommendation. Acquire archive locks before SQLite's write lock.
-            await locks.enter_async_context(series_lock(series_id))
             await locks.enter_async_context(manual_archive_lock)
         await _apply_series_edit(series_id, body, session)
-        if changes_repair_inputs:
+        if changes_layout:
             await _refresh_issues(session, series_id)
+    if changes_title and not changes_layout:
+        # A title edit must not wait behind a refresh holding the series.
+        await _refresh_issues_when_free(session, series_id)
     return await get_series(series_id, session)
+
+
+_issue_refreshes: set[asyncio.Task] = set()
+
+
+async def _refresh_issues_when_free(session: AsyncSession, series_id: int) -> None:
+    """Refresh warnings now if the series is idle, else once its holder finishes."""
+    lock = series_lock(series_id)
+    if not (lock.locked() or getattr(lock, "_waiters", None)):
+        async with lock, manual_archive_lock:
+            await _refresh_issues(session, series_id)
+        return
+
+    async def later() -> None:
+        try:
+            async with series_lock(series_id), manual_archive_lock, session_scope() as background:
+                await _refresh_issues(background, series_id)
+        except Exception:
+            log.exception("refreshing metadata issues for series %d failed", series_id)
+
+    task = asyncio.get_running_loop().create_task(later())
+    _issue_refreshes.add(task)
+    task.add_done_callback(_issue_refreshes.discard)
 
 
 async def _refresh_issues(session: AsyncSession, series_id: int) -> None:

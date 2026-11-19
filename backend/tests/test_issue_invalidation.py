@@ -125,3 +125,26 @@ async def test_chapter_volume_edit_refreshes_volume_recommendations(repair_db):
     )
 
     assert await _warnings(session, series.id) == []
+
+
+async def test_title_edit_does_not_wait_behind_a_refresh(repair_db):
+    import asyncio
+
+    from mangarr.api import series as series_api
+    from mangarr.comicinfo import update_comicinfo
+    from mangarr.schemas import SeriesUpdateIn
+
+    session, _, series, path = repair_db
+    update_comicinfo(path, {"series": "Renamed Series"})
+    await issues_api.scan_issues(session)
+    lock = series_api.series_lock(series.id)
+    await lock.acquire()  # a refresh holds the series through slow source fetches
+    try:
+        async with asyncio.timeout(5):
+            await series_api.update_series(series.id, SeriesUpdateIn(title="Renamed Series"), session)
+        assert "series" in {w.field for w in await _warnings(session, series.id)}  # refreshed later
+    finally:
+        lock.release()
+    async with asyncio.timeout(5):
+        await asyncio.gather(*list(series_api._issue_refreshes))
+    assert [w.field for w in await _warnings(session, series.id)] == ["volume"]
