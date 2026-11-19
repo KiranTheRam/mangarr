@@ -16,6 +16,8 @@ DEFAULT_IMPORT_LIST_HOURS = 6
 
 
 async def start() -> None:
+    from ..api.series import resume_pending_deletions
+
     async with session_scope() as session:
         raw = await settings_service.get(session, "monitor_interval_minutes")
         raw_lists = await settings_service.get(session, "import_list_sync_hours")
@@ -35,7 +37,12 @@ async def start() -> None:
     # downloads interrupted by the previous shutdown would otherwise be
     # stranded in a state the queue worker never picks up
     await recover_interrupted_downloads()
+    await resume_pending_deletions()
 
+    scheduler.add_job(
+        resume_pending_deletions, "interval", minutes=1,
+        id="series_deletions", max_instances=1, coalesce=True,
+    )
     scheduler.add_job(
         process_direct_queue, "interval", seconds=10,
         id="direct_queue", max_instances=1, coalesce=True,

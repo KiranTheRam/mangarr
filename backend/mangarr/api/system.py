@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import __version__
 from ..db import get_session
+from ..metadata_issues import manual_archive_lock
 from ..models import Chapter, Download, DownloadStatus, RootFolder, Series
 from ..schemas import RootFolderIn, RootFolderOut, SystemStatus, WantedItemOut
 
@@ -111,8 +112,9 @@ async def add_root_folder(body: RootFolderIn, session: AsyncSession = Depends(ge
 
 @router.delete("/rootfolders/{folder_id}", status_code=204)
 async def delete_root_folder(folder_id: int, session: AsyncSession = Depends(get_session)):
-    folder = await session.get(RootFolder, folder_id)
-    if folder is None:
-        raise HTTPException(404, "Root folder not found")
-    await session.delete(folder)
-    await session.commit()
+    async with manual_archive_lock:
+        folder = await session.get(RootFolder, folder_id)
+        if folder is None:
+            raise HTTPException(404, "Root folder not found")
+        await session.delete(folder)
+        await session.commit()

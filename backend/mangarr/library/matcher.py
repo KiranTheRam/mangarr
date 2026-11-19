@@ -6,20 +6,29 @@ volume number matches the metadata edition. Archive directories and ComicInfo
 titles are cached per file version; page images are never read or written."""
 
 import json
+import os
+import stat
+import threading
 import zipfile
 import zlib
-from collections.abc import Iterable
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
 from pathlib import Path
+from typing import Any, TypeVar
 from xml.etree import ElementTree
 
 from ..filename import FilenameCoverage, parse_filename
 from ..models import Chapter
 from ..util import has_chapter_marker, parse_chapter_number
+from .archive_members import (
+    IMAGE_EXTS, MAX_COMICINFO_BYTES, ArchiveVersion, archive_files, archive_pages, archive_version,
+    find_comicinfo_member,
+)
+
+T = TypeVar("T")
 
 ARCHIVE_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z"}
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 SIDECAR_IMAGE_STEMS = {
     "banner", "cover", "fanart", "folder", "poster", "thumb", "thumbnail",
 }
@@ -98,81 +107,118 @@ def _media_of(path: Path, is_dir: bool) -> MediaFile:
     return MediaFile(path, is_dir, parsed.chapter_number, parsed.volume_number, parsed)
 
 
-# path -> (mtime, size, title); opening every archive on every scan is far too
-# slow for a network-mounted library, so each file version is read only once
-_comicinfo_cache: dict[str, tuple[float, int, str]] = {}
-_comicinfo_number_cache: dict[str, tuple[float, int, float | None]] = {}
+_ARCHIVE_READ_ERRORS = (
+    zipfile.BadZipFile, ValueError, RuntimeError, EOFError, LookupError,
+    zlib.error, ElementTree.ParseError,
+)
+
+
+class _ArchiveCache:
+    """Values read from the current version of each archive path.
+
+    Opening every archive on every scan is far too slow for a network-mounted
+    library, so each file version is read only once. The value is read through
+    the descriptor whose fstat forms the version, so a replacement that keeps
+    the size and mtime, or one racing the read, cannot reuse another inode's
+    value. Transient I/O errors are not cached.
+    """
+
+    def __init__(self, maxsize: int | None = None):
+        self._maxsize = maxsize
+        self._items: OrderedDict[str, tuple[ArchiveVersion, Any]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, path: Path, read: Callable[[zipfile.ZipFile], T], default: T) -> T:
+        if path.suffix.lower() not in {".cbz", ".zip"}:
+            return default
+        key = str(path)
+        try:
+            # A hit only needs a stat, which matters on network mounts. A miss
+            # reads through the descriptor whose fstat forms the cached version.
+            current = path.stat()
+        except OSError:
+            return default
+        if stat.S_ISREG(current.st_mode):
+            with self._lock:
+                cached = self._items.get(key)
+                if cached is not None and cached[0] == archive_version(current):
+                    self._items.move_to_end(key)
+                    return cached[1]
+        try:
+            # O_NONBLOCK keeps a FIFO with an archive suffix from hanging a scan.
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return default
+        with os.fdopen(fd, "rb") as handle:
+            try:
+                file_stat = os.fstat(fd)
+            except OSError:
+                return default
+            if not stat.S_ISREG(file_stat.st_mode):
+                return default
+            version = archive_version(file_stat)
+            with self._lock:
+                cached = self._items.get(key)
+                if cached is not None and cached[0] == version:
+                    self._items.move_to_end(key)
+                    return cached[1]
+            try:
+                with zipfile.ZipFile(handle) as archive:
+                    value = read(archive)
+            except OSError:
+                return default
+            except _ARCHIVE_READ_ERRORS:
+                value = default
+        with self._lock:
+            self._items[key] = (version, value)
+            self._items.move_to_end(key)
+            if self._maxsize is not None and len(self._items) > self._maxsize:
+                self._items.popitem(last=False)
+        return value
+
+
+_comicinfo_title_cache = _ArchiveCache()
+_comicinfo_number_cache = _ArchiveCache()
+_chapter_numbers_cache = _ArchiveCache(256)
+_page_signature_cache = _ArchiveCache(1024)
+_source_page_signature_cache = _ArchiveCache(1024)
 
 
 def comicinfo_title(path: Path) -> str:
     """The standard ComicInfo Title field from a CBZ/ZIP, if present."""
-    if path.suffix.lower() not in {".cbz", ".zip"}:
-        return ""
-    try:
-        stat = path.stat()
-    except OSError:
-        return ""
-    cached = _comicinfo_cache.get(str(path))
-    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-        return cached[2]
-    title = _read_comicinfo_title(path)
-    _comicinfo_cache[str(path)] = (stat.st_mtime, stat.st_size, title)
-    return title
+    return _comicinfo_title_cache.get(path, _read_comicinfo_title, "")
 
 
-# Plenty for ordinary metadata, independent of the archive's compressed size.
-MAX_COMICINFO_BYTES = 1024 * 1024
-
-
-def _read_comicinfo(path: Path) -> ElementTree.Element | None:
-    try:
-        with zipfile.ZipFile(path) as archive:
-            member = next(
-                (info for info in archive.infolist()
-                 if Path(info.filename).name.lower() == "comicinfo.xml"),
-                None,
-            )
-            if (member is None or member.file_size > MAX_COMICINFO_BYTES
-                    or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
-                return None
-            # zipfile's BZIP2/LZMA readers can allocate unbounded decompressed
-            # output before applying read(n), unlike STORED/DEFLATED. Ignore
-            # metadata using those methods, even if the declared size is small.
-            # Pass the actual ZipInfo (duplicate names must not change which
-            # entry was checked), and bound decompression even for bad headers.
-            with archive.open(member) as stream:
-                data = stream.read(MAX_COMICINFO_BYTES + 1)
-            if len(data) > MAX_COMICINFO_BYTES:
-                return None
-            return ElementTree.fromstring(data)
-    except (OSError, KeyError, ValueError, RuntimeError, EOFError,
-            zipfile.BadZipFile, zlib.error, ElementTree.ParseError):
+def _read_comicinfo(archive: zipfile.ZipFile) -> ElementTree.Element | None:
+    member = find_comicinfo_member(archive_files(archive.infolist()))
+    if (member is None or member.file_size > MAX_COMICINFO_BYTES
+            or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}):
         return None
+    # zipfile's BZIP2/LZMA readers can allocate unbounded decompressed
+    # output before applying read(n), unlike STORED/DEFLATED. Ignore
+    # metadata using those methods, even if the declared size is small.
+    # Pass the actual ZipInfo (duplicate names must not change which
+    # entry was checked), and bound decompression even for bad headers.
+    with archive.open(member) as stream:
+        data = stream.read(MAX_COMICINFO_BYTES + 1)
+    if len(data) > MAX_COMICINFO_BYTES or len(data) != member.file_size:
+        return None
+    root = ElementTree.fromstring(data)
+    return root if root.tag == "ComicInfo" else None
 
 
-def _read_comicinfo_title(path: Path) -> str:
-    root = _read_comicinfo(path)
+def _read_comicinfo_title(archive: zipfile.ZipFile) -> str:
+    root = _read_comicinfo(archive)
     return " ".join((root.findtext("Title") or "").split()) if root is not None else ""
 
 
 def comicinfo_number(path: Path) -> float | None:
     """The standard ComicInfo Number field from a CBZ/ZIP, if numeric."""
-    if path.suffix.lower() not in {".cbz", ".zip"}:
-        return None
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    cached = _comicinfo_number_cache.get(str(path))
-    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-        return cached[2]
-    number = _read_comicinfo_number(path)
-    _comicinfo_number_cache[str(path)] = (stat.st_mtime, stat.st_size, number)
-    return number
+    return _comicinfo_number_cache.get(path, _read_comicinfo_number, None)
 
 
-def _read_comicinfo_number(path: Path) -> float | None:
-    root = _read_comicinfo(path)
+def _read_comicinfo_number(archive: zipfile.ZipFile) -> float | None:
+    root = _read_comicinfo(archive)
     if root is None:
         return None
     raw = (root.findtext("Number") or "").strip()
@@ -190,32 +236,18 @@ def archive_chapter_numbers(path: Path) -> frozenset[float] | None:
     numbers, partly labeled archives and unsupported formats use the existing
     filename/metadata fallback. Read the ZIP directory, never page payloads.
     """
-    if path.suffix.lower() not in {".cbz", ".zip"}:
-        return None
-    try:
-        stat = path.stat()
-        return _archive_chapter_numbers(str(path), stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        return None
+    return _chapter_numbers_cache.get(path, _read_archive_chapter_numbers, None)
 
 
-@lru_cache(maxsize=256)
-def _archive_chapter_numbers(path: str, mtime_ns: int, size: int) -> frozenset[float] | None:
+def _read_archive_chapter_numbers(archive: zipfile.ZipFile) -> frozenset[float] | None:
     numbers: set[float] = set()
-    try:
-        with zipfile.ZipFile(path) as archive:
-            for member in archive.infolist():
-                name = Path(member.filename)
-                if member.is_dir() or name.suffix.lower() not in IMAGE_EXTS:
-                    continue
-                if not has_chapter_marker(name.stem):
-                    return None
-                number = parse_chapter_number(name.stem)
-                if number is None:
-                    return None
-                numbers.add(number)
-    except (OSError, zipfile.BadZipFile):
-        return None
+    for _, name in archive_pages(archive_files(archive.infolist())):
+        if not has_chapter_marker(name.stem):
+            return None
+        number = parse_chapter_number(name.stem)
+        if number is None:
+            return None
+        numbers.add(number)
     return frozenset(numbers) if numbers else None
 
 
@@ -234,26 +266,14 @@ def page_bytes_signature(pages: list[bytes]) -> PageSignature:
 
 def archive_page_signature(path: Path) -> PageSignature | None:
     """Ordered page CRC/size pairs for a CBZ/ZIP, excluding metadata."""
-    if path.suffix.lower() not in {".cbz", ".zip"}:
-        return None
-    try:
-        stat = path.stat()
-        return _archive_page_signature(str(path), stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        return None
+    return _page_signature_cache.get(path, _read_archive_page_signature, None)
 
 
-@lru_cache(maxsize=1024)
-def _archive_page_signature(path: str, mtime_ns: int, size: int) -> PageSignature | None:
-    try:
-        with zipfile.ZipFile(path) as archive:
-            signature = tuple(
-                (member.CRC, member.file_size)
-                for member in archive.infolist()
-                if not member.is_dir() and Path(member.filename).suffix.lower() in IMAGE_EXTS
-            )
-    except (OSError, zipfile.BadZipFile):
-        return None
+def _read_archive_page_signature(archive: zipfile.ZipFile) -> PageSignature | None:
+    signature = tuple(
+        (member.CRC, member.file_size)
+        for member, _ in archive_pages(archive_files(archive.infolist()))
+    )
     return signature or None
 
 
@@ -263,25 +283,12 @@ PAGE_PROVENANCE_NAME = "MangarrPageProvenance.json"
 
 
 def archive_source_page_signature(path: Path) -> PageSignature | None:
-    if path.suffix.lower() not in {".cbz", ".zip"}:
-        return None
-    try:
-        stat = path.stat()
-        return _archive_source_page_signature(str(path), stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        return None
+    return _source_page_signature_cache.get(path, _read_archive_source_page_signature, None)
 
 
-@lru_cache(maxsize=1024)
-def _archive_source_page_signature(path: str, mtime_ns: int, size: int) -> PageSignature | None:
-    stored = _archive_page_signature(path, mtime_ns, size)
-    if not stored:
-        return None
-    try:
-        with zipfile.ZipFile(path) as archive:
-            return read_archive_source_page_signature(archive, stored)
-    except (OSError, zipfile.BadZipFile):
-        return None
+def _read_archive_source_page_signature(archive: zipfile.ZipFile) -> PageSignature | None:
+    stored = _read_archive_page_signature(archive)
+    return read_archive_source_page_signature(archive, stored) if stored else None
 
 
 def read_archive_source_page_signature(
@@ -339,9 +346,10 @@ def find_series_media_files(
         if not folder.exists():
             continue
         try:
-            key = str(folder.resolve(strict=False))
-        except OSError:
-            key = str(folder.absolute())
+            resolved_folder = folder.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        key = str(resolved_folder)
         scoped = key in offsets
         offset = offsets.get(key, 0)
         for media in find_media_files(folder):
@@ -364,10 +372,13 @@ def find_series_media_files(
                     continue
                 media = replace(media, coverage=replace(media.coverage, volume=local))
             try:
-                media_key = str(media.path.resolve(strict=False))
-            except OSError:
-                media_key = str(media.path.absolute())
-            found.setdefault(media_key, media)
+                resolved_media = media.path.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            # A symlink may point outside the folder (a seeding or shared copy).
+            # Adopt it; ComicInfo editing separately refuses files outside the
+            # series folders, and aliases resolve to one key and one owner set.
+            found.setdefault(str(resolved_media), media)
     return list(found.values())
 
 

@@ -87,6 +87,40 @@ def resolve_folders(root: Path, series: Series, extra_paths: list[str]) -> list[
     return folders
 
 
+def unavailable_extra_folders(folders: list[Path]) -> set[Path]:
+    """Treat an extra folder as its own mount, including an empty mount point."""
+    unavailable = set()
+    for folder in folders:
+        try:
+            if not folder.is_file() and root_unavailable(folder):
+                unavailable.add(folder)
+        except OSError:
+            unavailable.add(folder)
+    return unavailable
+
+
+def chapters_under_folders(chapters: list[Chapter], folders: set[Path]) -> set[Chapter]:
+    """Find recorded mappings under these folders, following existing aliases."""
+    if not folders:
+        return set()
+
+    def path_forms(path: Path) -> set[Path]:
+        try:
+            return {path, path.resolve()}
+        except (OSError, RuntimeError):
+            return {path}
+
+    folder_paths = {path for folder in folders for path in path_forms(folder)}
+    return {
+        chapter for chapter in chapters
+        if chapter.downloaded and not chapter.excluded and chapter.file_path
+        and any(
+            path.is_relative_to(folder)
+            for path in path_forms(Path(chapter.file_path)) for folder in folder_paths
+        )
+    }
+
+
 def resolve_volume_offsets(root: Path, series: Series) -> dict[str, int]:
     """Resolved shared-folder paths whose physical volumes need translating.
 
@@ -239,7 +273,8 @@ def scan_series(
     leaves every chapter untouched and is reported in the result instead.
     `expect_content` says whether the root should hold files; left None only
     `chapters` decide, so callers with a database pass the root-wide answer
-    (tasks.root_expects_content)."""
+    (tasks.root_expects_content). Preserve existing chapter mappings under
+    unavailable configured extras while scanning the remaining folders."""
     folders = [Path(f) for f in folders]
     result = ScanResult()
     if root is not None:
@@ -250,9 +285,12 @@ def scan_series(
             log.warning("Not scanning %r: %s", series.title, reason)
             result.root_unavailable = reason
             return result
-    existing = [f for f in folders if f.exists()]
+    unavailable = unavailable_extra_folders(folders[1:])
+    protected = chapters_under_folders(chapters, unavailable)
+    owned_now = {_ownership_key(chapter) for chapter in protected}
+    existing = [f for f in folders if f not in unavailable and f.exists()]
     if not existing:
-        result.cleared = _reconcile(chapters, keep=set())
+        result.cleared = _reconcile(chapters, keep=owned_now)
         return result
 
     media = find_series_media_files(existing, chapters, volume_offsets)
@@ -268,7 +306,7 @@ def scan_series(
         for m in match.matched if m.content_chapters is not None
     }
     for chapter in chapters:
-        if not chapter.file_path:
+        if chapter in protected or not chapter.file_path:
             continue
         content = known_content.get(str(Path(chapter.file_path).resolve()))
         if content is not None and chapter.number not in content:
@@ -276,8 +314,6 @@ def scan_series(
                 result.cleared += 1
             chapter.downloaded = False
             chapter.file_path = ""
-
-    owned_now: set[tuple[str, int]] = set()
 
     # Exact chapter files take precedence over volume coverage. When several
     # files identify the same chapter (e.g. 115 and 115.0), keep the recorded

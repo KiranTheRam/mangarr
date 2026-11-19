@@ -129,6 +129,8 @@ async def test_progress_between_commits_does_not_hold_the_write_lock(
         await cancel_cb()
         await progress_cb(3, 3)
         await cancel_cb()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"downloaded archive")
 
     monkeypatch.setattr(tasks, "download_chapter_to_cbz", slow_last_page)
 

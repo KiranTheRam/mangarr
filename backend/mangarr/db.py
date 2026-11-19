@@ -81,6 +81,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("series", "title_romaji", "VARCHAR NOT NULL DEFAULT ''", None),
     ("series", "title_native", "VARCHAR NOT NULL DEFAULT ''", None),
     ("series", "title_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("series", "deletion_pending", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("library_issues", "public_id", "VARCHAR NOT NULL DEFAULT ''", "ux_library_issues_public_id"),
+    ("library_issues", "revision", "VARCHAR NOT NULL DEFAULT ''", None),
 ]
 
 # Chapters mangarr downloaded before file provenance was tracked: the latest
@@ -120,6 +123,11 @@ async def init_db() -> None:
                     await conn.exec_driver_sql(_BACKFILL_FILE_SOURCE)
                 if (table, column) == ("series", "provider_title"):
                     await conn.exec_driver_sql(_BACKFILL_PROVIDER_TITLE)
+            if (table, column) == ("library_issues", "public_id"):
+                await conn.exec_driver_sql(
+                    "UPDATE library_issues SET public_id = lower(hex(randomblob(16))) "
+                    "WHERE public_id = ''"
+                )
             if index:
                 await conn.exec_driver_sql(
                     f"CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table} ({column})"

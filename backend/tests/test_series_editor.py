@@ -1,7 +1,9 @@
 """The library mass editor: bulk monitoring, moving series to another root
 folder, bulk refresh/search and bulk delete."""
 
+import asyncio
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from fastapi import HTTPException
@@ -9,7 +11,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from mangarr.api import series as series_api
+from mangarr.api import issues as issues_api, library as library_api, series as series_api
+from mangarr.api import system as system_api
+from mangarr.comicinfo import read_comicinfo
+from mangarr.jobs import tasks
 from mangarr.models import (
     Base,
     Chapter,
@@ -19,8 +24,12 @@ from mangarr.models import (
     RootFolder,
     Series,
     SeriesFolder,
+    Setting,
 )
-from mangarr.schemas import SeriesBulkIn, SeriesBulkRefreshIn, SeriesEditorIn
+from mangarr.schemas import (
+    ComicInfoUpdateIn, IssueResolveIn, RenameApplyIn, SeriesBulkIn, SeriesBulkRefreshIn,
+    SeriesEditorIn, SeriesUpdateIn,
+)
 
 
 @pytest.fixture
@@ -94,6 +103,108 @@ async def test_root_change_without_move_keeps_files_and_extra_folders_in_place(s
     assert a.extra_folders[0].path == str(old / "Alpha Volumes")
 
 
+@pytest.mark.parametrize("change", ["root", "folder", "bulk_root", "delete_root", "title", "bulk_title"])
+async def test_primary_layout_and_title_edits_wait_for_archive_repairs(tmp_path, roots, monkeypatch, change):
+    old, new = roots
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'layout.db'}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    archive_lock = asyncio.Lock()
+    monkeypatch.setattr(tasks, "_SERIES_LOCKS", {})
+    monkeypatch.setattr(series_api, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(issues_api, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(system_api, "manual_archive_lock", archive_lock)
+    started, release, editing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_write = issues_api._write_archive
+
+    async def pause_write(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original_write(*args, **kwargs)
+
+    monkeypatch.setattr(issues_api, "_write_archive", pause_write)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with maker() as setup:
+            new_root = RootFolder(path=str(new))
+            setup.add(new_root)
+            series = await _add(setup, "Alpha", RootFolder(path=str(old)), numbers=(1,))
+            series_id, old_root_id = series.id, series.root_folder_id
+            new_root_id, chapter_id = new_root.id, series.chapters[0].id
+            folder = old / "Alpha"
+            folder.mkdir()
+            path = folder / "Ch 1.cbz"
+            with ZipFile(path, "w") as archive:
+                archive.writestr("001.jpg", b"page")
+                archive.writestr("ComicInfo.xml", "<ComicInfo><Number>1</Number></ComicInfo>")
+            chapter = series.chapters[0]
+            chapter.file_path, chapter.downloaded = str(path), True
+            if change == "bulk_title":
+                series.title_native = "物語"
+                setup.add(Setting(key="preferred_title_language", value="native"))
+            await setup.commit()
+            info = await issues_api.get_chapter_comicinfo(series_id, chapter_id, setup)
+
+        async def edit():
+            async with maker() as session:
+                editing.set()
+                if change == "bulk_root":
+                    return await _edit(session, series_ids=[series_id], root_folder_id=new_root_id)
+                if change == "bulk_title":
+                    return await series_api.apply_title_preference(session)
+                if change == "delete_root":
+                    return await system_api.delete_root_folder(old_root_id, session)
+                fields = {
+                    "root": {"root_folder_id": new_root_id},
+                    "folder": {"folder_name": "Other Folder"},
+                    "title": {"title": "New Title"},
+                }[change]
+                return await series_api.update_series(series_id, SeriesUpdateIn(**fields), session)
+
+        async def repair():
+            async with maker() as session:
+                return await issues_api.update_chapter_comicinfo(
+                    series_id, chapter_id, ComicInfoUpdateIn(title="Chapter Title", revision=info.revision),
+                    session,
+                )
+
+        async with asyncio.timeout(10):
+            repairing = asyncio.create_task(repair())
+            await started.wait()
+            updating = asyncio.create_task(edit())
+            await editing.wait()
+            try:
+                done, _ = await asyncio.wait({updating}, timeout=0.05)
+                assert not done
+            finally:
+                release.set()
+                repaired, result = await asyncio.gather(repairing, updating)
+        assert repaired.title == read_comicinfo(path).title == "Chapter Title"
+        if change == "bulk_root":
+            assert result.updated == 1 and result.moved == 0 and not result.problems
+        elif change == "title":
+            assert result.title == "New Title"
+        elif change == "bulk_title":
+            assert result.updated == 1
+        elif change == "root":
+            assert result.root_folder_id == new_root_id
+        elif change == "delete_root":
+            assert result is None
+        else:
+            assert result.folder_name == "Other Folder"
+        async with maker() as check:
+            if change == "bulk_title":
+                assert (await check.get(Series, series_id)).title == "物語"
+            elif change != "title":
+                if change == "delete_root":
+                    assert (await check.get(Series, series_id)).root_folder_id is None
+                with pytest.raises(HTTPException, match="outside the series folders") as err:
+                    await issues_api.get_chapter_comicinfo(series_id, chapter_id, check)
+                assert err.value.status_code == 400
+    finally:
+        await engine.dispose()
+
+
 async def test_move_carries_the_folder_and_repoints_chapters(session, roots):
     old, new = roots
     old_root, new_root = RootFolder(path=str(old)), RootFolder(path=str(new))
@@ -121,6 +232,159 @@ async def test_move_carries_the_folder_and_repoints_chapters(session, roots):
         str(new / "Alpha" / "Volumes"), str(old / "Loose"),
     ]
     assert a.root_folder_id == new_root.id
+
+
+async def test_cancelled_root_move_still_saves_the_new_chapter_path(session, roots, monkeypatch):
+    old, new = roots
+    old_root, new_root = RootFolder(path=str(old)), RootFolder(path=str(new))
+    session.add(new_root)
+    series = await _add(session, "Alpha", old_root, numbers=(1,))
+    original = old / "Alpha" / "Ch 1.cbz"
+    original.parent.mkdir()
+    original.write_bytes(b"archive")
+    chapter = series.chapters[0]
+    chapter.downloaded = True
+    chapter.file_path = str(original)
+    await session.commit()
+
+    moved, release = asyncio.Event(), asyncio.Event()
+    move = series_api.move_series_folder
+
+    async def pause_after_move(*args):
+        result = await move(*args)
+        moved.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(series_api, "move_series_folder", pause_after_move)
+    request = asyncio.create_task(_edit(
+        session, series_ids=[series.id], root_folder_id=new_root.id, move_files=True,
+    ))
+    try:
+        await asyncio.wait_for(moved.wait(), 10)
+        request.cancel()
+        await asyncio.sleep(0)
+        assert series_api.manual_archive_lock.locked()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    await session.refresh(series, ["root_folder_id"])
+    await session.refresh(chapter)
+    expected = new / "Alpha" / original.name
+    assert series.root_folder_id == new_root.id
+    assert chapter.file_path == str(expected) and expected.is_file()
+
+
+@pytest.mark.parametrize("extra_available", [False, True])
+async def test_move_carries_ignored_archive_warning_to_new_root(session, roots, extra_available):
+    old, new = roots
+    old_root, new_root = RootFolder(path=str(old)), RootFolder(path=str(new))
+    session.add(new_root)
+    series = await _add(
+        session, "Alpha", old_root, numbers=(1, 2),
+        extra_folders=[SeriesFolder(path="Outside")],
+    )
+    (old / "Alpha").mkdir()
+    (old / "Outside").mkdir()
+    primary = old / "Alpha" / "Ch 1.cbz"
+    outside = old / "Outside" / "Ch 2.cbz"
+    for path in (primary, outside):
+        with ZipFile(path, "w") as archive:
+            archive.writestr("001.jpg", b"page")
+            archive.writestr("ComicInfo.xml", "<ComicInfo><PageCount>2</PageCount></ComicInfo>")
+    await library_api.scan(series.id, session)
+    warnings = {
+        warning.file_path: warning
+        for warning in await issues_api.list_issues(ignored=False, series_id=series.id, session=session)
+    }
+    await issues_api.ignore_issue(warnings[str(primary)].id, session)
+    if not extra_available:
+        outside.parent.rename(old / "Detached")
+
+    out = await _edit(session, series_ids=[series.id], root_folder_id=new_root.id, move_files=True)
+
+    assert out.moved == 1 and not out.problems
+    moved_path = new / "Alpha" / "Ch 1.cbz"
+    [moved] = await issues_api.list_issues(ignored=True, series_id=series.id, session=session)
+    assert moved.id == warnings[str(primary)].id
+    assert moved.file_path == str(moved_path)
+    assert (moved.revision != warnings[str(primary)].revision) is extra_available
+    assert series.extra_folders[0].path == str(outside.parent)
+    assert await issues_api.list_issues(ignored=False, series_id=series.id, session=session) == [
+        warnings[str(outside)],
+    ]
+
+    if not extra_available:
+        (old / "Detached").rename(outside.parent)
+    await library_api.scan(series.id, session)
+    [rescanned] = await issues_api.list_issues(ignored=True, series_id=series.id, session=session)
+    assert rescanned.id == moved.id and rescanned.file_path == moved.file_path
+    assert rescanned.revision != warnings[str(primary)].revision
+    await issues_api.restore_issue(rescanned.id, session)
+    await issues_api.resolve_issue(rescanned.id, IssueResolveIn(revision=rescanned.revision), session)
+    assert read_comicinfo(moved_path).page_count == "1"
+
+
+async def test_move_reloads_paths_after_a_concurrent_rename(tmp_path, roots, monkeypatch):
+    old, new = roots
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'concurrent-move.db'}")
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    entered = asyncio.Event()
+    renamed = asyncio.Event()
+    original_get_settings = series_api.settings_service.get_all
+
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with maker() as setup:
+            new_root = RootFolder(path=str(new))
+            setup.add(new_root)
+            series = await _add(setup, "Alpha", RootFolder(path=str(old)), numbers=(1,))
+            series_id, new_root_id = series.id, new_root.id
+            library = old / "Alpha"
+            library.mkdir()
+            with ZipFile(library / "Ch 1.cbz", "w") as archive:
+                archive.writestr("001.jpg", b"page")
+                archive.writestr("ComicInfo.xml", "<ComicInfo><PageCount>2</PageCount></ComicInfo>")
+            await library_api.scan(series_id, setup)
+            [warning] = await issues_api.list_issues(ignored=False, series_id=series_id, session=setup)
+            await issues_api.ignore_issue(warning.id, setup)
+
+        async with maker() as moving, maker() as renaming:
+            async def pause_bulk_settings(session):
+                if session is moving and not entered.is_set():
+                    entered.set()
+                    await renamed.wait()
+                return await original_get_settings(session)
+
+            monkeypatch.setattr(series_api.settings_service, "get_all", pause_bulk_settings)
+            move_task = asyncio.create_task(_edit(
+                moving, series_ids=[series_id], root_folder_id=new_root_id, move_files=True,
+                monitor_mode="none",
+            ))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                [outcome] = await library_api.rename_apply(series_id, RenameApplyIn(), renaming)
+                assert outcome.status == "renamed"
+            finally:
+                renamed.set()
+                move = await asyncio.wait_for(move_task, timeout=5)
+
+        assert move.moved == 1 and not move.problems
+        moved_path = new / "Alpha" / outcome.new_name
+        assert moved_path.is_file() and not library.exists()
+        async with maker() as check:
+            chapter = await check.scalar(select(Chapter).where(Chapter.series_id == series_id))
+            assert chapter.file_path == str(moved_path)
+            assert not chapter.monitored
+            [ignored] = await issues_api.list_issues(ignored=True, series_id=series_id, session=check)
+            assert ignored.id == warning.id and ignored.file_path == str(moved_path)
+            await library_api.scan(series_id, check)
+            assert await issues_api.list_issues(ignored=False, series_id=series_id, session=check) == []
+    finally:
+        await engine.dispose()
 
 
 async def test_move_never_overwrites_and_reports_blocked_series(session, roots):

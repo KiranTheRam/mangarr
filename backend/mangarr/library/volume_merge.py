@@ -9,45 +9,23 @@ for the cleanup tool, never chapters without a file."""
 import json
 import logging
 import zipfile
-from io import BufferedReader
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from ..download.cbz import build_comicinfo
 from ..util import NEW_FILE_MODE, natural_key
-from .matcher import IMAGE_EXTS, PAGE_PROVENANCE_NAME, read_archive_source_page_signature
+from .archive_members import archive_files, archive_pages
+from .matcher import PAGE_PROVENANCE_NAME, read_archive_source_page_signature
+from .zip_limits import (
+    BoundedZipReader, COPY_CHUNK_BYTES, MAX_EXPANDED_BYTES, MAX_MEMBER_BYTES,
+    MAX_ZIP_DIRECTORY_BYTES, MAX_ZIP_ENTRIES, SAFE_ZIP_COMPRESSION,
+)
 
 log = logging.getLogger(__name__)
 
 MAX_MERGE_PAGES = 10_000
-MAX_MERGE_PAGE_BYTES = 32 * 1024 * 1024
-MAX_MERGE_BYTES = 2 * 1024 * 1024 * 1024
-MAX_ZIP_DIRECTORY_BYTES = 4 * 1024 * 1024
-MAX_ZIP_ENTRIES = 12_000
-COPY_CHUNK_BYTES = 64 * 1024
-
-
-class _MergeArchiveReader(BufferedReader):
-    def read(self, size: int = -1) -> bytes:
-        # ZipFile loads the central directory in one read, before it exposes
-        # entry counts. Bound that allocation as well as streamed page reads.
-        if size > MAX_ZIP_DIRECTORY_BYTES:
-            raise ValueError("chapter ZIP directory exceeds the size limit")
-        data = super().read(MAX_ZIP_DIRECTORY_BYTES + 1 if size < 0 else size)
-        if len(data) > MAX_ZIP_DIRECTORY_BYTES:
-            raise ValueError("chapter ZIP directory exceeds the size limit")
-        return data
-
-
-def _page_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
-    pages = [
-        info for info in archive.infolist()
-        if not info.is_dir() and Path(info.filename).suffix.lower() in IMAGE_EXTS
-    ]
-    # mangarr's own writers zero-pad page names, but torrent-imported archives
-    # often don't (1.jpg … 10.jpg): order numbers by value. Subfolders still
-    # stay together, since the key compares the path prefix first.
-    return sorted(pages, key=lambda info: natural_key(info.filename))
+MAX_MERGE_PAGE_BYTES = MAX_MEMBER_BYTES
+MAX_MERGE_BYTES = MAX_EXPANDED_BYTES
 
 
 def merge_chapter_archives(
@@ -78,33 +56,33 @@ def merge_chapter_archives(
         provenance_valid = True
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as out:
             for index, (_number, path) in enumerate(ordered, start=1):
-                with _MergeArchiveReader(path.open("rb", buffering=0)) as handle, zipfile.ZipFile(handle) as archive:
+                with BoundedZipReader(path.open("rb", buffering=0), MAX_ZIP_DIRECTORY_BYTES) as handle, zipfile.ZipFile(handle) as archive:
                     if len(archive.infolist()) > MAX_ZIP_ENTRIES:
                         raise ValueError("chapter ZIP exceeds the entry count limit")
-                    members = _page_members(archive)
+                    source_members = list(archive_pages(archive_files(archive.infolist())))
+                    # Use reading order even for archives with unpadded page numbers.
+                    members = sorted(source_members, key=lambda member: natural_key(str(member[1])))
                     if not members:
                         raise ValueError(f"no page images in {path}")
                     if pages + len(members) > MAX_MERGE_PAGES:
                         raise ValueError("volume merge exceeds the page count limit")
-                    source_members = [info for info in archive.infolist()
-                                      if not info.is_dir() and Path(info.filename).suffix.lower() in IMAGE_EXTS]
-                    stored = tuple((info.CRC, info.file_size) for info in source_members)
+                    stored = tuple((info.CRC, info.file_size) for info, _ in source_members)
                     source_signature = read_archive_source_page_signature(archive, stored)
                     # Provenance follows ZIP entry order; the merged output
                     # uses natural filename order, so remap by entry identity.
-                    by_member = dict(zip(map(id, source_members), source_signature or ()))
+                    by_member = dict(zip((id(info) for info, _ in source_members), source_signature or ()))
                     provenance_valid = provenance_valid and source_signature is not None
-                    for page, info in enumerate(members, start=1):
+                    for page, (info, name) in enumerate(members, start=1):
                         # BZIP2 and LZMA can expand a large block inside
                         # ZipExtFile before returning a bounded read.
-                        if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                        if info.compress_type not in SAFE_ZIP_COMPRESSION:
                             raise ValueError(f"unsupported page compression in {path}")
                         if info.file_size > MAX_MERGE_PAGE_BYTES or expanded_bytes + info.file_size > MAX_MERGE_BYTES:
                             raise ValueError("volume merge exceeds the expanded size limit")
                         if source_signature is not None:
                             original_signature.append(by_member[id(info)])
                         archived_signature.append((info.CRC, info.file_size))
-                        ext = Path(info.filename).suffix.lower()
+                        ext = name.suffix.lower()
                         # chapter-then-page prefix keeps reading order under
                         # the name sort Kavita and Komga use
                         name = f"{index:04d}-{page:04d}{ext}"

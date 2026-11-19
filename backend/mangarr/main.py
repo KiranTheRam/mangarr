@@ -12,6 +12,7 @@ from .api import (
     apikeys,
     calendar,
     import_lists,
+    issues,
     library,
     library_import,
     queue,
@@ -62,6 +63,7 @@ api.include_router(library_import.router)
 api.include_router(library.router)
 api.include_router(calendar.router)
 api.include_router(import_lists.router)
+api.include_router(issues.router)
 api.include_router(search.router)
 api.include_router(queue.router)
 api.include_router(settings.router)

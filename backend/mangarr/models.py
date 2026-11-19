@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -10,10 +11,12 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
@@ -72,6 +75,7 @@ class Series(Base):
     total_chapters: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_volumes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     monitored: Mapped[bool] = mapped_column(Boolean, default=True)
+    deletion_pending: Mapped[bool] = mapped_column(Boolean, server_default=false())
     root_folder_id: Mapped[int | None] = mapped_column(ForeignKey("root_folders.id"), nullable=True)
     folder_name: Mapped[str] = mapped_column(String, default="")
     # the folder was chosen explicitly by the user — scans must not re-adopt
@@ -114,6 +118,9 @@ class Series(Base):
         back_populates="series", cascade="all, delete-orphan"
     )
     extra_folders: Mapped[list[SeriesFolder]] = relationship(
+        back_populates="series", cascade="all, delete-orphan"
+    )
+    issues: Mapped[list[LibraryIssue]] = relationship(
         back_populates="series", cascade="all, delete-orphan"
     )
 
@@ -262,6 +269,42 @@ class HistoryEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     series: Mapped[Series | None] = relationship()
+    chapter: Mapped[Chapter | None] = relationship()
+
+
+class LibraryIssue(Base):
+    """A currently reproducible library metadata problem.
+
+    Detection upserts these rows by ``key`` and deletes them when the file no
+    longer reproduces the problem. Ignoring an issue is therefore durable
+    while the problem exists, without leaving resolved history in the UI.
+    """
+
+    __tablename__ = "library_issues"
+    __table_args__ = (Index("ux_library_issues_public_id", "public_id", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String, default=lambda: uuid4().hex)
+    revision: Mapped[str] = mapped_column(String, default="")
+    key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
+    chapter_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chapters.id"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String)
+    file_path: Mapped[str] = mapped_column(Text)
+    field: Mapped[str] = mapped_column(String)
+    current_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(String)
+    detail: Mapped[str] = mapped_column(Text)
+    ignored: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    series: Mapped[Series] = relationship(back_populates="issues")
     chapter: Mapped[Chapter | None] = relationship()
 
 

@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .comicinfo import COMICINFO_INT_MAX
+
 MonitorMode = Literal["all", "missing", "future", "from_chapter", "latest_volume", "none"]
 
 
@@ -258,6 +260,81 @@ class ChapterMetadataIn(BaseModel):
     title_locked: bool = True
     volume_locked: bool = True
     excluded: bool | None = None
+
+
+class ComicInfoOut(BaseModel):
+    file_path: str
+    revision: str
+    exists: bool
+    series: str | None
+    number: str | None
+    volume: str | None
+    title: str | None
+    page_count: str | None
+    actual_page_count: int
+
+
+class ComicInfoUpdateIn(BaseModel):
+    revision: str
+    series: str | None = None
+    number: str | None = None
+    volume: int | None = None
+    title: str | None = None
+    page_count: int | None = None
+
+    @field_validator("series", "number", "title")
+    @classmethod
+    def _trim_optional_text(cls, value):
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        return value or None
+
+    @field_validator("number")
+    @classmethod
+    def _single_chapter_number(cls, value):
+        from .comicinfo import number_spans_chapters
+
+        if number_spans_chapters(value):
+            raise ValueError("Number must describe a single chapter")
+        return value
+
+    @field_validator("volume", "page_count")
+    @classmethod
+    def _positive_optional_integer(cls, value, info):
+        if value is not None and value < 1:
+            raise ValueError(f"{info.field_name} must be at least 1")
+        if value is not None and value > COMICINFO_INT_MAX:
+            raise ValueError(f"{info.field_name} must be at most {COMICINFO_INT_MAX}")
+        return value
+
+
+class LibraryIssueOut(BaseModel):
+    id: str
+    revision: str
+    series_id: int
+    series_title: str
+    chapter_id: int | None
+    chapter_number: float | None
+    kind: str
+    file_path: str
+    field: str
+    current_value: str | None
+    suggested_value: str | None
+    title: str
+    detail: str
+    ignored: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class IssueResolveIn(BaseModel):
+    revision: str
+
+
+class IssueScanOut(BaseModel):
+    active: int
+    ignored: int
 
 
 class MetadataResult(BaseModel):
