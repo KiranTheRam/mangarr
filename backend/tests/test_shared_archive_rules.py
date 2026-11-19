@@ -394,10 +394,11 @@ async def test_reservations_never_mutate_a_snapshot_a_reader_holds(tmp_path):
     assert metadata_issues._reserved_owners == {}
 
 
-async def test_failed_merge_publish_removes_the_unreferenced_volume(repair_db, monkeypatch):
+@pytest.mark.parametrize("failure", ["unreferenced", "adopted", "cancelled_during_cleanup"])
+async def test_failed_merge_publish_cleans_up_only_an_unreferenced_volume(repair_db, monkeypatch, failure):
     from mangarr import metadata_issues
 
-    session, _, series, path = repair_db
+    session, maker, series, path = repair_db
     second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
     archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
     archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
@@ -410,17 +411,32 @@ async def test_failed_merge_publish_removes_the_unreferenced_volume(repair_db, m
     load = metadata_issues.load_archive_ownership
     calls = []
 
+    dest = path.with_name("Tracked - Vol. 01.cbz")
+    root_id = series.root_folder_id
+
     async def ownership(db):
         calls.append(1)
         if len(calls) == 2:
+            if failure == "adopted":
+                # A scan of a series sharing the folder adopted the new volume.
+                async with maker() as other_session:
+                    other_session.add(Series(
+                        title="Other", folder_name="Tracked", root_folder_id=root_id,
+                        chapters=[Chapter(number=1, downloaded=True, file_path=str(dest))],
+                    ))
+                    await other_session.commit()
             raise RuntimeError("ownership snapshot failed")
+        if len(calls) == 3 and failure == "cancelled_during_cleanup":
+            raise asyncio.CancelledError
         return await load(db)
 
     monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
-    with pytest.raises(RuntimeError):
+    expected = asyncio.CancelledError if failure == "cancelled_during_cleanup" else RuntimeError
+    with pytest.raises(expected):
         await tasks.merge_complete_volumes(session, series, {}, force=True)
 
-    assert not path.with_name("Tracked - Vol. 01.cbz").exists()
+    assert len(calls) == 3, "cleanup ran its ownership check without waiting"
+    assert dest.exists() == (failure != "unreferenced")
     assert path.exists() and second.exists()
 
 
@@ -459,3 +475,46 @@ async def test_cancelled_merge_keeps_a_volume_another_series_adopted(repair_db):
         await task
     metadata_issues.manual_archive_lock.release()
     assert dest.exists(), "volume archive another series maps was deleted"
+
+
+async def test_merge_cleanup_does_not_queue_behind_a_woken_lock_waiter(repair_db, monkeypatch):
+    from mangarr import metadata_issues
+
+    session, _, series, path = repair_db
+    second, later = path.with_name("Tracked Ch. 2.cbz"), path.with_name("Tracked Ch. 3.cbz")
+    archive(second, "<ComicInfo><Number>2</Number></ComicInfo>")
+    archive(later, "<ComicInfo><Number>3</Number></ComicInfo>")
+    for number, volume, file_path in ((2, 1, second), (3, 2, later)):
+        series.chapters.append(Chapter(number=number, volume=volume, downloaded=True, file_path=str(file_path)))
+    for chapter in series.chapters:
+        chapter.file_source = "alpha"
+    await session.commit()
+    await session.refresh(series, ["extra_folders"])
+    lock = metadata_issues.manual_archive_lock
+    load = metadata_issues.load_archive_ownership
+    calls = []
+
+    async def other_holder():
+        async with lock:  # e.g. a scan or repair, queued behind the merge
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+    async def ownership(db):
+        calls.append(1)
+        if len(calls) == 2:
+            other.append(asyncio.create_task(other_holder()))
+            while not getattr(lock, "_waiters", None):
+                await asyncio.sleep(0)
+            raise RuntimeError("publish failed")
+        return await load(db)
+
+    other = []
+    monkeypatch.setattr(metadata_issues, "load_archive_ownership", ownership)
+    async with asyncio.timeout(5):
+        with pytest.raises(RuntimeError):
+            await tasks.merge_complete_volumes(session, series, {}, force=True)
+        await other[0]
+    # The failure released the lock to the queued holder; cleanup kept the
+    # file instead of waiting behind it for another ownership check.
+    assert len(calls) == 2
+    assert path.with_name("Tracked - Vol. 01.cbz").exists()

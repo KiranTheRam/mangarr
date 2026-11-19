@@ -2173,12 +2173,13 @@ async def _discard_unpublished_volume(session: AsyncSession, dest: Path) -> None
 
     A scan may adopt the new archive while the merge waits for the archive
     lock, so it is deleted only after an ownership check under that lock.
-    Cleanup never waits for the lock (shutdown may be cancelling the holder);
-    a free asyncio lock is acquired without suspending.
+    Cleanup never waits for the lock (shutdown may be cancelling the holder).
     """
     from ..metadata_issues import load_archive_ownership, manual_archive_lock
 
-    if manual_archive_lock.locked():
+    # asyncio.Lock.acquire only skips suspending when the lock is free and no
+    # waiter is queued (a released lock first wakes its next waiter).
+    if manual_archive_lock.locked() or getattr(manual_archive_lock, "_waiters", None):
         log.warning("keeping unpublished volume %s: ownership cannot be checked now", dest)
         return
     try:
@@ -2187,7 +2188,7 @@ async def _discard_unpublished_volume(session: AsyncSession, dest: Path) -> None
             if _owned_only_by([], await load_archive_ownership(session), dest):
                 dest.unlink(missing_ok=True)
                 return
-    except BaseException as exc:  # noqa: BLE001 - cleanup must not mask the original failure
+    except Exception as exc:  # a new cancellation propagates; other errors keep the file
         log.warning("keeping unpublished volume %s: ownership could not be checked (%s)", dest, exc)
         return
     log.warning("keeping unpublished volume %s: another chapter maps it", dest)
