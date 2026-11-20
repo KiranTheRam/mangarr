@@ -275,7 +275,7 @@ def update_comicinfo(
                 raise ComicInfoError("Updated archive exceeds the ZIP entry count limit")
 
             with tempfile.NamedTemporaryFile(
-                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+                dir=path.parent, prefix=".mangarr-comicinfo-", suffix=".tmp", delete=False
             ) as handle:
                 temp_path = Path(handle.name)
             try:

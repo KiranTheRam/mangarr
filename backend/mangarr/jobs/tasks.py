@@ -3,14 +3,17 @@ processing, qBittorrent sync, and the monitor loop."""
 
 import asyncio
 import logging
+import os
 import re
+import shutil
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from tempfile import mkdtemp
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -1533,6 +1536,66 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     _notify_kavita(values, series)
 
 
+def _backup_direct_archive(dest: Path, backup: Path) -> None:
+    if dest.is_symlink():
+        # Preserve the link itself, including a relative target.
+        backup.symlink_to(os.readlink(dest))
+        return
+    try:
+        os.link(dest, backup)
+    except OSError:
+        shutil.copy2(dest, backup)
+
+
+@asynccontextmanager
+async def _publish_direct_archive(
+    staged: Path, dest: Path, expected_destination: ArchiveVersion | None,
+    check_still_wanted: Callable[[], Awaitable[None]],
+):
+    """Publish for the database commit and undo our publication on failure."""
+    backup = None
+    keep_backup = False
+    try:
+        if expected_destination is not None:
+            original_entry = archive_version(dest.lstat())
+            backup = Path(mkdtemp(dir=dest.parent, prefix=".mangarr-direct-rollback-")) / "previous"
+            await run_file_work(_backup_direct_archive, dest, backup)
+        await check_still_wanted()
+        installed_version = archive_version(staged.lstat())
+        if backup is None:
+            publish_new_file(staged, dest)
+        else:
+            if (archive_version(dest.lstat()) != original_entry
+                    or archive_version(dest.stat()) != expected_destination):
+                raise FileExistsError(f"{dest.name} changed while the download was being installed")
+            staged.replace(dest)
+        try:
+            yield
+        except Exception:
+            try:
+                if archive_version(dest.lstat()) == installed_version:
+                    if backup is None:
+                        dest.unlink()
+                    else:
+                        backup.replace(dest)
+                elif backup is not None:
+                    raise FileExistsError(f"{dest.name} changed after the download was installed")
+            except OSError as exc:
+                if backup is not None:
+                    keep_backup = True
+                    log.warning("could not restore %s from %s: %s", dest, backup, exc)
+                elif not isinstance(exc, FileNotFoundError):
+                    log.warning("could not remove uncommitted download %s: %s", dest, exc)
+            raise
+    finally:
+        if backup is not None and not keep_backup:
+            try:
+                backup.unlink(missing_ok=True)
+                backup.parent.rmdir()
+            except OSError as exc:
+                log.warning("could not clean up download backup %s: %s", backup, exc)
+
+
 async def _install_direct_download(
     session: AsyncSession, dl: Download, series: Series, chapter: Chapter, staged: Path, dest: Path,
     check_still_wanted: Callable[[], Awaitable[None]],
@@ -1559,34 +1622,28 @@ async def _install_direct_download(
             replaced_version is not None
             and ownership.owners.get(replaced_version[:2]) == {chapter.id}
         )
-    await check_still_wanted()
-    if expected_destination is None:
-        publish_new_file(staged, dest)
-    else:
-        if archive_version(dest.stat()) != expected_destination:
-            raise FileExistsError(f"{dest.name} changed while the download was being installed")
-        staged.replace(dest)
-    chapter.downloaded = True
-    chapter.file_path = str(dest)
-    chapter.file_source = dl.source_name
-    chapter.file_group = dl.release_group
-    dl.status = DownloadStatus.DONE
-    dl.progress = 1.0
-    dl.error = ""
-    session.add(HistoryEvent(
-        series_id=series.id, chapter_id=chapter.id, event="imported",
-        source_name=dl.source_name, detail=str(dest),
-    ))
-    if replaced:
+    async with _publish_direct_archive(staged, dest, expected_destination, check_still_wanted):
+        chapter.downloaded = True
+        chapter.file_path = str(dest)
+        chapter.file_source = dl.source_name
+        chapter.file_group = dl.release_group
+        dl.status = DownloadStatus.DONE
+        dl.progress = 1.0
+        dl.error = ""
         session.add(HistoryEvent(
-            series_id=series.id, chapter_id=chapter.id, event="upgraded",
-            source_name=dl.source_name,
-            detail=(
-                f"from {replaced_source or 'an existing file'}; previous file "
-                f"{'removed' if discard_replaced else 'kept'}: {replaced}"
-            ),
+            series_id=series.id, chapter_id=chapter.id, event="imported",
+            source_name=dl.source_name, detail=str(dest),
         ))
-    await session.commit()
+        if replaced:
+            session.add(HistoryEvent(
+                series_id=series.id, chapter_id=chapter.id, event="upgraded",
+                source_name=dl.source_name,
+                detail=(
+                    f"from {replaced_source or 'an existing file'}; previous file "
+                    f"{'removed' if discard_replaced else 'kept'}: {replaced}"
+                ),
+            ))
+        await session.commit()
     if discard_replaced:
         previous = Path(replaced)
         try:
@@ -1817,7 +1874,7 @@ async def _import_torrent(
             if protects_inputs:
                 await _raise_if_download_removed(session, dl.id)
             try:
-                placed, coverage = await asyncio.to_thread(
+                placed, coverage = await run_file_work(
                     _place_torrent_files,
                     content_path,
                     SimpleNamespace(title=series.title, folder_name=series.folder_name),

@@ -168,7 +168,7 @@ async def test_torrent_import_waits_for_repair_before_adopting_shared_archive(
 
     def pause_repair(path, revision):
         require_revision(path, revision)
-        if path == archive and any(folder.glob(f".{archive.name}.*.tmp")):
+        if path == archive and any(folder.glob(".mangarr-comicinfo-*.tmp")):
             loop.call_soon_threadsafe(repair_ready.set)
             assert release_repair.wait(timeout=8)
 
@@ -206,6 +206,60 @@ async def test_torrent_import_waits_for_repair_before_adopting_shared_archive(
     assert by_number[1].downloaded
     assert comicinfo.read_comicinfo(Path(by_number[1].file_path)).number == "1"
     assert not by_number[2].downloaded and not by_number[2].file_path
+
+
+@pytest.mark.parametrize("in_library", [False, True])
+async def test_cancelled_torrent_import_holds_locks_until_placement_finishes(
+    db_session, tmp_path, monkeypatch, in_library,
+):
+    root = tmp_path / "library"
+    root.mkdir()
+    series = Series(title="Tracked", folder_name="Tracked", root_folder=RootFolder(path=str(root)),
+                    chapters=[Chapter(number=1)])
+    db_session.add(series)
+    await db_session.flush()
+    download = Download(series_id=series.id, kind=DownloadKind.TORRENT, status=DownloadStatus.IMPORTING)
+    db_session.add(download)
+    await db_session.commit()
+    source_root = root if in_library else tmp_path
+    source = source_root / "payload" / "Ch. 1.cbz"
+    write_cbz(source, [b"\xff\xd8\xffimage"], "<ComicInfo><Number>1</Number></ComicInfo>")
+
+    archive_lock = asyncio.Lock()
+    monkeypatch.setattr(metadata_issues, "manual_archive_lock", archive_lock)
+    monkeypatch.setattr(tasks, "_SERIES_LOCKS", {})
+    series_lock = tasks.series_lock(series.id)
+    placing, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    place = tasks._place_torrent_files
+
+    def pause_placement(*args, **kwargs):
+        loop.call_soon_threadsafe(placing.set)
+        assert release.wait(timeout=5)
+        return place(*args, **kwargs)
+
+    monkeypatch.setattr(tasks, "_place_torrent_files", pause_placement)
+
+    async def run_import():
+        async with series_lock:
+            await tasks._import_torrent(db_session, download, source, VALUES, files=[source])
+
+    importing = asyncio.create_task(run_import())
+    try:
+        await asyncio.wait_for(placing.wait(), timeout=5)
+        importing.cancel()
+        await asyncio.sleep(0)
+        assert series_lock.locked()
+        assert archive_lock.locked() == in_library
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await importing
+
+    assert not series_lock.locked() and not archive_lock.locked()
+    assert len(list((root / series.folder_name).glob("*.cbz"))) == 1
+    assert not series.chapters[0].downloaded
+    assert download.status == DownloadStatus.IMPORTING
 
 
 @pytest.mark.parametrize("mode", ["copy", "hardlink"])

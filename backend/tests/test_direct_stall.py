@@ -8,7 +8,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from mangarr.api.queue import _remove_downloads, get_queue
+from mangarr.api.queue import _remove_downloads, get_queue, retry_failed_download
 from mangarr.jobs import tasks
 from mangarr.jobs.tasks import REMOVED_BY_USER
 from mangarr.models import (
@@ -216,6 +216,68 @@ async def test_download_preserves_an_unmapped_archive_that_appears_mid_download(
     assert "already exists" in download.error
     chapter = await db_session.get(Chapter, chapter_id)
     assert not chapter.downloaded and not chapter.file_path
+
+
+@pytest.mark.parametrize("previous", [None, "archive", "symlink"])
+async def test_failed_install_commit_leaves_the_direct_download_retryable(db_session, tmp_path, monkeypatch, previous):
+    from mangarr import settings_service
+
+    download = await _make_download(db_session, tmp_path)
+    download_id, chapter_id = download.id, download.chapter_id
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    defaults = settings_service.DEFAULTS
+    dest = tasks.chapter_path(
+        tmp_path, defaults["naming_template"], defaults["naming_template_no_volume"],
+        "Test Series", "Test Series", 1, None, "",
+    )
+    if previous is not None:
+        dest.parent.mkdir()
+        if previous == "symlink":
+            target = tmp_path / "original.cbz"
+            target.write_bytes(b"original")
+            dest.symlink_to("../original.cbz")
+        else:
+            dest.write_bytes(b"original")
+        chapter = await db_session.get(Chapter, chapter_id)
+        chapter.file_path = str(dest)
+        chapter.downloaded = True
+        await db_session.commit()
+
+    async def stage(source, payload, series, chapter, staged, **kwargs):
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"new download")
+
+    commit = db_session.commit
+
+    async def fail_install_commit():
+        if download.status == DownloadStatus.DONE:
+            assert dest.read_bytes() == b"new download"
+            monkeypatch.setattr(db_session, "commit", commit)
+            raise RuntimeError("install commit failed")
+        await commit()
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", stage)
+    monkeypatch.setattr(db_session, "commit", fail_install_commit)
+    await tasks._run_direct_download(db_session, download)
+
+    assert download.status == DownloadStatus.FAILED
+    assert download.error == "install commit failed"
+    chapter = await db_session.get(Chapter, chapter_id)
+    if previous is None:
+        assert not dest.exists()
+        assert not chapter.downloaded and not chapter.file_path
+    else:
+        assert dest.read_bytes() == b"original"
+        assert dest.is_symlink() == (previous == "symlink")
+        assert chapter.downloaded and chapter.file_path == str(dest)
+
+    await retry_failed_download(download_id, db_session)
+    await tasks._run_direct_download(db_session, download)
+
+    assert download.status == DownloadStatus.DONE
+    assert chapter.downloaded and chapter.file_path == str(dest)
+    assert dest.read_bytes() == b"new download"
+    assert not list(dest.parent.glob(".mangarr-direct-*"))
 
 
 async def test_download_does_not_install_in_the_old_root_after_a_root_change(db_session, tmp_path, monkeypatch):

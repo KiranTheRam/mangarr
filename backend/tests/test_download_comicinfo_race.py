@@ -46,7 +46,7 @@ async def test_direct_upgrade_waits_for_repair_before_installing_archive(tmp_pat
 
     def pause_repair(path, revision):
         used_revision(path, revision)
-        if path == old and any(folder.glob(f".{old.name}.*.tmp")):
+        if path == old and any(folder.glob(".mangarr-comicinfo-*.tmp")):
             loop.call_soon_threadsafe(ready_to_replace.set)
             assert release_repair.wait(timeout=5)
 

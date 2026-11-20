@@ -19,6 +19,7 @@ from mangarr import comicinfo, db as db_module, metadata_issues
 from mangarr.api import issues as issues_api, library as library_api, series as series_api
 from mangarr.comicinfo import ArchiveChanged, ComicInfoError, read_comicinfo, update_comicinfo
 from mangarr.jobs import tasks
+from mangarr.library.naming import chapter_filename
 from mangarr.schemas import (
     ChapterMetadataIn, ComicInfoUpdateIn, FileMapIn, FileMapRangeIn, IssueResolveIn, RenameApplyIn,
     SeriesFolderUpdateIn,
@@ -61,6 +62,18 @@ def test_comicinfo_editor_preserves_pages_and_unknown_metadata(tmp_path):
             "001.png", "002.png"
         ]
         assert b"<Writer>Someone</Writer>" in zf.read("ComicInfo.xml")
+
+
+def test_comicinfo_editor_handles_a_maximum_length_chapter_filename(tmp_path):
+    template = "{series} - Ch. {chapter:04.1f} - {title}"
+    path = tmp_path / chapter_filename(template, template, "Tracked", 1, title="A" * 400)
+    archive(path, "<ComicInfo><Number>1</Number></ComicInfo>")
+    original = read_comicinfo(path)
+
+    update_comicinfo(path, {"title": "New title"}, expected_revision=original.revision)
+
+    assert read_comicinfo(path).title == "New title"
+    assert list(tmp_path.iterdir()) == [path]
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires changing file owner")
@@ -614,7 +627,7 @@ async def test_rename_waits_for_comicinfo_replacement(repair_db, monkeypatch):
 
     def pause_replacement(candidate_path, revision):
         require_revision(candidate_path, revision)
-        if any(path.parent.glob(f".{path.name}.*.tmp")):
+        if any(path.parent.glob(".mangarr-comicinfo-*.tmp")):
             loop.call_soon_threadsafe(checked.set)
             assert release.wait(timeout=5)
 
@@ -873,7 +886,7 @@ async def test_cross_series_scan_waits_for_comicinfo_replacement(repair_db, monk
 
     def pause_replacement(candidate_path, revision):
         require_revision(candidate_path, revision)
-        if any(path.parent.glob(f".{path.name}.*.tmp")):
+        if any(path.parent.glob(".mangarr-comicinfo-*.tmp")):
             loop.call_soon_threadsafe(checked.set)
             assert release.wait(timeout=5)
 
