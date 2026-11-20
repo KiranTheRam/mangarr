@@ -26,7 +26,7 @@ from mangarr.models import (
     Series,
     SeriesFolder,
 )
-from mangarr.schemas import ComicInfoUpdateIn, FileMapIn, SeriesFolderIn
+from mangarr.schemas import CleanupApplyIn, ComicInfoUpdateIn, FileMapIn, SeriesFolderIn
 
 VALUES = {
     "naming_template": "{series} - Ch. {chapter:04.1f}",
@@ -74,6 +74,8 @@ async def test_slow_import_does_not_block_the_event_loop(db_session, tmp_path, m
         import_started.set()
         ran_during_import.append(loop_ran.wait(timeout=0.5))
         match = next(c for c in chapters if c.number == 2.0)
+        write_cbz(dest, [b"\xff\xd8\xffimage"], "<ComicInfo><Number>2</Number></ComicInfo>")
+        kwargs["destination_versions"][dest] = tasks.archive_version(dest.stat())
         return [(dest, match, None)]
 
     monkeypatch.setattr(tasks, "import_torrent_payload", slow_import)
@@ -260,6 +262,82 @@ async def test_cancelled_torrent_import_holds_locks_until_placement_finishes(
     assert len(list((root / series.folder_name).glob("*.cbz"))) == 1
     assert not series.chapters[0].downloaded
     assert download.status == DownloadStatus.IMPORTING
+
+
+@pytest.mark.parametrize("replace", [False, True])
+async def test_torrent_does_not_map_a_destination_changed_during_cleanup(two_sessions, tmp_path, monkeypatch, replace):
+    sync, api, notified = two_sessions
+    root = tmp_path / "library"
+    root.mkdir()
+    root_folder = RootFolder(path=str(root))
+    first = Series(title="First", folder_name="Shared", root_folder=root_folder, chapters=[Chapter(number=1)])
+    other = Series(title="Other", folder_name="Shared", root_folder=root_folder, chapters=[Chapter(number=2)])
+    sync.add_all([first, other])
+    await sync.flush()
+    download = Download(series_id=first.id, kind=DownloadKind.TORRENT, status=DownloadStatus.IMPORTING)
+    sync.add(download)
+    await sync.commit()
+    source = tmp_path / "payload" / "Ch. 1.cbz"
+    write_cbz(source, [b"\xff\xd8\xffimage"], "<ComicInfo><Number>1</Number></ComicInfo>")
+    dest = root / "Shared" / "First - Ch. 0001.cbz"
+
+    placed, waiting = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    class ObservedLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                waiting.set()
+            return await super().acquire()
+
+    lock = ObservedLock()
+    monkeypatch.setattr(metadata_issues, "manual_archive_lock", lock)
+    monkeypatch.setattr(library, "manual_archive_lock", lock)
+    monkeypatch.setattr(tasks, "_import_path_missing_counts", {})
+    place = tasks._place_torrent_files
+    reconcile = library._reconcile_issues
+
+    def pause_after_placement(*args, **kwargs):
+        result = place(*args, **kwargs)
+        loop.call_soon_threadsafe(placed.set)
+        assert release.wait(5)
+        return result
+
+    async def pause_cleanup(*args):
+        await reconcile(*args)
+        assert not dest.exists()
+        if replace:
+            write_cbz(dest, [b"\xff\xd8\xffother image"], "<ComicInfo><Number>1</Number></ComicInfo>")
+        release.set()
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+
+    monkeypatch.setattr(tasks, "_place_torrent_files", pause_after_placement)
+    monkeypatch.setattr(library, "_reconcile_issues", pause_cleanup)
+
+    async def run_import():
+        async with tasks.series_lock(first.id):
+            await tasks._import_torrent(sync, download, source, VALUES, files=[source])
+
+    importing = asyncio.create_task(run_import())
+    try:
+        await asyncio.wait_for(placed.wait(), timeout=5)
+        assert (await library.cleanup_apply(other.id, CleanupApplyIn(delete=[str(dest)]), api)).deleted == 1
+    finally:
+        release.set()
+        await importing
+
+    assert download.status == DownloadStatus.DOWNLOADING
+    assert not first.chapters[0].downloaded and not first.chapters[0].file_path
+    assert not notified
+    await run_import()
+    if replace:
+        assert download.status == DownloadStatus.FAILED
+        assert "differs from the torrent" in download.error
+        assert not first.chapters[0].downloaded
+    else:
+        assert download.status == DownloadStatus.DONE
+        assert first.chapters[0].file_path == str(dest)
 
 
 @pytest.mark.parametrize("mode", ["copy", "hardlink"])

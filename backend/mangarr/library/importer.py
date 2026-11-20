@@ -114,7 +114,9 @@ def _require_archive_revision(path: Path, expected: ArchiveRevision | None) -> N
         raise FileNotFoundError(f"torrent archive changed while importing: {path}")
 
 
-def place_file(src: Path, dest: Path, mode: str, *, revision: ArchiveRevision | None = None) -> None:
+def place_file(
+    src: Path, dest: Path, mode: str, *, revision: ArchiveRevision | None = None,
+) -> ArchiveVersion:
     """Put a payload file into the library. Hardlink mode keeps the torrent
     seeding without doubling disk use; it needs src and dest on one
     filesystem, so cross-device (and any other) failure falls back to copy."""
@@ -124,8 +126,9 @@ def place_file(src: Path, dest: Path, mode: str, *, revision: ArchiveRevision | 
                 temporary.unlink()
                 os.link(src, temporary)
                 _require_archive_revision(src, revision)
+                placed_version = _archive_revision(temporary)
             log.info("Hardlinked %s -> %s", src.name, dest)
-            return
+            return placed_version
         except (FileNotFoundError, FileExistsError):
             raise
         except OSError as exc:
@@ -136,7 +139,9 @@ def place_file(src: Path, dest: Path, mode: str, *, revision: ArchiveRevision | 
         _require_archive_revision(src, revision)
         if temporary.stat().st_size != src.stat().st_size:
             raise OSError("Incomplete library copy")
+        placed_version = _archive_revision(temporary)
     log.info("Imported %s -> %s", src.name, dest)
+    return placed_version
 
 
 def _inside(path: Path, folder: Path) -> bool:
@@ -252,6 +257,8 @@ def import_torrent_payload(
     template_no_volume: str,
     import_mode: str = "hardlink",
     files: list[Path] | None = None,
+    *,
+    destination_versions: dict[Path, ArchiveVersion] | None = None,
 ) -> list[tuple[Path, Chapter | None, int | None]]:
     """Copies/renames payload files into the library. Returns (dest, matched
     chapter, volume) triples. Shared archives have no single chapter; only
@@ -314,6 +321,7 @@ def import_torrent_payload(
     def place(media: MediaFile, chapter: Chapter | None, volume: int | None) -> None:
         dest = destination(media, chapter, volume)
         if dest == media.path or dest.exists():
+            placed_version = _archive_revision(dest)
             _validate_existing(dest)
             recorded_here = (
                 chapter is not None and chapter.downloaded
@@ -322,11 +330,13 @@ def import_torrent_payload(
             if dest != media.path and not recorded_here and not _matches_payload(media, dest, only):
                 raise FileExistsError(f"Library file already exists and differs from the torrent: {dest}")
             _require_archive_revision(media.path, revisions.get(media.path))
+            _require_archive_revision(dest, placed_version)
+        elif media.is_dir:
+            placed_version = _pack_images(media.path, dest, only)
         else:
-            if media.is_dir:
-                _pack_images(media.path, dest, only)
-            else:
-                place_file(media.path, dest, import_mode, revision=revisions[media.path])
+            placed_version = place_file(media.path, dest, import_mode, revision=revisions[media.path])
+        if destination_versions is not None:
+            destination_versions[dest] = placed_version
         imported.append((dest, chapter, volume if chapter is None else None))
 
     for mf in result.matched:
@@ -346,10 +356,12 @@ def _loose_images(img_dir: Path, only: set[Path] | None) -> list[Path]:
     )
 
 
-def _pack_images(img_dir: Path, dest: Path, only: set[Path] | None = None) -> None:
+def _pack_images(img_dir: Path, dest: Path, only: set[Path] | None = None) -> ArchiveVersion:
     images = _loose_images(img_dir, only)
     with _atomic_destination(dest) as temporary:
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as zf:
             for img in images:
                 zf.write(img, img.name)
+        placed_version = _archive_revision(temporary)
     log.info("Packed %s (%d images) -> %s", img_dir, len(images), dest)
+    return placed_version

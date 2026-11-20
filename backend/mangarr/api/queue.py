@@ -9,6 +9,7 @@ from ..db import get_session
 from ..download.qbittorrent import QbtClient
 from ..jobs.tasks import (
     REMOVED_BY_USER,
+    DownloadCancelled,
     enqueue_direct,
     enqueue_torrent,
     failed_grab_blocks,
@@ -143,6 +144,17 @@ async def _verify_direct_availability(source_name: str, external_id: str) -> Non
             raise HTTPException(409, f"{source_name} could not verify that this chapter is available")
 
 
+async def _queue_series(session: AsyncSession, series_id: int | None) -> Series | None:
+    if series_id is None:
+        return None
+    series = await session.scalar(
+        select(Series).where(Series.id == series_id, Series.deletion_pending.is_(False))
+    )
+    if series is None:
+        raise HTTPException(404, "Series not found")
+    return series
+
+
 @router.post("/queue/{download_id}/retry", response_model=QueueItemOut)
 async def retry_failed_download(
     download_id: int, session: AsyncSession = Depends(get_session)
@@ -153,6 +165,7 @@ async def retry_failed_download(
         raise HTTPException(404, "Download not found")
     if dl.status != DownloadStatus.FAILED:
         raise HTTPException(409, "Only failed downloads can be retried")
+    series = await _queue_series(session, dl.series_id)
     if dl.chapter_id is not None:
         chapter = await session.get(Chapter, dl.chapter_id)
         if chapter is None or chapter.excluded:
@@ -172,8 +185,11 @@ async def retry_failed_download(
                     existing = await client.get_torrent(dl.torrent_hash)
                 finally:
                     await client.close()
+            await _queue_series(session, dl.series_id)
             if existing is None:
                 dl.torrent_hash = await submit_torrent(dl.payload, values)
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(502, "Torrent submission failed; check the indexer and qBittorrent settings") from exc
         dl.status = DownloadStatus.DOWNLOADING
@@ -182,6 +198,7 @@ async def retry_failed_download(
         if getattr(source, "requires_chapter_verification", False):
             await registry.apply_settings(session)
             await _verify_direct_availability(dl.source_name, dl.payload)
+        await _queue_series(session, dl.series_id)
         dl.status = DownloadStatus.QUEUED
 
     dl.progress = 0.0
@@ -196,7 +213,6 @@ async def retry_failed_download(
     ))
     await session.commit()
 
-    series = await session.get(Series, dl.series_id) if dl.series_id else None
     out = QueueItemOut.model_validate(dl)
     out.series_title = series.title if series else ""
     return out
@@ -210,8 +226,9 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
         chapter = await session.get(Chapter, body.chapter_id)
         if chapter is None or chapter.excluded:
             raise HTTPException(404, "Chapter not found")
-        series = await session.get(Series, chapter.series_id)
+        await _queue_series(session, chapter.series_id)
         await _verify_direct_availability(body.source_name, body.external_id)
+        series = await _queue_series(session, chapter.series_id)
         dl = await enqueue_direct(
             session, series, chapter, body.source_name, body.external_id, group=body.group
         )
@@ -220,14 +237,14 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
             raise HTTPException(400, "qBittorrent is not enabled in settings")
         if not magnet_btih_hex(body.magnet) and not body.magnet.startswith(("http://", "https://")):
             raise HTTPException(422, "Provide a valid btih magnet or an HTTP(S) torrent URL")
-        series = await session.get(Series, body.series_id) if body.series_id else None
-        if body.series_id and series is None:
-            raise HTTPException(404, "Series not found")
+        series = await _queue_series(session, body.series_id)
         try:
             dl = await enqueue_torrent(
                 session, series, body.magnet, body.title or "manual torrent", values,
                 source_name=body.source_name or "manual"
             )
+        except DownloadCancelled as exc:
+            raise HTTPException(404, "Series not found") from exc
         except Exception as exc:
             raise HTTPException(502, "Torrent submission failed; check the indexer and qBittorrent settings") from exc
     else:

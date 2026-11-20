@@ -3,7 +3,11 @@ instead of wedging the single queue worker, concurrent page callbacks must
 not corrupt the shared session, and failures must stay visible in /queue."""
 
 import asyncio
+import os
+import sys
+from contextlib import asynccontextmanager
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -218,8 +222,8 @@ async def test_download_preserves_an_unmapped_archive_that_appears_mid_download(
     assert not chapter.downloaded and not chapter.file_path
 
 
-@pytest.mark.parametrize("previous", [None, "archive", "symlink"])
-async def test_failed_install_commit_leaves_the_direct_download_retryable(db_session, tmp_path, monkeypatch, previous):
+@pytest.mark.parametrize("previous", [None, "archive", "symlink", "concurrent replacement"])
+async def test_failed_install_leaves_the_direct_download_retryable(db_session, tmp_path, monkeypatch, previous):
     from mangarr import settings_service
 
     download = await _make_download(db_session, tmp_path)
@@ -250,6 +254,13 @@ async def test_failed_install_commit_leaves_the_direct_download_retryable(db_ses
     commit = db_session.commit
 
     async def fail_install_commit():
+        if previous == "concurrent replacement" and download.direct_install is not None:
+            await commit()
+            other = dest.with_suffix(".incoming")
+            other.write_bytes(b"replacement between validation and publication")
+            other.replace(dest)
+            monkeypatch.setattr(db_session, "commit", commit)
+            return
         if download.status == DownloadStatus.DONE:
             assert dest.read_bytes() == b"new download"
             monkeypatch.setattr(db_session, "commit", commit)
@@ -261,13 +272,19 @@ async def test_failed_install_commit_leaves_the_direct_download_retryable(db_ses
     await tasks._run_direct_download(db_session, download)
 
     assert download.status == DownloadStatus.FAILED
-    assert download.error == "install commit failed"
+    if previous == "concurrent replacement":
+        assert "changed while the download was being installed" in download.error
+    else:
+        assert download.error == "install commit failed"
     chapter = await db_session.get(Chapter, chapter_id)
     if previous is None:
         assert not dest.exists()
         assert not chapter.downloaded and not chapter.file_path
     else:
-        assert dest.read_bytes() == b"original"
+        if previous == "concurrent replacement":
+            assert dest.read_bytes() == b"replacement between validation and publication"
+        else:
+            assert dest.read_bytes() == b"original"
         assert dest.is_symlink() == (previous == "symlink")
         assert chapter.downloaded and chapter.file_path == str(dest)
 
@@ -278,6 +295,130 @@ async def test_failed_install_commit_leaves_the_direct_download_retryable(db_ses
     assert chapter.downloaded and chapter.file_path == str(dest)
     assert dest.read_bytes() == b"new download"
     assert not list(dest.parent.glob(".mangarr-direct-*"))
+
+
+async def _crash_during_publication(database, destination, commit_mapping):
+    engine = create_async_engine(database)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        download = await session.get(Download, 1)
+        series = await tasks._load_series(session, download.series_id)
+        chapter = series.chapters[0]
+        dest = Path(destination)
+        staged = dest.with_name(".mangarr-direct-1.staged")
+        staged.write_bytes(b"new download")
+        expected = tasks.archive_version(dest.stat()) if dest.exists() else None
+        commit = session.commit
+
+        async def interrupt_install_commit():
+            if download.status == DownloadStatus.DONE:
+                assert dest.read_bytes() == b"new download"
+                if commit_mapping:
+                    await commit()
+                os._exit(75)
+            await commit()
+
+        async def wanted():
+            pass
+
+        session.commit = interrupt_install_commit
+        await tasks._install_direct_download(session, download, series, chapter, staged, dest, wanted, expected)
+
+
+@pytest.mark.parametrize("scenario", [
+    "new file", "overwrite", "committed overwrite", "external replacement", "hidden directory",
+])
+async def test_startup_recovers_a_direct_worker_killed_during_install(tmp_path, monkeypatch, scenario):
+    from mangarr import settings_service
+
+    root = tmp_path / "library"
+    root.mkdir()
+    database = f"sqlite+aiosqlite:///{tmp_path / 'recovery.db'}"
+    engine = create_async_engine(database)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def scope():
+        async with maker() as session:
+            yield session
+
+    monkeypatch.setattr(tasks, "session_scope", scope)
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    monkeypatch.setitem(settings_service.DEFAULTS, "source_fake_enabled", "true")
+    defaults = settings_service.DEFAULTS
+    dest = tasks.chapter_path(
+        root, defaults["naming_template"], defaults["naming_template_no_volume"],
+        "Test Series", "Test Series", 1, None, "",
+    )
+    dest.parent.mkdir()
+    overwrite = scenario in {"overwrite", "committed overwrite"}
+    committed = scenario == "committed overwrite"
+
+    try:
+        async with maker() as session:
+            download = await _make_download(session, root)
+            download.status = DownloadStatus.DOWNLOADING
+            chapter = await session.get(Chapter, download.chapter_id)
+            if overwrite:
+                dest.write_bytes(b"original")
+                chapter.downloaded = True
+                chapter.file_path = str(dest)
+            await session.commit()
+
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c",
+            "import asyncio, sys; from tests.test_direct_stall import _crash_during_publication; "
+            "asyncio.run(_crash_during_publication(sys.argv[1], sys.argv[2], sys.argv[3] == 'True'))",
+            database, str(dest), str(committed), cwd=Path(__file__).resolve().parents[1],
+        )
+        assert await asyncio.wait_for(process.wait(), timeout=10) == 75
+        assert dest.read_bytes() == b"new download"
+        if scenario == "external replacement":
+            other = dest.with_suffix(".incoming")
+            other.write_bytes(b"different archive")
+            other.replace(dest)
+        if scenario == "hidden directory":
+            hidden = dest.parent.with_name("offline")
+            dest.parent.rename(hidden)
+            dest.parent.mkdir()
+            await tasks.recover_interrupted_downloads()
+            async with maker() as session:
+                assert (await session.get(Download, 1)).direct_install is not None
+            dest.parent.rmdir()
+            hidden.rename(dest.parent)
+
+        await tasks.recover_interrupted_downloads()
+        async with maker() as session:
+            download = await session.get(Download, 1)
+            assert download.direct_install is None
+            assert not list(dest.parent.glob(".mangarr-direct-rollback-*"))
+            if committed:
+                assert download.status == DownloadStatus.DONE
+                assert dest.read_bytes() == b"new download"
+            else:
+                assert download.status == DownloadStatus.QUEUED
+                if overwrite:
+                    assert dest.read_bytes() == b"original"
+                elif scenario == "external replacement":
+                    assert dest.read_bytes() == b"different archive"
+                else:
+                    assert not dest.exists()
+
+                async def stage(source, payload, series, chapter, staged, **kwargs):
+                    staged.write_bytes(b"retried download")
+
+                monkeypatch.setattr(tasks, "download_chapter_to_cbz", stage)
+                await tasks._run_direct_download(session, download)
+                if scenario == "external replacement":
+                    assert download.status == DownloadStatus.FAILED
+                    assert dest.read_bytes() == b"different archive"
+                else:
+                    assert download.status == DownloadStatus.DONE
+                    assert dest.read_bytes() == b"retried download"
+    finally:
+        await engine.dispose()
 
 
 async def test_download_does_not_install_in_the_old_root_after_a_root_change(db_session, tmp_path, monkeypatch):

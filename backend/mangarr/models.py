@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -243,6 +244,8 @@ class Download(Base):
     # scanlation group of the grabbed release, when the source reports one
     release_group: Mapped[str] = mapped_column(String, default="")
     torrent_hash: Mapped[str] = mapped_column(String, default="")
+    # Filesystem publication starts after this journal is committed.
+    direct_install: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)  # 0..1
     error: Mapped[str] = mapped_column(Text, default="")
     # a failure a later attempt can be expected to clear (network, timeout,

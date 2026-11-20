@@ -56,6 +56,7 @@ async def wanted(limit: int = 100, session: AsyncSession = Depends(get_session),
             Chapter.downloaded == False,  # noqa: E712
             Chapter.excluded == False,  # noqa: E712
             Series.monitored == True,  # noqa: E712
+            Series.deletion_pending.is_(False),
         )
         .order_by(Series.title, Series.id, Chapter.number, Chapter.id)
         .offset(offset)
@@ -85,6 +86,7 @@ async def wanted_page(
         select(func.count(Chapter.id)).join(Series).where(
             Chapter.monitored == True, Chapter.downloaded == False,
             Chapter.excluded == False, Series.monitored == True,
+            Series.deletion_pending.is_(False),
         )
     )
     return {"items": await wanted(limit, session, offset), "total": total}

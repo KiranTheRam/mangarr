@@ -2,16 +2,19 @@
 and must not make the request wait behind a long refresh."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from mangarr.api import issues as issues_api, series as series_api
+from mangarr import settings_service
+from mangarr.api import issues as issues_api, queue, series as series_api, system
 from mangarr.comicinfo import read_comicinfo
+from mangarr.jobs import tasks
 from mangarr.jobs.tasks import REMOVED_BY_USER
 from mangarr.models import Chapter, Download, DownloadKind, DownloadStatus, Series
-from mangarr.schemas import ComicInfoUpdateIn, IssueResolveIn, SeriesBulkIn
+from mangarr.schemas import ComicInfoUpdateIn, GrabIn, IssueResolveIn, SeriesBulkIn
 from tests.test_metadata_issues import repair_db  # noqa: F401
 
 
@@ -142,3 +145,45 @@ async def test_deferred_delete_is_recovered_after_its_task_is_cancelled(repair_d
     await _finish_deletions()
     assert await _series_row(maker, series_id) is None
     assert path.exists()
+
+
+async def test_pending_deletion_hides_wanted_chapters_and_rejects_grabs_and_retries(repair_db, monkeypatch):
+    session, maker, series, _ = repair_db
+    series_id, chapter_id = series.id, series.chapters[0].id
+    series.chapters[0].downloaded = False
+    active = Series(title="Active", chapters=[Chapter(number=1)])
+    failed = Download(series_id=series_id, kind=DownloadKind.TORRENT, status=DownloadStatus.FAILED)
+    session.add_all([active, failed])
+    await session.commit()
+    active_id, download_id = active.id, failed.id
+
+    monkeypatch.setattr(queue.registry, "apply_settings", AsyncMock(return_value={
+        **settings_service.DEFAULTS, "qbittorrent_enabled": "true",
+    }))
+    submit = AsyncMock()
+    verify = AsyncMock()
+    monkeypatch.setattr(queue, "enqueue_torrent", submit)
+    monkeypatch.setattr(queue, "submit_torrent", submit)
+    monkeypatch.setattr(queue, "_verify_direct_availability", verify)
+    monkeypatch.setattr(tasks, "submit_torrent", submit)
+    async with series_api.series_lock(series_id):
+        await _delete(maker, series_id, False)
+        async with maker() as check:
+            wanted = await system.wanted_page(limit=100, offset=0, session=check)
+            assert wanted["total"] == 1
+            assert [item.series_id for item in wanted["items"]] == [active_id]
+            for grab in (
+                GrabIn(chapter_id=chapter_id, source_name="fake", external_id="c1"),
+                GrabIn(series_id=series_id, magnet="magnet:?xt=urn:btih:" + "a" * 40),
+            ):
+                with pytest.raises(HTTPException) as rejected:
+                    await queue.grab(grab, check)
+                assert rejected.value.status_code == 404
+            with pytest.raises(HTTPException) as rejected:
+                await queue.retry_failed_download(download_id, check)
+            assert rejected.value.status_code == 404
+        with pytest.raises(tasks.DownloadCancelled):
+            await tasks.enqueue_torrent(session, series, "unused", "release", settings_service.DEFAULTS)
+    await _finish_deletions()
+    submit.assert_not_awaited()
+    verify.assert_not_awaited()

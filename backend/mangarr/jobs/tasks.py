@@ -1092,6 +1092,8 @@ async def enqueue_torrent(
     session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
     source_name: str = "manual",
 ) -> Download:
+    if series is not None and not await _series_accepts_downloads(session, series.id):
+        raise DownloadCancelled("series no longer exists or is being deleted")
     torrent_hash = await submit_torrent(magnet, values)
     dl = Download(
         series_id=series.id if series else None,
@@ -1109,6 +1111,13 @@ async def enqueue_torrent(
     ))
     await session.commit()
     return dl
+
+
+async def _series_accepts_downloads(session: AsyncSession, series_id: int) -> bool:
+    with session.no_autoflush:
+        return await session.scalar(
+            select(Series.id).where(Series.id == series_id, Series.deletion_pending.is_(False))
+        ) is not None
 
 
 @dataclass(frozen=True)
@@ -1391,6 +1400,12 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     staged: Path | None = None
     download_task: asyncio.Task | None = None
     try:
+        if dl.direct_install is not None:
+            async with series_lock(series_id), manual_archive_lock:
+                await ensure_not_cancelled(force=True)
+                if not await _recover_direct_install(session, dl):
+                    raise LibraryUnavailableError("could not recover the interrupted archive install")
+                await session.commit()
         # inside the try: a broken naming template must fail THIS download
         # (visibly, with an error) instead of crashing the queue worker and
         # leaving the row stuck in "downloading"
@@ -1547,21 +1562,99 @@ def _backup_direct_archive(dest: Path, backup: Path) -> None:
         shutil.copy2(dest, backup)
 
 
+def _direct_entry_version(path: Path) -> ArchiveVersion | None:
+    try:
+        return archive_version(path.lstat())
+    except FileNotFoundError:
+        if not path.parent.is_dir():
+            raise
+        return None
+
+
+def _remove_direct_backup(backup: Path) -> None:
+    if not backup.parent.parent.is_dir():
+        raise FileNotFoundError(f"download backup directory is unavailable: {backup.parent.parent}")
+    backup.unlink(missing_ok=True)
+    with suppress(FileNotFoundError):
+        backup.parent.rmdir()
+
+
+def _rollback_direct_archive(install: dict) -> None:
+    dest = Path(install["destination"])
+    current = _direct_entry_version(dest)
+    backup = Path(install["backup"]) if install["backup"] else None
+    if current == tuple(install["version"]):
+        if backup is None:
+            dest.unlink()
+        else:
+            if list(archive_version(backup.lstat())) != install["previous_versions"][-1]:
+                raise FileExistsError(f"previous archive changed after it was backed up: {backup}")
+            backup.replace(dest)
+    elif (backup is not None and list(current or ()) not in install["previous_versions"]
+          and os.path.lexists(backup)):
+        raise FileExistsError(f"{dest.name} changed after publication. Previous archive: {backup}")
+    if backup is not None:
+        _remove_direct_backup(backup)
+
+
+async def _recover_direct_install(session: AsyncSession, dl: Download) -> bool:
+    from ..metadata_issues import load_archive_ownership
+
+    install = dl.direct_install
+    assert install is not None
+    dest = Path(install["destination"])
+    try:
+        # An unmounted share can expose a different directory at the same
+        # path. Keep the journal until the recorded directory is accessible.
+        directory = await asyncio.to_thread(dest.parent.stat)
+        if list(archive_version(directory)[:2]) != install["directory"]:
+            raise FileNotFoundError(f"download directory changed: {dest.parent}")
+        if dl.status == DownloadStatus.DONE:
+            if install["backup"]:
+                await run_file_work(_remove_direct_backup, Path(install["backup"]))
+        else:
+            current = await asyncio.to_thread(_direct_entry_version, dest)
+            if current == tuple(install["version"]):
+                ownership = await load_archive_ownership(session)
+                if ownership.owners.get(current[:2], set()) - {dl.chapter_id}:
+                    raise FileExistsError("another chapter now maps the interrupted download")
+            await run_file_work(_rollback_direct_archive, install)
+    except OSError as exc:
+        log.warning("could not recover direct download %d at %s: %s", dl.id, install["destination"], exc)
+        return False
+    dl.direct_install = None
+    return True
+
+
 @asynccontextmanager
 async def _publish_direct_archive(
-    staged: Path, dest: Path, expected_destination: ArchiveVersion | None,
+    session: AsyncSession, dl: Download, staged: Path, dest: Path,
+    expected_destination: ArchiveVersion | None,
     check_still_wanted: Callable[[], Awaitable[None]],
 ):
     """Publish for the database commit and undo our publication on failure."""
     backup = None
+    previous_versions = []
     keep_backup = False
     try:
         if expected_destination is not None:
             original_entry = archive_version(dest.lstat())
             backup = Path(mkdtemp(dir=dest.parent, prefix=".mangarr-direct-rollback-")) / "previous"
             await run_file_work(_backup_direct_archive, dest, backup)
+            previous_versions = [list(original_entry), list(archive_version(backup.lstat()))]
         await check_still_wanted()
-        installed_version = archive_version(staged.lstat())
+        install = {
+            "destination": str(dest.absolute()),
+            "directory": list(archive_version(dest.parent.stat())[:2]),
+            "version": list(archive_version(staged.lstat())),
+            "backup": str(backup.absolute()) if backup else None,
+            "previous_versions": previous_versions,
+        }
+        dl.direct_install = install
+        await session.commit()
+        await check_still_wanted()
+        if list(archive_version(staged.lstat())) != install["version"]:
+            raise FileExistsError(f"staged download changed while it was being installed: {staged.name}")
         if backup is None:
             publish_new_file(staged, dest)
         else:
@@ -1573,25 +1666,15 @@ async def _publish_direct_archive(
             yield
         except Exception:
             try:
-                if archive_version(dest.lstat()) == installed_version:
-                    if backup is None:
-                        dest.unlink()
-                    else:
-                        backup.replace(dest)
-                elif backup is not None:
-                    raise FileExistsError(f"{dest.name} changed after the download was installed")
+                await run_file_work(_rollback_direct_archive, install)
             except OSError as exc:
-                if backup is not None:
-                    keep_backup = True
-                    log.warning("could not restore %s from %s: %s", dest, backup, exc)
-                elif not isinstance(exc, FileNotFoundError):
-                    log.warning("could not remove uncommitted download %s: %s", dest, exc)
+                keep_backup = True
+                log.warning("could not roll back uncommitted download at %s: %s", dest, exc)
             raise
     finally:
         if backup is not None and not keep_backup:
             try:
-                backup.unlink(missing_ok=True)
-                backup.parent.rmdir()
+                _remove_direct_backup(backup)
             except OSError as exc:
                 log.warning("could not clean up download backup %s: %s", backup, exc)
 
@@ -1622,7 +1705,7 @@ async def _install_direct_download(
             replaced_version is not None
             and ownership.owners.get(replaced_version[:2]) == {chapter.id}
         )
-    async with _publish_direct_archive(staged, dest, expected_destination, check_still_wanted):
+    async with _publish_direct_archive(session, dl, staged, dest, expected_destination, check_still_wanted):
         chapter.downloaded = True
         chapter.file_path = str(dest)
         chapter.file_source = dl.source_name
@@ -1630,6 +1713,10 @@ async def _install_direct_download(
         dl.status = DownloadStatus.DONE
         dl.progress = 1.0
         dl.error = ""
+        # Keep the journal for replacements until startup can verify that any
+        # backup left between this commit and cleanup has been removed.
+        if expected_destination is None:
+            dl.direct_install = None
         session.add(HistoryEvent(
             series_id=series.id, chapter_id=chapter.id, event="imported",
             source_name=dl.source_name, detail=str(dest),
@@ -1777,7 +1864,10 @@ async def sync_qbittorrent() -> None:
 
 def _place_torrent_files(content_path, series, chapters, *args, **kwargs):
     """Place files and resolve shared-archive ownership off the event loop."""
-    placed = import_torrent_payload(content_path, series, chapters, *args, **kwargs)
+    versions: dict[Path, ArchiveVersion] = {}
+    placed = import_torrent_payload(
+        content_path, series, chapters, *args, **kwargs, destination_versions=versions,
+    )
     # Unknown imports retain decorations from the series title. Re-parsing
     # those names could turn a title such as C3 into invented ownership.
     shared = [dest for dest, chapter, volume in placed if chapter is None
@@ -1786,7 +1876,13 @@ def _place_torrent_files(content_path, series, chapters, *args, **kwargs):
         [media for dest in shared for media in find_media_files(dest)], chapters
     )
     coverage = {str(m.media.path): [c.id for c in m.covered_chapters] for m in matches.matched}
-    return placed, coverage
+    return placed, coverage, versions
+
+
+def _check_torrent_destinations(versions: dict[Path, ArchiveVersion]) -> None:
+    for path, version in versions.items():
+        if archive_version(path.stat()) != version:
+            raise FileNotFoundError(f"library archive changed while importing: {path}")
 
 
 def _torrent_payload_overlaps_library(
@@ -1874,7 +1970,7 @@ async def _import_torrent(
             if protects_inputs:
                 await _raise_if_download_removed(session, dl.id)
             try:
-                placed, coverage = await run_file_work(
+                placed, coverage, versions = await run_file_work(
                     _place_torrent_files,
                     content_path,
                     SimpleNamespace(title=series.title, folder_name=series.folder_name),
@@ -1888,6 +1984,12 @@ async def _import_torrent(
                     values["naming_template"], values["naming_template_no_volume"],
                     import_mode=values.get("import_mode", "hardlink"), files=files,
                 )
+                # External copies run without the archive lock. Recheck the
+                # installed versions under it before publishing their mappings.
+                if not protects_inputs:
+                    await archive_guard.enter_async_context(manual_archive_lock)
+                await asyncio.to_thread(_check_torrent_destinations, versions)
+                await _raise_if_download_removed(session, dl.id)
             except Exception:
                 # the queue stays usable while the worker runs, so the user may
                 # have removed this download meanwhile (which also deletes the
@@ -1933,16 +2035,6 @@ async def _import_torrent(
             (dest, candidates[match.id] if match is not None else None, volume)
             for dest, match, volume in placed
         ]
-        # Ordinary downloads copy or pack external payloads without holding
-        # the archive lock. Publishing ownership must still serialize with
-        # repairs so their ownership checks cover the replacement itself.
-        if not protects_inputs:
-            await archive_guard.enter_async_context(manual_archive_lock)
-        try:
-            await _raise_if_download_removed(session, dl.id)
-        except DownloadCancelled as cancelled:
-            log.info("torrent import %d discarded: %s", dl.id, cancelled)
-            return
         for dest, chapter, _volume in imported:
             if chapter is not None:
                 # Keep the origin of a file the import found already mapped.
@@ -2032,6 +2124,7 @@ async def _claim_duplicate_fallback(
     ).exists()
     same_policy = select(Series.id).where(
         Series.id == series.id,
+        Series.deletion_pending.is_(False),
         Series.source_priority == series.source_priority,
         Series.blocked_sources == series.blocked_sources,
         Series.preferred_groups == series.preferred_groups,
@@ -2207,6 +2300,9 @@ async def grab_missing_chapters(
                             src.name, series.title, type(exc).__name__)
                 continue
             source_chapters = [sc for sc in source_chapters if sc.external_id in verified]
+        # A long source lookup can outlive a deferred delete of this series.
+        if not await _series_accepts_downloads(session, series.id):
+            break
         for sc in source_chapters:
             ch = remaining.get(sc.number)
             if ch is not None:
@@ -2384,23 +2480,27 @@ async def merge_complete_volumes(
 
 
 async def recover_interrupted_downloads() -> None:
-    """Startup pass: direct downloads left mid-flight by a crash/restart go
-    back to queued (the worker only picks up QUEUED, so they would otherwise
-    sit in 'downloading' forever — and block re-grabs of their chapters)."""
-    async with session_scope() as session:
+    """Reconcile interrupted archive installs and put active downloads back in the queue."""
+    from ..metadata_issues import manual_archive_lock
+
+    async with manual_archive_lock, session_scope() as session:
         result = await session.execute(
             select(Download).where(
                 Download.kind == DownloadKind.DIRECT,
-                Download.status == DownloadStatus.DOWNLOADING,
+                or_(Download.status == DownloadStatus.DOWNLOADING, Download.direct_install.is_not(None)),
             )
         )
-        stuck = result.scalars().all()
-        for dl in stuck:
-            dl.status = DownloadStatus.QUEUED
-            dl.progress = 0.0
-        if stuck:
-            await session.commit()
-            log.info("Requeued %d direct download(s) interrupted by restart", len(stuck))
+        requeued = 0
+        for dl in result.scalars():
+            if dl.direct_install is not None:
+                await _recover_direct_install(session, dl)
+            if dl.status == DownloadStatus.DOWNLOADING:
+                dl.status = DownloadStatus.QUEUED
+                dl.progress = 0.0
+                requeued += 1
+        await session.commit()
+        if requeued:
+            log.info("Requeued %d direct download(s) interrupted by restart", requeued)
 
 
 def _checked_within(series: Series, days: int) -> bool:

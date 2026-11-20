@@ -195,7 +195,7 @@ def test_import_does_not_invent_coverage_from_added_series_title(tmp_path):
     archive(source)
     series = Series(id=1, title="C3", folder_name="C3")
     tracked = [Chapter(id=1, series_id=1, number=3, title="")]
-    placed, coverage = _place_torrent_files(
+    placed, coverage, _versions = _place_torrent_files(
         source, series, tracked, tmp_path / "library", DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME,
     )
     assert len(placed) == 1 and placed[0][1] is None
