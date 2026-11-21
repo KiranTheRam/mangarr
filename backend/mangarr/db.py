@@ -72,6 +72,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("series", "last_monitored_at", "DATETIME", None),
     ("chapters", "file_source", "VARCHAR NOT NULL DEFAULT ''", None),
     ("chapters", "file_group", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("chapters", "pdf_mapping", "VARCHAR NOT NULL DEFAULT ''", None),
     ("downloads", "release_group", "VARCHAR NOT NULL DEFAULT ''", None),
     ("series_folders", "volume_offset", "INTEGER", None),
     # existing failures keep their 7-day block (they were never classified)

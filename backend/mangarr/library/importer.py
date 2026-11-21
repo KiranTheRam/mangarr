@@ -281,7 +281,7 @@ def import_torrent_payload(
     folder = library_root / (series.folder_name or series_folder(series.title))
     folder.mkdir(parents=True, exist_ok=True)
     imported: list[tuple[Path, Chapter | None, int | None]] = []
-    media = find_media_files(content_path, only)
+    media = find_media_files(content_path, only, include_pdfs=False)
     # Capture archive identity before matching can read its ComicInfo. An
     # external payload can become an editable library file during an import.
     revisions = {item.path: _archive_revision(item.path) for item in media if not item.is_dir}

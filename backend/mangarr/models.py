@@ -195,6 +195,10 @@ class Chapter(Base):
     # files adopted from disk, which upgrades and volume merges never touch.
     file_source: Mapped[str] = mapped_column(String, default="")
     file_group: Mapped[str] = mapped_column(String, default="")
+    # Filename-based PDF adoption can be rechecked. Manual single mappings
+    # stay pinned; manually mapped ranges and renamed files can yield to an
+    # exact chapter file without relying on their current filenames.
+    pdf_mapping: Mapped[str] = mapped_column(String, default="")
 
     series: Mapped[Series] = relationship(back_populates="chapters")
 
@@ -209,6 +213,7 @@ class Chapter(Base):
         if value != self.__dict__.get("file_path"):
             self.file_source = ""
             self.file_group = ""
+            self.pdf_mapping = ""
         return value
 
 

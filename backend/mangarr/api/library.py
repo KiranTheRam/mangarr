@@ -11,7 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from .. import settings_service
 from ..db import get_session
-from ..library.matcher import find_series_media_files, match_files
+from ..library.matcher import find_series_media_files, match_files, split_pdf_title_conflicts
 from ..library.rename import apply_renames, plan_renames
 from ..library.scanner import (
     chapters_under_folders,
@@ -61,6 +61,7 @@ from ..schemas import (
     VolumeResyncPreviewOut,
 )
 from ..sources import registry
+from ..titles import metadata_titles
 
 router = APIRouter(tags=["library"])
 
@@ -97,9 +98,10 @@ def _volume_offsets_of(series: Series) -> dict[str, int]:
     return resolve_volume_offsets(_root_of(series), series)
 
 
-def _media_of(series: Series):
+def _media_of(series: Series, *, include_pdfs: bool = True):
     return find_series_media_files(
-        _folders_of(series), _active_chapters(series), _volume_offsets_of(series)
+        _folders_of(series), _active_chapters(series), _volume_offsets_of(series),
+        include_pdfs=include_pdfs,
     )
 
 
@@ -238,7 +240,9 @@ async def rename_apply(
 @router.get("/series/{series_id}/files", response_model=list[SeriesFileOut])
 async def series_files(series_id: int, session: AsyncSession = Depends(get_session)):
     series = await _load(session, series_id)
-    media = _media_of(series)
+    media, pdf_conflicts = split_pdf_title_conflicts(
+        _media_of(series), [series.title, *metadata_titles(series)],
+    )
     result = match_files(media, _active_chapters(series))
     out: list[SeriesFileOut] = []
     for mf in result.matched:
@@ -248,7 +252,7 @@ async def series_files(series_id: int, session: AsyncSession = Depends(get_sessi
             matched_chapter_id=mf.chapter.id if mf.chapter else None,
             covered_count=len(mf.covered_chapters),
         ))
-    for m in result.unmatched:
+    for m in (*result.unmatched, *pdf_conflicts):
         out.append(SeriesFileOut(
             path=str(m.path), name=m.path.name, is_dir=m.is_dir,
             chapter_number=m.chapter_number, volume_number=m.volume_number,
@@ -269,6 +273,8 @@ async def map_file(
         media_path = _require_series_media_path(series, body.file_path)
         chapter.downloaded = True
         chapter.file_path = str(media_path)
+        if media_path.is_file() and media_path.suffix.lower() == ".pdf":
+            chapter.pdf_mapping = "manual"
         await _reconcile_issues(session, series)
         await session.commit()
 
@@ -282,7 +288,7 @@ async def cleanup_plan(series_id: int, session: AsyncSession = Depends(get_sessi
     plan = analyze(
         series, _active_chapters(series), _folders_of(series),
         values["naming_template"], values["naming_template_no_volume"],
-        media=_media_of(series),
+        media=_media_of(series, include_pdfs=False),
     )
 
     def out(f):
@@ -307,7 +313,7 @@ async def cleanup_apply(
         series = await _load(session, series_id)
         result = apply_cleanup(
             series, _active_chapters(series), _folders_of(series), body.delete,
-            media=_media_of(series),
+            media=_media_of(series, include_pdfs=False),
         )
         await _reconcile_issues(session, series)
         await session.commit()
@@ -331,11 +337,14 @@ async def map_file_range(
         media_path = _require_series_media_path(series, body.file_path)
         lo, hi = sorted((body.from_number, body.to_number))
         volume = parse_volume_number(media_path.stem)
+        is_pdf = media_path.is_file() and media_path.suffix.lower() == ".pdf"
         mapped = 0
         for ch in _active_chapters(series):
             if lo <= ch.number <= hi:
                 ch.downloaded = True
                 ch.file_path = str(media_path)
+                if is_pdf:
+                    ch.pdf_mapping = "manual" if lo == hi else "confirmed"
                 if volume is not None:
                     ch.volume = volume
                     ch.volume_source = "manual"
@@ -571,10 +580,15 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
             ch.number: (
                 ch.title, ch.volume, ch.title_source, ch.volume_source,
                 ch.title_locked, ch.volume_locked, ch.excluded, ch.monitored,
-                ch.downloaded, ch.file_path, ch.released_at, ch.available_sources,
+                ch.downloaded, ch.file_path, ch.released_at, ch.available_sources, ch.pdf_mapping,
             )
             for ch in series.chapters
             if ch.excluded or ch.title_locked or ch.volume_locked
+        }
+        preserved_pdfs = {
+            ch.number: (ch.file_path, ch.pdf_mapping, ch.monitored)
+            for ch in series.chapters if not ch.excluded and ch.downloaded
+            and Path(ch.file_path).suffix.lower() == ".pdf" and ch.pdf_mapping != "scan"
         }
         values = await registry.apply_settings(session)
         # Deleting the chapter rows hides this series' mappings from every
@@ -610,14 +624,21 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
                     series.chapters.append(
                         Chapter(number=number, monitored=saved[7], excluded=saved[6])
                     )
+                    present.add(number)
+            for number, (_, _, monitored) in preserved_pdfs.items():
+                if number not in present:
+                    series.chapters.append(Chapter(number=number, monitored=monitored))
             for ch in series.chapters:
+                if pdf := preserved_pdfs.get(ch.number):
+                    ch.downloaded = True
+                    ch.file_path, ch.pdf_mapping, ch.monitored = pdf
                 saved = preserved_metadata.get(ch.number)
                 if saved is None:
                     continue
                 (
                     title, volume, title_source, volume_source,
                     title_locked, volume_locked, excluded, monitored,
-                    downloaded, file_path, released_at, available_sources,
+                    downloaded, file_path, released_at, available_sources, pdf_mapping,
                 ) = saved
                 if excluded:
                     ch.title, ch.volume = title, volume
@@ -626,6 +647,7 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
                     ch.excluded, ch.monitored = True, monitored
                     ch.downloaded, ch.file_path = downloaded, file_path
                     ch.released_at, ch.available_sources = released_at, available_sources
+                    ch.pdf_mapping = pdf_mapping
                     continue
                 if title_locked:
                     ch.title, ch.title_source, ch.title_locked = title, title_source, True
@@ -680,8 +702,10 @@ def _run_resync(
         if not ch.downloaded or not ch.file_path:
             continue
         before[ch.id] = ch.file_path
-        stem = Path(ch.file_path).stem
-        coverage = parse_filename(stem)
+        path = Path(ch.file_path)
+        if path.suffix.lower() == ".pdf" and ch.pdf_mapping != "scan":
+            continue
+        coverage = parse_filename(path.stem)
         if coverage.volume and not coverage.chapter and not coverage.ambiguous \
                 and not coverage.covers(ch.number, ch.volume):
             ch.downloaded = False
@@ -712,7 +736,7 @@ def _chapter_copies(chapters):
                 volume=ch.volume, volume_source=ch.volume_source,
                 volume_locked=ch.volume_locked,
                 excluded=ch.excluded,
-                downloaded=ch.downloaded, file_path=ch.file_path)
+                downloaded=ch.downloaded, file_path=ch.file_path, pdf_mapping=ch.pdf_mapping)
         for ch in chapters
     ]
 

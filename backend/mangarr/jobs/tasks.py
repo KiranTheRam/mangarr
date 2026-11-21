@@ -49,7 +49,9 @@ from ..download.torrent import magnet_btih_hex
 from ..filename import parse_filename
 from ..library.archive_members import ArchiveVersion, archive_version
 from ..library.importer import import_torrent_payload
-from ..library.matcher import find_media_files, find_series_media_files, match_files
+from ..library.matcher import (
+    find_media_files, find_series_media_files, match_files, split_pdf_title_conflicts,
+)
 from ..library.naming import chapter_path, series_folder, volume_filename
 from ..library.publish import publish_new_file
 from ..library.volume_merge import merge_chapter_archives
@@ -730,8 +732,10 @@ def disk_volume_numbers(series: Series) -> set[int]:
         resolve_volume_offsets(Path(series.root_folder.path), series)
         if series.root_folder is not None else {}
     )
-    media = find_series_media_files(
-        folders, [chapter for chapter in series.chapters if not chapter.excluded], offsets
+    media, _ = split_pdf_title_conflicts(
+        find_series_media_files(
+            folders, [chapter for chapter in series.chapters if not chapter.excluded], offsets,
+        ), [series.title, *metadata_titles(series)],
     )
     for mf in media:
         if mf.coverage and mf.coverage.is_range and mf.coverage.volume and not mf.coverage.chapter:
@@ -863,7 +867,8 @@ async def try_acquire_series_lock(series_id: int) -> asyncio.Lock | None:
 
 
 async def refresh_series_full(
-    series_id: int, grab_missing: bool = False, only_monitored: bool = False
+    series_id: int, grab_missing: bool = False, only_monitored: bool = False,
+    *, force_scan: bool = False,
 ) -> None:
     REFRESHING.add(series_id)
     lock = await acquire_series_lock(series_id)
@@ -884,7 +889,7 @@ async def refresh_series_full(
             await link_sources(session, series, values)
             await update_chapters(session, series, values, chapter_cache)
             # adopt existing on-disk files before the monitor considers grabbing
-            if values.get("library_scan_on_add", "true") == "true":
+            if force_scan or values.get("library_scan_on_add", "true") == "true":
                 try:
                     await scan_series_folder(session, series)
                 except Exception as exc:
@@ -1873,7 +1878,7 @@ def _place_torrent_files(content_path, series, chapters, *args, **kwargs):
     shared = [dest for dest, chapter, volume in placed if chapter is None
               and (volume is not None or parse_filename(dest.stem).is_range)]
     matches = match_files(
-        [media for dest in shared for media in find_media_files(dest)], chapters
+        [media for dest in shared for media in find_media_files(dest, include_pdfs=False)], chapters
     )
     coverage = {str(m.media.path): [c.id for c in m.covered_chapters] for m in matches.matched}
     return placed, coverage, versions

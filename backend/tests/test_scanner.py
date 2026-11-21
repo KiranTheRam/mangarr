@@ -1,5 +1,8 @@
 import zipfile
 
+import pytest
+
+from mangarr.library.cleanup import analyze, apply_cleanup
 from mangarr.library.scanner import find_existing_folder, scan_series
 from mangarr.models import Chapter, Series
 
@@ -23,6 +26,83 @@ def make_cbz(path):
 
 
 class TestScanSeries:
+    def test_adopts_pdf_chapters_ranges_and_volumes_in_place(self, tmp_path):
+        single = tmp_path / "[Dandadan] (Digital) Ch. 001.PDF"
+        span = tmp_path / "Dan Da Dan 002-003.pdf"
+        volume = tmp_path / "Vol. 03.pdf"
+        extra = tmp_path / "Sketchbook.pdf"
+        for path in (single, span, volume, extra):
+            path.write_bytes(b"\xef\xbb\xbf%PDF-1.7\n")
+        chapters = chs((1, 1), (2, 1), (2.5, 1), (3, 1), (4, 2), (5, 3))
+        series, _ = series_with(chapters)
+        series.alt_titles = "Dan Da Dan"
+
+        result = scan_series(series, chapters, [tmp_path])
+
+        assert result.matched_chapters == 5
+        assert result.volume_files == 1
+        assert [c.file_path for c in chapters] == [str(single), str(span), str(span), str(span), "", str(volume)]
+        assert [item.path for item in result.unmatched] == [extra]
+        assert all(path.read_bytes() == b"\xef\xbb\xbf%PDF-1.7\n" for path in (single, span, volume, extra))
+
+    @pytest.mark.parametrize("name", ["Receipt Ch. 2.pdf", "[Another Manga] [Ch. 2.5].pdf", "領収書 Vol. 01.pdf"])
+    def test_unrelated_pdf_cannot_own_or_create_chapters(self, tmp_path, name):
+        path = tmp_path / name
+        path.write_bytes(b"%PDF-1.7\n")
+        chapters = chs((2, 1))
+        series, _ = series_with(chapters)
+        series.title_native = "ダンダダン"
+
+        result = scan_series(series, chapters, [tmp_path])
+
+        assert not chapters[0].downloaded
+        assert result.added_chapters == 0
+        assert [item.path for item in result.unmatched] == [path]
+
+    def test_wrong_title_clears_only_provably_automatic_pdf_ownership(self, tmp_path):
+        pdfs = [tmp_path / f"Other Series Ch. {number}.pdf" for number in (1, 2)]
+        chapters = chs((1, 1), (2, 1))
+        for path, chapter in zip(pdfs, chapters):
+            path.write_bytes(b"%PDF-1.7\n")
+            chapter.downloaded, chapter.file_path = True, str(path)
+        chapters[0].pdf_mapping = "scan"
+        series, _ = series_with(chapters)
+
+        result = scan_series(series, chapters, [tmp_path])
+
+        assert result.cleared == 1
+        assert [c.file_path for c in chapters] == ["", str(pdfs[1])]
+        assert all(path.is_file() for path in pdfs)
+
+    def test_scan_ignores_fake_pdfs_and_clears_a_now_invalid_pdf(self, tmp_path):
+        path = tmp_path / "02.PDF"
+        path.write_bytes(b"%PDF-1.7\n")
+        sidecar = tmp_path / "._Dandadan Ch. 3.pdf"
+        sidecar.write_bytes(b"%PDF-1.7\n")
+        chapters = chs((2, 1), (3, 1))
+        series, _ = series_with(chapters)
+
+        assert scan_series(series, chapters, [tmp_path]).matched_chapters == 1
+        assert chapters[0].file_path == str(path)
+        assert not chapters[1].downloaded
+        path.write_bytes(b"not a PDF")
+        assert scan_series(series, chapters, [tmp_path]).cleared == 1
+        assert not chapters[0].downloaded
+
+    def test_cleanup_excludes_pdfs_as_targets_and_as_redundant_coverage(self, tmp_path):
+        pdf = tmp_path / "Dandadan Ch. 1.pdf"
+        pdf.write_bytes(b"%PDF-1.7\n")
+        cbz = tmp_path / "Dandadan Ch. 1.cbz"
+        make_cbz(cbz)
+        chapters = chs((1, 1))
+        series, _ = series_with(chapters)
+
+        plan = analyze(series, chapters, [tmp_path], "{series} - Ch. {chapter}", "{series} - Ch. {chapter}")
+        assert not plan.groups
+        assert [item.path for item in plan.orphans] == [str(cbz)]
+        assert apply_cleanup(series, chapters, [tmp_path], [str(pdf), str(cbz)]).deleted == 0
+        assert pdf.is_file() and cbz.is_file()
+
     def test_keeps_recorded_exact_match_and_its_metadata_across_aliases(self, tmp_path):
         folder = tmp_path / "Dandadan"
         folder.mkdir()

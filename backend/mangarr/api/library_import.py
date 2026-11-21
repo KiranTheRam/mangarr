@@ -12,7 +12,8 @@ from sqlalchemy.orm import selectinload
 
 from ..adding import AddOptions, LibraryIndex, SeriesExists, create_series, start_refreshes
 from ..db import get_session
-from ..library.matcher import find_media_files
+from ..filename import parse_filename
+from ..library.matcher import MediaFile, find_media_files, split_pdf_title_conflicts
 from ..library.scanner import resolve_folders
 from ..models import RootFolder, Series
 from ..schemas import (
@@ -61,11 +62,50 @@ def _dir_identity(path: Path) -> tuple[int, int] | None:
     return st.st_dev, st.st_ino
 
 
+def _numbered_pdf(item: MediaFile) -> bool:
+    coverage = item.coverage
+    return bool(item.is_pdf and coverage and not coverage.ambiguous
+                and (coverage.chapter or coverage.volume))
+
+
+def _pdf_import_subfolders(
+    folder: Path, media: list[MediaFile], *, parent_available: bool,
+) -> list[tuple[Path, int]]:
+    """Distinguish series folders from collections with incidental PDFs."""
+    if not any(item.is_pdf for item in media):
+        return []
+    if parent_available:
+        if any(not item.is_pdf and (item.path == folder or item.path.parent == folder)
+               for item in media):
+            return []
+        titled_pdfs = [item for item in media if _numbered_pdf(item) and item.coverage.title_candidates]
+        matching, _ = split_pdf_title_conflicts(titled_pdfs, [folder_query(folder.name)])
+        if matching:
+            return []
+
+    children: dict[Path, list[MediaFile]] = {}
+    for item in media:
+        parts = item.path.relative_to(folder).parts
+        if len(parts) > 1 or (len(parts) == 1 and item.is_dir):
+            children.setdefault(folder / parts[0], []).append(item)
+
+    candidates = []
+    for child, files in children.items():
+        label = parse_filename(child.name)
+        if child.name.startswith(".") or ((label.explicit_chapter or label.volume) and not label.title_candidates):
+            continue
+        if any(not item.is_pdf or _numbered_pdf(item) for item in files):
+            candidates.append((child, len(files)))
+    return sorted(candidates, key=lambda entry: entry[0].name.casefold())
+
+
 def _unclaimed_folders(root: Path, claimed: set[Path]) -> list[ImportFolderOut]:
     # a folder that is, or holds, a series folder belongs to that series —
     # so every existing ancestor of a claimed folder counts as taken too
     taken_paths: set[Path] = set()
     taken_ids: set[tuple[int, int]] = set()
+    claimed_ids = {_dir_identity(path) for path in claimed} - {None}
+    root_id = _dir_identity(root)
     for path in claimed:
         for p in (path, *path.parents):
             if p in taken_paths:
@@ -74,17 +114,29 @@ def _unclaimed_folders(root: Path, claimed: set[Path]) -> list[ImportFolderOut]:
             if (identity := _dir_identity(p)) is not None:
                 taken_ids.add(identity)
     out: list[ImportFolderOut] = []
+
+    def add(folder: Path, count: int) -> None:
+        out.append(ImportFolderOut(
+            name=str(folder.relative_to(root)), path=str(folder),
+            file_count=count, query=folder_query(folder.name),
+        ))
+
     for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         if not child.is_dir() or child.name.startswith("."):
             continue
-        if child in taken_paths or _dir_identity(child) in taken_ids:
+        identity = _dir_identity(child)
+        if (child in claimed or identity in claimed_ids or (identity is not None and identity == root_id)
+                or (identity in taken_ids and child not in taken_paths)):
             continue
-        out.append(ImportFolderOut(
-            name=child.name,
-            path=str(child),
-            file_count=len(find_media_files(child)),
-            query=folder_query(child.name),
-        ))
+        parent_available = child not in taken_paths and identity not in taken_ids
+        media = find_media_files(child)
+        subfolders = _pdf_import_subfolders(child, media, parent_available=parent_available)
+        if subfolders:
+            for folder, count in subfolders:
+                if folder not in taken_paths and _dir_identity(folder) not in taken_ids:
+                    add(folder, count)
+        elif parent_available:
+            add(child, len(media))
     return out
 
 
@@ -204,5 +256,5 @@ async def import_library(body: LibraryImportIn, session: AsyncSession = Depends(
         results.append(LibraryImportResultOut(
             folder_name=item.folder_name, status="added", series_id=series.id,
         ))
-    start_refreshes(added, grab_missing=body.search_now)
+    start_refreshes(added, grab_missing=body.search_now, force_scan=True)
     return results

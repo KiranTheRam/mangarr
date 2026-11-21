@@ -25,6 +25,8 @@ from .matcher import (
     comicinfo_title,
     find_series_media_files,
     match_files,
+    pdf_header_present,
+    split_pdf_title_conflicts,
 )
 from .naming import series_folder
 
@@ -36,7 +38,7 @@ class ScanResult:
     matched_chapters: int = 0  # chapters newly marked owned
     added_chapters: int = 0  # explicit on-disk decimal/one-volume rows created
     volume_files: int = 0  # whole-volume archives found
-    cleared: int = 0  # chapters whose recorded file vanished
+    cleared: int = 0  # chapters whose recorded file no longer proves ownership
     unmatched: list[MediaFile] = field(default_factory=list)
     # why the library root couldn't be trusted; nothing was changed when set
     root_unavailable: str = ""
@@ -293,27 +295,39 @@ def scan_series(
         result.cleared = _reconcile(chapters, keep=owned_now)
         return result
 
-    media = find_series_media_files(existing, chapters, volume_offsets)
+    media, pdf_conflicts = split_pdf_title_conflicts(
+        find_series_media_files(existing, chapters, volume_offsets),
+        [series.title, *metadata_titles(series)],
+    )
     media = _title_only_volume(media, series)
     result.added_chapters = _add_disk_chapters(series, chapters, media)
     match = match_files(media, chapters)
-    scanned_paths = {str(item.path.resolve(strict=False)) for item in media}
+    scanned_paths = {item.path.resolve() for item in (*media, *pdf_conflicts)}
+    conflicting_paths = {item.path.resolve() for item in pdf_conflicts}
 
     # Explicit page labels or chapter spans can disprove an old assignment
     # even though the recorded file still exists.
     known_content = {
-        str(m.media.path.resolve()): m.content_chapters
+        m.media.path.resolve(): (m.content_chapters, m.media.is_pdf)
         for m in match.matched if m.content_chapters is not None
     }
     for chapter in chapters:
         if chapter in protected or not chapter.file_path:
             continue
-        content = known_content.get(str(Path(chapter.file_path).resolve()))
-        if content is not None and chapter.number not in content:
+        path = Path(chapter.file_path)
+        resolved = path.resolve()
+        content, is_pdf = known_content.get(resolved, (None, False))
+        automatic_pdf = chapter.pdf_mapping == "scan"
+        disproved = (automatic_pdf and resolved in conflicting_paths) or (
+            content is not None and (not is_pdf or automatic_pdf) and chapter.number not in content
+        )
+        if disproved:
             if chapter.downloaded:
                 result.cleared += 1
             chapter.downloaded = False
             chapter.file_path = ""
+        elif chapter.downloaded and chapter.pdf_mapping == "manual" and path.is_file():
+            owned_now.add(_ownership_key(chapter))
 
     # Exact chapter files take precedence over volume coverage. When several
     # files identify the same chapter (e.g. 115 and 115.0), keep the recorded
@@ -339,6 +353,8 @@ def scan_series(
                 result.matched_chapters += 1
             chapter.downloaded = True
             chapter.file_path = path_str
+            if mf.media.is_pdf:
+                chapter.pdf_mapping = "scan"
         owned_now.add(chapter_key)
 
     # whole-volume archives fill in any chapters not already covered exactly
@@ -355,20 +371,23 @@ def scan_series(
             recorded_is_scanned = False
             if chapter.file_path:
                 try:
-                    recorded_is_scanned = str(
-                        Path(chapter.file_path).resolve(strict=False)
-                    ) in scanned_paths
+                    recorded_is_scanned = Path(chapter.file_path).resolve() in scanned_paths
                 except OSError:
                     recorded_is_scanned = False
-            if not chapter.downloaded or not chapter.file_path or not recorded_is_scanned:
+            confirmed_pdf = chapter.pdf_mapping == "confirmed" and chapter.file_path and (
+                Path(chapter.file_path).is_file() and pdf_header_present(Path(chapter.file_path)) is not False
+            )
+            if not chapter.downloaded or not chapter.file_path or not (recorded_is_scanned or confirmed_pdf):
                 was_downloaded = chapter.downloaded
                 chapter.downloaded = True
                 chapter.file_path = path_str
+                if mf.media.is_pdf:
+                    chapter.pdf_mapping = "scan"
                 if not was_downloaded:
                     result.matched_chapters += 1
             owned_now.add(chapter_key)
 
-    result.unmatched = match.unmatched
+    result.unmatched = [*match.unmatched, *pdf_conflicts]
     result.cleared += _reconcile(chapters, keep=owned_now)
     log.info("Scanned %r across %d folder(s): +%d owned, +%d rows, %d volume files, "
              "%d unmatched, -%d cleared", series.title, len(existing),
@@ -378,12 +397,15 @@ def scan_series(
 
 
 def _reconcile(chapters: list[Chapter], keep: set[tuple[str, int]]) -> int:
-    """Clear downloaded state for chapters whose recorded file is gone."""
+    """Clear missing paths and invalid PDFs unless explicitly mapped."""
     cleared = 0
     for chapter in chapters:
         if not chapter.downloaded or _ownership_key(chapter) in keep:
             continue
-        if not chapter.file_path or not Path(chapter.file_path).exists():
+        path = Path(chapter.file_path)
+        if not chapter.file_path or not path.exists() or (
+            chapter.pdf_mapping != "manual" and pdf_header_present(path) is False
+        ):
             chapter.downloaded = False
             chapter.file_path = ""
             cleared += 1

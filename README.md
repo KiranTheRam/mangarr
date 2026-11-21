@@ -203,6 +203,10 @@ it won't re-download what's on disk.
 Matching is filename-based and handles the usual variety: `Series - Ch. 12.cbz`,
 `Series ch. 12`, `Volume 03.cbr`, `Series v03 (2019).cbz`, whole-volume archives
 (which mark every chapter in that volume), and folders of loose images.
+Library Import and Scan Disk also recognize existing PDFs. Use chapter or
+volume names such as `Series - Ch. 12.pdf`, `Series Ch. 12-15.pdf`, or
+`Series Vol. 03.pdf`. Mangarr keeps the original PDFs in place and marks
+matched chapters as owned. Use **Files** to map any unmatched PDFs by hand.
 
 ## Local development
 

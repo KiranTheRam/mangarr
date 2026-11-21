@@ -7,6 +7,7 @@ titles are cached per file version; page images are never read or written."""
 
 import json
 import os
+import re
 import stat
 import threading
 import zipfile
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 from xml.etree import ElementTree
 
-from ..filename import FilenameCoverage, parse_filename
+from ..filename import BRACKET_GROUPS, FilenameCoverage, parse_filename
 from ..models import Chapter
 from ..util import has_chapter_marker, parse_chapter_number
 from .archive_members import (
@@ -32,6 +33,7 @@ ARCHIVE_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z"}
 SIDECAR_IMAGE_STEMS = {
     "banner", "cover", "fanart", "folder", "poster", "thumb", "thumbnail",
 }
+_PDF_HEADER = re.compile(rb"%PDF-\d\.\d")
 
 
 @dataclass
@@ -45,6 +47,10 @@ class MediaFile:
     @property
     def label(self) -> str:
         return self.path.name
+
+    @property
+    def is_pdf(self) -> bool:
+        return not self.is_dir and self.path.suffix.lower() == ".pdf"
 
 
 @dataclass
@@ -67,18 +73,35 @@ def _name_source(path: Path, is_dir: bool) -> str:
     return path.name if is_dir else path.stem
 
 
+def pdf_header_present(path: Path) -> bool | None:
+    """Check a PDF candidate's header. Unreadable files give no evidence."""
+    if path.suffix.lower() != ".pdf":
+        return None
+    if path.name.startswith("._"):
+        return False  # macOS AppleDouble sidecar
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                return _PDF_HEADER.search(stream.read(1024)) is not None
+    except OSError:
+        pass
+    return None
+
+
 def find_media_files(
-    content_path: Path, files: Iterable[Path] | None = None
+    content_path: Path, files: Iterable[Path] | None = None, *, include_pdfs: bool = True,
 ) -> list[MediaFile]:
-    """Archives anywhere under content_path, plus directories that directly
-    hold loose images. Non-media files (json sidecars, etc.) are ignored.
+    """Archives, existing PDFs and directories that directly hold loose images.
     Given `files`, only those are considered instead of walking content_path."""
     content_path = Path(content_path)
     media: list[MediaFile] = []
 
     if files is None:
         if content_path.is_file():
-            if content_path.suffix.lower() in ARCHIVE_EXTS:
+            if content_path.suffix.lower() in ARCHIVE_EXTS or (
+                include_pdfs and pdf_header_present(content_path)
+            ):
                 media.append(_media_of(content_path, is_dir=False))
             return media
 
@@ -91,7 +114,7 @@ def find_media_files(
         if not p.is_file():
             continue
         suffix = p.suffix.lower()
-        if suffix in ARCHIVE_EXTS:
+        if suffix in ARCHIVE_EXTS or (include_pdfs and pdf_header_present(p)):
             media.append(_media_of(p, is_dir=False))
         elif suffix in IMAGE_EXTS and p.stem.lower() not in SIDECAR_IMAGE_STEMS:
             image_dirs.add(p.parent)
@@ -105,6 +128,28 @@ def _media_of(path: Path, is_dir: bool) -> MediaFile:
     text = _name_source(path, is_dir)
     parsed = parse_filename(text)
     return MediaFile(path, is_dir, parsed.chapter_number, parsed.volume_number, parsed)
+
+
+def _pdf_title_key(title: str) -> str:
+    # Keep native-script titles distinct, even when they contain ASCII digits.
+    return re.sub(r"[\W_]+", " ", title.casefold().replace("×", "x")).strip()
+
+
+def split_pdf_title_conflicts(
+    media: list[MediaFile], titles: Iterable[str],
+) -> tuple[list[MediaFile], list[MediaFile]]:
+    """Keep titled PDFs for other series available for explicit mapping."""
+    title_keys = {_pdf_title_key(form) for name in titles
+                  for form in (name, BRACKET_GROUPS.sub(" ", name))}
+    title_keys.discard("")
+    eligible, conflicts = [], []
+    for item in media:
+        candidates = item.coverage.title_candidates if item.is_pdf and item.coverage else ()
+        if candidates and all(_pdf_title_key(title) not in title_keys for title in candidates):
+            conflicts.append(item)
+        else:
+            eligible.append(item)
+    return eligible, conflicts
 
 
 _ARCHIVE_READ_ERRORS = (
@@ -330,6 +375,7 @@ def find_series_media_files(
     folders: list[Path],
     chapters: list[Chapter],
     volume_offsets: dict[str, int] | None = None,
+    *, include_pdfs: bool = True,
 ) -> list[MediaFile]:
     """Discover a series' media, applying optional physical-volume offsets.
 
@@ -352,7 +398,7 @@ def find_series_media_files(
         key = str(resolved_folder)
         scoped = key in offsets
         offset = offsets.get(key, 0)
-        for media in find_media_files(folder):
+        for media in find_media_files(folder, include_pdfs=include_pdfs):
             if scoped and media.volume_number is not None:
                 local_volume = media.volume_number - offset
                 if local_volume not in tracked_volumes:

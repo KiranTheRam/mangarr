@@ -8,12 +8,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from mangarr import adding
-from mangarr.api import library_import
+from mangarr import adding, settings_service
+from mangarr.api import library, library_import
 from mangarr.api.library_import import best_match, folder_query, import_folders, import_library
+from mangarr.api.system import wanted
+from mangarr.jobs import tasks
 from mangarr.metadata.base import SeriesMetadata
-from mangarr.models import Base, RootFolder, Series, SeriesFolder
-from mangarr.schemas import LibraryImportIn, LibraryImportItemIn, MetadataResult
+from mangarr.models import Base, Chapter, RootFolder, Series, SeriesFolder
+from mangarr.schemas import FileMapIn, FileMapRangeIn, LibraryImportIn, LibraryImportItemIn, MetadataResult, RenameApplyIn
 
 
 @pytest.fixture
@@ -30,9 +32,9 @@ async def maker():
 
 @pytest.fixture
 def refreshes(monkeypatch):
-    started: list[tuple[list[int], bool]] = []
+    started: list[tuple[list[int], bool, bool]] = []
     monkeypatch.setattr(library_import, "start_refreshes",
-                        lambda ids, grab_missing=False: started.append((ids, grab_missing)))
+                        lambda ids, grab_missing=False, force_scan=False: started.append((ids, grab_missing, force_scan)))
     return started
 
 
@@ -93,6 +95,113 @@ async def test_folders_skip_those_a_series_already_uses(tmp_path: Path, maker):
     assert [(f.name, f.file_count, f.query) for f in folders] == [("Loose", 1, "Loose")]
 
 
+@pytest.mark.parametrize("claimed_child", [False, True])
+async def test_pdf_discovery_preserves_series_extras_and_collection_siblings(tmp_path, maker, claimed_child):
+    for folder, filename in (
+        ("Dandadan (2021)", "001.PDF"),
+        ("Dandadan (2021)/Extras", "Sketchbook.pdf"),
+        ("Publisher", "Reading Order.pdf"),
+        ("Publisher/Berserk", "Berserk Vol. 01.pdf"),
+        ("Publisher/One Piece", "One Piece Vol. 01.pdf"),
+    ):
+        directory = tmp_path / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / filename).write_bytes(b"%PDF-1.7\n")
+    async with maker() as session:
+        root = RootFolder(path=str(tmp_path))
+        session.add(root)
+        if claimed_child:
+            session.add(Series(title="Berserk", folder_name="Publisher/Berserk", root_folder=root))
+        await session.commit()
+        folders = await import_folders(root.id, session)
+    expected = [("Dandadan (2021)", 2, "Dandadan"), ("Publisher/One Piece", 1, "One Piece")]
+    if not claimed_child:
+        expected.insert(1, ("Publisher/Berserk", 1, "Berserk"))
+    assert [(folder.name, folder.file_count, folder.query) for folder in folders] == expected
+
+
+async def test_explicit_library_import_scans_pdfs_before_search(tmp_path, maker, monkeypatch):
+    folder = tmp_path / "Dandadan"
+    folder.mkdir()
+    owned = folder / "Dandadan Ch. 1.PDF"
+    owned.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(tasks, "session_scope", maker)
+    monkeypatch.setattr(adding, "mangaupdates", FakeProvider({"10": "Dandadan"}))
+    searched = []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def update_chapters(session, series, values, chapter_cache):
+        series.chapters.extend(Chapter(number=n, downloaded=False, monitored=True) for n in (1, 2))
+        await session.commit()
+
+    async def grab_missing(session, series, values, **kwargs):
+        searched.extend(chapter.number for chapter in series.chapters if not chapter.downloaded)
+
+    monkeypatch.setattr(tasks, "refresh_series_metadata", noop)
+    monkeypatch.setattr(tasks, "link_sources", noop)
+    monkeypatch.setattr(tasks, "update_chapters", update_chapters)
+    monkeypatch.setattr(tasks, "auto_grab_best_torrent", noop)
+    monkeypatch.setattr(tasks, "grab_missing_chapters", grab_missing)
+    async with maker() as session:
+        root = RootFolder(path=str(tmp_path))
+        session.add(root)
+        await settings_service.set_many(session, {"library_scan_on_add": "false"})
+        await session.commit()
+        body = LibraryImportIn(root_folder_id=root.id, search_now=True, items=[
+            LibraryImportItemIn(folder_name=folder.name, provider="mangaupdates", provider_id=10)
+        ])
+        completed = []
+        monkeypatch.setattr(library_import, "start_refreshes", lambda ids, **kwargs: completed.append((ids, kwargs)))
+        [result] = await import_library(body, session)
+    [([series_id], refresh_options)] = completed
+    assert result.status == "added"
+    await tasks.refresh_series_full(series_id, **refresh_options)
+    async with maker() as session:
+        tracked = (await session.scalars(select(Chapter).order_by(Chapter.number))).all()
+        missing = await wanted(session=session)
+    assert [(chapter.downloaded, chapter.file_path) for chapter in tracked] == [(True, str(owned)), (False, "")]
+    assert searched == [2]
+    assert [chapter.number for chapter in missing] == [2]
+
+
+async def test_pdf_manual_mappings_and_custom_renames_survive_scans(tmp_path, maker):
+    folder = tmp_path / "Dandadan"
+    folder.mkdir()
+    chapter_pdf = folder / "Dandadan Ch. 1.PDF"
+    collection = folder / "Collected Stories Ch. 20-21.pdf"
+    for path in (chapter_pdf, collection):
+        path.write_bytes(b"%PDF-1.7\n")
+    async with maker() as session:
+        chapters = [Chapter(number=n, title=f"Chapter title {n}") for n in (1, 2, 3)]
+        series = Series(title=folder.name, folder_name=folder.name, chapters=chapters,
+                        root_folder=RootFolder(path=str(tmp_path)))
+        session.add(series)
+        await session.commit()
+        await library.scan(series.id, session)
+        await settings_service.set_many(session, {"naming_template_no_volume": "{title} - Ch. {chapter:04.1f}"})
+        await library.rename_apply(series.id, RenameApplyIn(), session)
+        renamed = folder / "Chapter title 1 - Ch. 0001.pdf"
+        assert chapters[0].file_path == str(renamed)
+
+        await library.map_file_range(series.id, FileMapRangeIn(file_path=str(collection), from_number=2, to_number=3), session)
+        await library.scan(series.id, session)
+        assert [chapter.file_path for chapter in chapters] == [str(renamed), str(collection), str(collection)]
+
+        exact = folder / "[Dandadan] Ch. 3.pdf"
+        exact.write_bytes(b"%PDF-1.7\n")
+        await library.scan(series.id, session)
+        assert [chapter.file_path for chapter in chapters] == [str(renamed), str(collection), str(exact)]
+
+        await library.map_file(series.id, FileMapIn(file_path=str(collection), chapter_id=chapters[2].id), session)
+        await library.scan(series.id, session)
+        assert chapters[2].file_path == str(collection)
+        files = await library.series_files(series.id, session)
+        assert any(file.path == str(collection) and file.matched_chapter_id is None for file in files)
+        assert all(path.read_bytes() == b"%PDF-1.7\n" for path in (renamed, collection, exact))
+
+
 async def test_import_adds_series_with_their_folders_pinned(tmp_path: Path, maker, monkeypatch,
                                                            refreshes):
     monkeypatch.setattr(adding, "mangaupdates", FakeProvider({"10": "Kagurabachi", "20": "Berserk"}))
@@ -115,7 +224,7 @@ async def test_import_adds_series_with_their_folders_pinned(tmp_path: Path, make
         ("Kagurabachi (2023)", "added"), ("dup", "exists"), ("gone", "failed"), ("Berserk", "added"),
     ]
     assert results[1].series_id == results[0].series_id
-    assert refreshes == [([results[0].series_id, results[3].series_id], True)]
+    assert refreshes == [([results[0].series_id, results[3].series_id], True, True)]
     async with maker() as session:
         series = await session.get(Series, results[0].series_id)
         assert series.folder_name == "Kagurabachi (2023)"

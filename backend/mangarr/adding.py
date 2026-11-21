@@ -194,7 +194,8 @@ async def create_series(
 
 
 def start_refreshes(
-    series_ids: list[int], grab_missing: bool = False, only_monitored: bool = False
+    series_ids: list[int], grab_missing: bool = False, only_monitored: bool = False,
+    *, force_scan: bool = False,
 ) -> None:
     """Link sources and fetch chapters for newly added (or bulk-refreshed)
     series in the background. One series refreshes right away (what the Add
@@ -211,7 +212,8 @@ def start_refreshes(
     async def run() -> None:
         for series_id in series_ids:
             await refresh_series_full(
-                series_id, grab_missing=grab_missing, only_monitored=only_monitored
+                series_id, grab_missing=grab_missing, only_monitored=only_monitored,
+                force_scan=force_scan,
             )
 
     asyncio.get_running_loop().create_task(run())

@@ -7,7 +7,7 @@ invented by expanding an integer range.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 
 BRACKET_GROUPS = re.compile(r"\([^)]*\)|\[[^\]]*\]")
@@ -22,6 +22,26 @@ _VOLUME_TOKEN = re.compile(
     rf"(?<![a-z]){_VOLUME}(\d+)(?:\s*[-–—]\s*(?:{_VOLUME})?(\d+))?(?![a-bd-z0-9]|\.\d)", re.I
 )
 _BARE = re.compile(rf"(?<![\w.])({_NUMBER})(?:\s*[-–—]\s*({_NUMBER}))?\s*$", re.I)
+_YEAR_TAG = re.compile(r"(?:19|20)\d{2}")
+_TITLELESS_PREFIX = re.compile(r"[\W_]*(?:(?:c(?:h(?:apter)?)?|v(?:ol(?:ume)?)?)[\W_]*)?", re.I)
+
+
+def _title_candidates(text: str, prefix: str) -> tuple[str, ...]:
+    if not _TITLELESS_PREFIX.fullmatch(prefix):
+        return (prefix,)
+    # A title may live in a leading group, alongside release and format tags.
+    titles: list[str] = []
+    end = 0
+    for group in BRACKET_GROUPS.finditer(text):
+        if not _TITLELESS_PREFIX.fullmatch(text[end:group.start()]):
+            break
+        tag = group.group()[1:-1].strip()
+        if _CHAPTER_TOKEN.fullmatch(tag) or _VOLUME_TOKEN.fullmatch(tag):
+            break
+        if not _YEAR_TAG.fullmatch(tag) and any(char.isalnum() for char in tag):
+            titles.append(tag)
+        end = group.end()
+    return tuple(titles)
 
 
 def _number(value: str) -> float:
@@ -34,6 +54,7 @@ class FilenameCoverage:
     volume: tuple[int, int] | None = None
     explicit_chapter: bool = False
     ambiguous: bool = False
+    title_candidates: tuple[str, ...] = field(default=(), compare=False, repr=False)
 
     @property
     def is_range(self) -> bool:
@@ -78,8 +99,11 @@ def parse_filename(text: str) -> FilenameCoverage:
     volumes = {(int(m[1]), int(m[2] or m[1])) for m in volume_matches}
     explicit = bool(chapters)
     bare = _BARE.search(untagged)
+    title_end = min((match.start() for match in outside_chapters + outside_volumes),
+                    default=len(untagged))
     if not chapters and not volumes and bare:
         chapters.add((_number(bare[1]), _number(bare[2] or bare[1])))
+        title_end = bare.start()
     ambiguous = len(chapters) > 1 or len(volumes) > 1
     chapter = next(iter(chapters), None)
     volume = next(iter(volumes), None)
@@ -93,4 +117,5 @@ def parse_filename(text: str) -> FilenameCoverage:
         )
         if not labeled_episode and not any(m.end() == len(untagged) for m in outside_volumes):
             ambiguous |= (_number(bare[1]), _number(bare[2] or bare[1])) != chapter
-    return FilenameCoverage(chapter, volume, explicit, ambiguous)
+    return FilenameCoverage(chapter, volume, explicit, ambiguous,
+                            _title_candidates(text, untagged[:title_end].strip()))
