@@ -88,6 +88,10 @@ Follow the setup screen to create a browser login.
 The image's healthcheck polls `GET /ping` (no API key needed), so
 `docker ps` shows the container as `healthy` once Mangarr is serving.
 
+The Dockerfile pins the Node and Python base images by digest so rebuilds use
+the same base images. To update one, run
+`docker buildx imagetools inspect <image:tag>` and replace its digest.
+
 First-run checklist, in the mangarr UI:
 
 1. **Settings → Root Folders**: add `/media/manga`.
@@ -259,10 +263,6 @@ Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
 `--revision <commit>` to inspect another commit. This requires a full Git clone;
 CI checks out the complete history. Avoid rewriting `main` history, since the
 commit count determines the patch increment.
-
-The Dockerfile pins `node:22-alpine` and `python:3.12-slim` by digest so rebuilds
-are reproducible; to update, run `docker buildx imagetools inspect <image:tag>`
-and replace the `@sha256:` value.
 
 ## Configuration
 
