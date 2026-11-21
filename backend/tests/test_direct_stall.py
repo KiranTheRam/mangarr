@@ -10,8 +10,11 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
+from sqlalchemy import Update, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from mangarr.api.library import resync_chapters
 from mangarr.api.queue import _remove_downloads, get_queue, retry_failed_download
 from mangarr.jobs import tasks
 from mangarr.jobs.tasks import REMOVED_BY_USER
@@ -77,6 +80,136 @@ async def _make_download(db_session, tmp_path):
     db_session.add(dl)
     await db_session.commit()
     return dl
+
+
+@pytest.mark.parametrize("replace_existing", [False, True])
+async def test_removal_after_direct_publication_rolls_back_the_archive(tmp_path, monkeypatch, replace_existing):
+    from mangarr import settings_service
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'queue.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setitem(tasks.registry.DIRECT_SOURCES, "fake", FakeSource())
+    monkeypatch.setitem(settings_service.DEFAULTS, "source_fake_enabled", "true")
+    defaults = settings_service.DEFAULTS
+    dest = tasks.chapter_path(
+        tmp_path, defaults["naming_template"], defaults["naming_template_no_volume"],
+        "Test Series", "Test Series", 1, None, "",
+    )
+    published = tasks._publish_direct_archive
+
+    async def stage(source, payload, series, chapter, path, **kwargs):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"new download")
+
+    @asynccontextmanager
+    async def remove_after_publish(*args):
+        async with published(*args):
+            assert dest.read_bytes() == b"new download"
+            async with sessions() as remover:
+                assert await _remove_downloads(remover, [download_id]) == 1
+            yield
+
+    monkeypatch.setattr(tasks, "download_chapter_to_cbz", stage)
+    monkeypatch.setattr(tasks, "_publish_direct_archive", remove_after_publish)
+    try:
+        async with sessions() as worker:
+            download = await _make_download(worker, tmp_path)
+            download_id, chapter_id = download.id, download.chapter_id
+            if replace_existing:
+                dest.parent.mkdir()
+                dest.write_bytes(b"existing chapter")
+                chapter = await worker.get(Chapter, chapter_id)
+                chapter.downloaded = True
+                chapter.file_path = str(dest)
+                await worker.commit()
+            await tasks._run_direct_download(worker, download)
+        async with sessions() as check:
+            download = await check.get(Download, download_id)
+            chapter = await check.get(Chapter, chapter_id)
+            assert (download.status, download.error) == (DownloadStatus.FAILED, REMOVED_BY_USER)
+            assert chapter.downloaded == replace_existing
+            assert chapter.file_path == (str(dest) if replace_existing else "")
+        if replace_existing:
+            assert dest.read_bytes() == b"existing chapter"
+        else:
+            assert not dest.exists()
+    finally:
+        await engine.dispose()
+
+
+async def test_resync_keeps_an_install_journal_until_recovery_succeeds(db_session, tmp_path, monkeypatch):
+    async def refresh_without_network(session, series, values):
+        series.chapters.append(Chapter(number=1))
+        await session.commit()
+
+    monkeypatch.setattr(tasks, "update_chapters", refresh_without_network)
+    download = await _make_download(db_session, tmp_path)
+    series_id, download_id = download.series_id, download.id
+    chapter = await db_session.get(Chapter, download.chapter_id)
+    folder = tmp_path / "Test Series"
+    folder.mkdir()
+    dest = folder / "Test Series - Ch. 0001.cbz"
+    dest.write_bytes(b"new download")
+    backup = folder / ".rollback" / "previous"
+    backup.parent.mkdir()
+    backup.write_bytes(b"existing chapter")
+    backup_version = list(tasks.archive_version(backup.stat()))
+    original_directory = list(tasks.archive_version(folder.stat())[:2])
+    download.status = DownloadStatus.FAILED
+    download.direct_install = {
+        "destination": str(dest), "directory": original_directory,
+        "version": list(tasks.archive_version(dest.stat())), "backup": str(backup),
+        "previous_versions": [backup_version],
+    }
+    chapter.downloaded = True
+    chapter.file_path = str(dest)
+    await db_session.commit()
+
+    offline = tmp_path / "offline"
+    folder.rename(offline)
+    folder.mkdir()
+    with pytest.raises(HTTPException, match="interrupted archive install") as exc:
+        await resync_chapters(series_id, db_session)
+    assert exc.value.status_code == 409
+    assert (await db_session.get(Download, download_id)).direct_install == download.direct_install
+    assert (offline / ".rollback" / "previous").read_bytes() == b"existing chapter"
+
+    folder.rmdir()
+    offline.rename(folder)
+    await resync_chapters(series_id, db_session)
+    assert await db_session.get(Download, download_id) is None
+    assert dest.read_bytes() == b"existing chapter"
+    assert not backup.exists()
+
+
+async def test_queue_removal_keeps_a_download_that_finished_after_selection(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'queue.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with sessions() as remover:
+            download = await _make_download(remover, tmp_path)
+            download_id = download.id
+            execute = remover.execute
+
+            async def finish_after_selection(statement, *args, **kwargs):
+                if isinstance(statement, Update):
+                    async with sessions.begin() as worker:
+                        await worker.execute(update(Download).where(Download.id == download_id).values(
+                            status=DownloadStatus.DONE, progress=1.0,
+                        ))
+                return await execute(statement, *args, **kwargs)
+
+            monkeypatch.setattr(remover, "execute", finish_after_selection)
+            assert await _remove_downloads(remover, [download_id]) == 0
+        async with sessions() as check:
+            download = await check.get(Download, download_id)
+            assert download.status == DownloadStatus.DONE
+    finally:
+        await engine.dispose()
 
 
 async def test_stalled_download_fails_visibly_instead_of_hanging(

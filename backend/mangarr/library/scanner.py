@@ -24,7 +24,9 @@ from .matcher import (
     comicinfo_number,
     comicinfo_title,
     find_series_media_files,
+    manual_pdf_mappings,
     match_files,
+    pdf_file_identity,
     pdf_header_present,
     split_pdf_title_conflicts,
 )
@@ -295,13 +297,17 @@ def scan_series(
         result.cleared = _reconcile(chapters, keep=owned_now)
         return result
 
+    manual_pdfs = manual_pdf_mappings(chapters)
     media, pdf_conflicts = split_pdf_title_conflicts(
         find_series_media_files(existing, chapters, volume_offsets),
-        [series.title, *metadata_titles(series)],
+        [series.title, *metadata_titles(series)], manual_pdfs=manual_pdfs,
     )
     media = _title_only_volume(media, series)
-    result.added_chapters = _add_disk_chapters(series, chapters, media)
-    match = match_files(media, chapters)
+    automatic_media = [item for item in media if not (
+        manual_pdfs and item.is_pdf and pdf_file_identity(item.path) in manual_pdfs
+    )]
+    result.added_chapters = _add_disk_chapters(series, chapters, automatic_media)
+    match = match_files(media, chapters, manual_pdfs=manual_pdfs)
     scanned_paths = {item.path.resolve() for item in (*media, *pdf_conflicts)}
     conflicting_paths = {item.path.resolve() for item in pdf_conflicts}
 
@@ -318,7 +324,8 @@ def scan_series(
         resolved = path.resolve()
         content, is_pdf = known_content.get(resolved, (None, False))
         automatic_pdf = chapter.pdf_mapping == "scan"
-        disproved = (automatic_pdf and resolved in conflicting_paths) or (
+        pinned = manual_pdfs.get(pdf_file_identity(path), ()) if manual_pdfs and chapter.pdf_mapping else ()
+        disproved = (automatic_pdf and (resolved in conflicting_paths or pinned)) or (
             content is not None and (not is_pdf or automatic_pdf) and chapter.number not in content
         )
         if disproved:
@@ -326,7 +333,7 @@ def scan_series(
                 result.cleared += 1
             chapter.downloaded = False
             chapter.file_path = ""
-        elif chapter.downloaded and chapter.pdf_mapping == "manual" and path.is_file():
+        elif chapter in pinned:
             owned_now.add(_ownership_key(chapter))
 
     # Exact chapter files take precedence over volume coverage. When several

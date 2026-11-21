@@ -11,7 +11,9 @@ from sqlalchemy.orm import selectinload
 
 from .. import settings_service
 from ..db import get_session
-from ..library.matcher import find_series_media_files, match_files, split_pdf_title_conflicts
+from ..library.matcher import (
+    find_series_media_files, manual_pdf_mappings, match_files, pdf_file_identity, split_pdf_title_conflicts,
+)
 from ..library.rename import apply_renames, plan_renames
 from ..library.scanner import (
     chapters_under_folders,
@@ -240,10 +242,12 @@ async def rename_apply(
 @router.get("/series/{series_id}/files", response_model=list[SeriesFileOut])
 async def series_files(series_id: int, session: AsyncSession = Depends(get_session)):
     series = await _load(session, series_id)
+    chapters = _active_chapters(series)
+    manual_pdfs = manual_pdf_mappings(chapters)
     media, pdf_conflicts = split_pdf_title_conflicts(
-        _media_of(series), [series.title, *metadata_titles(series)],
+        _media_of(series), [series.title, *metadata_titles(series)], manual_pdfs=manual_pdfs,
     )
-    result = match_files(media, _active_chapters(series))
+    result = match_files(media, chapters, manual_pdfs=manual_pdfs)
     out: list[SeriesFileOut] = []
     for mf in result.matched:
         out.append(SeriesFileOut(
@@ -261,6 +265,16 @@ async def series_files(series_id: int, session: AsyncSession = Depends(get_sessi
     return out
 
 
+def _pin_pdf_mapping(series: Series, chapter: Chapter, path: Path) -> None:
+    chapter.pdf_mapping = "manual"
+    identity = pdf_file_identity(path)
+    for other in _active_chapters(series):
+        if (identity is not None and other.pdf_mapping == "scan" and other.file_path
+                and pdf_file_identity(Path(other.file_path)) == identity):
+            other.downloaded = False
+            other.file_path = ""
+
+
 @router.post("/series/{series_id}/files/map", status_code=204)
 async def map_file(
     series_id: int, body: FileMapIn, session: AsyncSession = Depends(get_session)
@@ -274,7 +288,7 @@ async def map_file(
         chapter.downloaded = True
         chapter.file_path = str(media_path)
         if media_path.is_file() and media_path.suffix.lower() == ".pdf":
-            chapter.pdf_mapping = "manual"
+            _pin_pdf_mapping(series, chapter, media_path)
         await _reconcile_issues(session, series)
         await session.commit()
 
@@ -344,7 +358,10 @@ async def map_file_range(
                 ch.downloaded = True
                 ch.file_path = str(media_path)
                 if is_pdf:
-                    ch.pdf_mapping = "manual" if lo == hi else "confirmed"
+                    if lo == hi:
+                        _pin_pdf_mapping(series, ch, media_path)
+                    else:
+                        ch.pdf_mapping = "confirmed"
                 if volume is not None:
                     ch.volume = volume
                     ch.volume_source = "manual"
@@ -549,7 +566,7 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     being rebuilt."""
     from sqlalchemy import delete as sa_delete, func, or_
 
-    from ..jobs.tasks import acquire_series_lock, update_chapters
+    from ..jobs.tasks import _recover_direct_install, acquire_series_lock, update_chapters
     from ..models import Download, DownloadStatus, HistoryEvent
 
     lock = await acquire_series_lock(series_id)
@@ -576,6 +593,18 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
                 f"{busy} download(s) for this series are still in progress; wait for "
                 "them to finish or remove them from the queue, then re-sync",
             )
+        pending_installs = (await session.scalars(select(Download).where(
+            Download.series_id == series_id, Download.direct_install.is_not(None),
+        ))).all()
+        if pending_installs:
+            async with manual_archive_lock:
+                for download in pending_installs:
+                    if not await _recover_direct_install(session, download):
+                        await session.commit()  # keep earlier completed repairs
+                        raise HTTPException(
+                            409, "An interrupted archive install could not be recovered. "
+                            "Check the archive and library folder before re-syncing.",
+                        )
         preserved_metadata = {
             ch.number: (
                 ch.title, ch.volume, ch.title_source, ch.volume_source,

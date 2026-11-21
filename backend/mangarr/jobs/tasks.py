@@ -50,7 +50,8 @@ from ..filename import parse_filename
 from ..library.archive_members import ArchiveVersion, archive_version
 from ..library.importer import import_torrent_payload
 from ..library.matcher import (
-    find_media_files, find_series_media_files, match_files, split_pdf_title_conflicts,
+    find_media_files, find_series_media_files, manual_pdf_mappings, match_files, pdf_file_identity,
+    split_pdf_title_conflicts,
 )
 from ..library.naming import chapter_path, series_folder, volume_filename
 from ..library.publish import publish_new_file
@@ -732,12 +733,14 @@ def disk_volume_numbers(series: Series) -> set[int]:
         resolve_volume_offsets(Path(series.root_folder.path), series)
         if series.root_folder is not None else {}
     )
+    chapters = [chapter for chapter in series.chapters if not chapter.excluded]
+    manual_pdfs = manual_pdf_mappings(chapters)
     media, _ = split_pdf_title_conflicts(
-        find_series_media_files(
-            folders, [chapter for chapter in series.chapters if not chapter.excluded], offsets,
-        ), [series.title, *metadata_titles(series)],
+        find_series_media_files(folders, chapters, offsets), [series.title, *metadata_titles(series)],
     )
     for mf in media:
+        if manual_pdfs and mf.is_pdf and pdf_file_identity(mf.path) in manual_pdfs:
+            continue
         if mf.coverage and mf.coverage.is_range and mf.coverage.volume and not mf.coverage.chapter:
             low, high = mf.coverage.volume
             volumes.update(range(low, high + 1))
@@ -1459,13 +1462,12 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             )))
     except DownloadCancelled as cancel_exc:
         await session.rollback()
-        current = await session.get(Download, download_id)
-        if current is not None and not (
-            current.status == DownloadStatus.FAILED and current.error == REMOVED_BY_USER
-        ):
-            current.status = DownloadStatus.FAILED
-            current.error = str(cancel_exc)
-            await session.commit()
+        await session.execute(
+            sa_update(Download)
+            .where(Download.id == download_id, Download.status == DownloadStatus.DOWNLOADING)
+            .values(status=DownloadStatus.FAILED, error=str(cancel_exc))
+        )
+        await session.commit()
         log.info("direct download %d cancelled: %s", download_id, cancel_exc)
         return
     except DuplicateChapterPagesError as duplicate:
@@ -1711,17 +1713,23 @@ async def _install_direct_download(
             and ownership.owners.get(replaced_version[:2]) == {chapter.id}
         )
     async with _publish_direct_archive(session, dl, staged, dest, expected_destination, check_still_wanted):
+        completion = {"status": DownloadStatus.DONE, "progress": 1.0, "error": ""}
+        # Keep the journal for replacements until recovery can verify that
+        # any backup left between the commit and cleanup has been removed.
+        if expected_destination is None:
+            completion["direct_install"] = None
+        claimed = await session.execute(
+            sa_update(Download)
+            .where(Download.id == dl.id, Download.status == DownloadStatus.DOWNLOADING)
+            .values(**completion)
+            .execution_options(synchronize_session="evaluate")
+        )
+        if claimed.rowcount != 1:
+            raise DownloadCancelled("download left the active queue before installation completed")
         chapter.downloaded = True
         chapter.file_path = str(dest)
         chapter.file_source = dl.source_name
         chapter.file_group = dl.release_group
-        dl.status = DownloadStatus.DONE
-        dl.progress = 1.0
-        dl.error = ""
-        # Keep the journal for replacements until startup can verify that any
-        # backup left between this commit and cleanup has been removed.
-        if expected_destination is None:
-            dl.direct_install = None
         session.add(HistoryEvent(
             series_id=series.id, chapter_id=chapter.id, event="imported",
             source_name=dl.source_name, detail=str(dest),

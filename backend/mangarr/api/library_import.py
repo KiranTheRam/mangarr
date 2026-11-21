@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from ..adding import AddOptions, LibraryIndex, SeriesExists, create_series, start_refreshes
 from ..db import get_session
 from ..filename import parse_filename
-from ..library.matcher import MediaFile, find_media_files, split_pdf_title_conflicts
+from ..library.matcher import MediaFile, filename_matches_title, find_media_files, split_pdf_title_conflicts
 from ..library.scanner import resolve_folders
 from ..models import RootFolder, Series
 from ..schemas import (
@@ -74,13 +74,27 @@ def _pdf_import_subfolders(
     """Distinguish series folders from collections with incidental PDFs."""
     if not any(item.is_pdf for item in media):
         return []
+    numbered_pdfs = [item for item in media if _numbered_pdf(item)]
+    number_only_at_root = any(
+        item.path.parent == folder and not item.coverage.title_candidates for item in numbered_pdfs
+    )
     if parent_available:
         if any(not item.is_pdf and (item.path == folder or item.path.parent == folder)
                for item in media):
             return []
-        titled_pdfs = [item for item in media if _numbered_pdf(item) and item.coverage.title_candidates]
-        matching, _ = split_pdf_title_conflicts(titled_pdfs, [folder_query(folder.name)])
+        title = folder_query(folder.name)
+        titled_pdfs = [item for item in numbered_pdfs if item.coverage.title_candidates]
+        matching, _ = split_pdf_title_conflicts(titled_pdfs, [title])
         if matching:
+            return []
+        if number_only_at_root and any(
+            not item.is_pdf and item.coverage and not item.coverage.ambiguous
+            and (item.coverage.chapter or item.coverage.volume)
+            and filename_matches_title(item.coverage, title)
+            for item in media
+        ):
+            # The archive identifies the parent series, so the loose PDFs and
+            # its nested archives belong to the same import candidate.
             return []
 
     children: dict[Path, list[MediaFile]] = {}
@@ -93,6 +107,9 @@ def _pdf_import_subfolders(
     for child, files in children.items():
         label = parse_filename(child.name)
         if child.name.startswith(".") or ((label.explicit_chapter or label.volume) and not label.title_candidates):
+            continue
+        if (parent_available and number_only_at_root and child.name.casefold() in {"volumes", "chapters"}
+                and all(not item.coverage or not item.coverage.title_candidates for item in files)):
             continue
         if any(not item.is_pdf or _numbered_pdf(item) for item in files):
             candidates.append((child, len(files)))

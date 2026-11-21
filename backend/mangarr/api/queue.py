@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import get_session
@@ -92,6 +92,8 @@ async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
         )
     )
     downloads = result.scalars().all()
+    if not downloads:
+        return 0
     hashes = [
         dl.torrent_hash for dl in downloads
         if dl.kind == DownloadKind.TORRENT and dl.torrent_hash
@@ -112,11 +114,17 @@ async def _remove_downloads(session: AsyncSession, ids: list[int]) -> int:
             raise HTTPException(502, "Could not stop torrents in qBittorrent; items remain visible. Retry removal.") from exc
         finally:
             await client.close()
-    for dl in downloads:
-        dl.status = DownloadStatus.FAILED
-        dl.error = REMOVED_BY_USER
+    # The worker can complete while removal waits for the database or the
+    # download client. A stale selection must not cancel completed work.
+    removed = await session.execute(
+        update(Download)
+        .where(Download.id.in_([dl.id for dl in downloads]),
+               Download.status.in_([*ACTIVE, DownloadStatus.FAILED]))
+        .values(status=DownloadStatus.FAILED, error=REMOVED_BY_USER)
+        .execution_options(synchronize_session="evaluate")
+    )
     await session.commit()
-    return len(downloads)
+    return removed.rowcount
 
 
 @router.delete("/queue/{download_id}", status_code=204)

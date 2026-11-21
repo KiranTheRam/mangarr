@@ -101,6 +101,7 @@ async def test_pdf_discovery_preserves_series_extras_and_collection_siblings(tmp
         ("Dandadan (2021)", "001.PDF"),
         ("Dandadan (2021)/Extras", "Sketchbook.pdf"),
         ("Publisher", "Reading Order.pdf"),
+        ("Publisher", "001.PDF"),
         ("Publisher/Berserk", "Berserk Vol. 01.pdf"),
         ("Publisher/One Piece", "One Piece Vol. 01.pdf"),
     ):
@@ -118,6 +119,23 @@ async def test_pdf_discovery_preserves_series_extras_and_collection_siblings(tmp
     if not claimed_child:
         expected.insert(1, ("Publisher/Berserk", 1, "Berserk"))
     assert [(folder.name, folder.file_count, folder.query) for folder in folders] == expected
+
+
+@pytest.mark.parametrize("volume", ["Dandadan Vol. 02.cbz", "Vol. 02.cbz"])
+async def test_library_import_keeps_series_with_numbered_pdfs_and_nested_volumes(tmp_path, maker, volume):
+    folder = tmp_path / "Dandadan"
+    volumes = folder / "Volumes"
+    volumes.mkdir(parents=True)
+    (folder / "001.PDF").write_bytes(b"%PDF-1.7\n")
+    (volumes / volume).touch()
+    async with maker() as session:
+        root = RootFolder(path=str(tmp_path))
+        session.add(root)
+        await session.commit()
+        [candidate] = await import_folders(root.id, session)
+
+    assert candidate.name == "Dandadan"
+    assert candidate.file_count == 2
 
 
 async def test_explicit_library_import_scans_pdfs_before_search(tmp_path, maker, monkeypatch):
@@ -198,8 +216,45 @@ async def test_pdf_manual_mappings_and_custom_renames_survive_scans(tmp_path, ma
         await library.scan(series.id, session)
         assert chapters[2].file_path == str(collection)
         files = await library.series_files(series.id, session)
-        assert any(file.path == str(collection) and file.matched_chapter_id is None for file in files)
+        assert any(file.path == str(collection) and file.matched_chapter_id == chapters[2].id for file in files)
         assert all(path.read_bytes() == b"%PDF-1.7\n" for path in (renamed, collection, exact))
+
+
+@pytest.mark.parametrize("single_range", [False, True])
+async def test_manual_pdf_mapping_replaces_a_conflicting_automatic_claim(tmp_path, maker, single_range):
+    folder = tmp_path / "Dandadan"
+    folder.mkdir()
+    pdf = folder / "Dandadan Ch. 2.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n")
+    manual_path = pdf
+    if single_range:
+        manual_path = folder / "Unlabelled.pdf"
+        manual_path.hardlink_to(pdf)
+    async with maker() as session:
+        first, second = Chapter(number=1), Chapter(number=2)
+        series = Series(title=folder.name, folder_name=folder.name, chapters=[first, second],
+                        root_folder=RootFolder(path=str(tmp_path)))
+        session.add(series)
+        await session.commit()
+        await library.scan(series.id, session)
+        assert second.pdf_mapping == "scan"
+        if single_range:
+            await library.map_file_range(
+                series.id, FileMapRangeIn(file_path=str(manual_path), from_number=1, to_number=1), session,
+            )
+        else:
+            await library.map_file(series.id, FileMapIn(file_path=str(pdf), chapter_id=first.id), session)
+        assert first.downloaded and not second.downloaded
+
+        # Simulate a series that still has a stale automatic claim from the prior implementation.
+        second.downloaded, second.file_path, second.pdf_mapping = True, str(pdf), "scan"
+        await session.commit()
+        assert (await library.scan(series.id, session)).cleared == 1
+        assert (await library.scan(series.id, session)).matched_chapters == 0
+        files = await library.series_files(series.id, session)
+        assert {file.path for file in files} == {str(pdf), str(manual_path)}
+        assert {(file.matched_chapter_id, file.chapter_number) for file in files} == {(first.id, 1)}
+        assert [row.number for row in await wanted(session=session)] == [2]
 
 
 async def test_import_adds_series_with_their_folders_pinned(tmp_path: Path, maker, monkeypatch,

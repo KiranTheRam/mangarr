@@ -13,7 +13,7 @@ import threading
 import zipfile
 import zlib
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeVar
@@ -135,8 +135,34 @@ def _pdf_title_key(title: str) -> str:
     return re.sub(r"[\W_]+", " ", title.casefold().replace("×", "x")).strip()
 
 
+def filename_matches_title(coverage: FilenameCoverage, title: str) -> bool:
+    key = _pdf_title_key(title)
+    return bool(key and any(_pdf_title_key(candidate) == key for candidate in coverage.title_candidates))
+
+
+def pdf_file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        file_stat = path.stat()
+    except OSError:
+        return None
+    if stat.S_ISREG(file_stat.st_mode):
+        return file_stat.st_dev, file_stat.st_ino
+    return None
+
+
+def manual_pdf_mappings(chapters: Iterable[Chapter]) -> dict[tuple[int, int], list[Chapter]]:
+    """Find explicit single-chapter PDF mappings across aliases and hardlinks."""
+    mappings: dict[tuple[int, int], list[Chapter]] = {}
+    for chapter in chapters:
+        if not chapter.downloaded or chapter.pdf_mapping != "manual" or not chapter.file_path:
+            continue
+        if key := pdf_file_identity(Path(chapter.file_path)):
+            mappings.setdefault(key, []).append(chapter)
+    return mappings
+
+
 def split_pdf_title_conflicts(
-    media: list[MediaFile], titles: Iterable[str],
+    media: list[MediaFile], titles: Iterable[str], *, manual_pdfs: Collection[tuple[int, int]] = (),
 ) -> tuple[list[MediaFile], list[MediaFile]]:
     """Keep titled PDFs for other series available for explicit mapping."""
     title_keys = {_pdf_title_key(form) for name in titles
@@ -145,7 +171,8 @@ def split_pdf_title_conflicts(
     eligible, conflicts = [], []
     for item in media:
         candidates = item.coverage.title_candidates if item.is_pdf and item.coverage else ()
-        if candidates and all(_pdf_title_key(title) not in title_keys for title in candidates):
+        if (candidates and all(_pdf_title_key(title) not in title_keys for title in candidates)
+                and (not manual_pdfs or pdf_file_identity(item.path) not in manual_pdfs)):
             conflicts.append(item)
         else:
             eligible.append(item)
@@ -428,7 +455,10 @@ def find_series_media_files(
     return list(found.values())
 
 
-def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
+def match_files(
+    media: list[MediaFile], chapters: list[Chapter], *,
+    manual_pdfs: dict[tuple[int, int], list[Chapter]] | None = None,
+) -> MatchResult:
     """Match single chapters and full chapter/volume spans to tracked rows."""
     by_number = {c.number: c for c in chapters}
     chapters_in_volume: dict[int, list[Chapter]] = {}
@@ -439,6 +469,12 @@ def match_files(media: list[MediaFile], chapters: list[Chapter]) -> MatchResult:
     matched: list[MatchedFile] = []
     unmatched: list[MediaFile] = []
     for mf in media:
+        mapped = manual_pdfs.get(pdf_file_identity(mf.path)) if manual_pdfs and mf.is_pdf else None
+        if mapped:
+            single = mapped[0] if len(mapped) == 1 else None
+            renamed = replace(mf, chapter_number=single.number if single else None, volume_number=None)
+            matched.append(MatchedFile(renamed, single, None, mapped))
+            continue
         parsed = mf.coverage
         if parsed is not None and parsed.ambiguous:
             unmatched.append(mf)
