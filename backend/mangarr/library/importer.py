@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ..models import Chapter, Series
 from ..util import NAME_MAX_BYTES, NEW_FILE_MODE, natural_key, sanitize_filename
+from .archive_members import ArchiveVersion, archive_version
 from .matcher import (
     ARCHIVE_EXTS,
     IMAGE_EXTS,
@@ -24,8 +25,12 @@ from .matcher import (
     match_files,
 )
 from .naming import chapter_filename, series_folder, volume_filename
+from .publish import publish_new_file
+from .zip_limits import COPY_CHUNK_BYTES
 
 log = logging.getLogger(__name__)
+
+ArchiveRevision = ArchiveVersion
 
 _SEASON_EPISODE = re.compile(
     r"(?:\bseason\s*|\bs\s*)(\d+)\b.*?\b(?:episode|ep)\.?\s*(\d+(?:\.\d+)?)",
@@ -59,7 +64,7 @@ def _atomic_destination(dest: Path, keep_mode: bool = False):
         yield temporary
         if not keep_mode:
             temporary.chmod(NEW_FILE_MODE)
-        temporary.replace(dest)
+        publish_new_file(temporary, dest)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -76,23 +81,67 @@ def _validate_existing(dest: Path) -> None:
             raise ValueError(f"Existing library archive is damaged; repair or remove it before retrying: {dest}") from exc
 
 
-def place_file(src: Path, dest: Path, mode: str) -> None:
+def _same_contents(source, destination) -> bool:
+    while data := source.read(COPY_CHUNK_BYTES):
+        if destination.read(len(data)) != data:
+            return False
+    return not destination.read(1)
+
+
+def _matches_payload(media: MediaFile, dest: Path, only: set[Path] | None) -> bool:
+    if media.is_dir:
+        with zipfile.ZipFile(dest) as archive:
+            images = _loose_images(media.path, only)
+            if archive.namelist() != [image.name for image in images]:
+                return False
+            for image in images:
+                with image.open("rb") as source, archive.open(image.name) as installed:
+                    if not _same_contents(source, installed):
+                        return False
+        return True
+    if media.path.samefile(dest):
+        return True
+    with media.path.open("rb") as source, dest.open("rb") as installed:
+        return _same_contents(source, installed)
+
+
+def _archive_revision(path: Path) -> ArchiveRevision:
+    return archive_version(path.stat())
+
+
+def _require_archive_revision(path: Path, expected: ArchiveRevision | None) -> None:
+    if expected is not None and _archive_revision(path) != expected:
+        raise FileNotFoundError(f"torrent archive changed while importing: {path}")
+
+
+def place_file(
+    src: Path, dest: Path, mode: str, *, revision: ArchiveRevision | None = None,
+) -> ArchiveVersion:
     """Put a payload file into the library. Hardlink mode keeps the torrent
     seeding without doubling disk use; it needs src and dest on one
     filesystem, so cross-device (and any other) failure falls back to copy."""
     if mode == "hardlink":
         try:
-            os.link(src, dest)
+            with _atomic_destination(dest, keep_mode=True) as temporary:
+                temporary.unlink()
+                os.link(src, temporary)
+                _require_archive_revision(src, revision)
+                placed_version = _archive_revision(temporary)
             log.info("Hardlinked %s -> %s", src.name, dest)
-            return
+            return placed_version
+        except (FileNotFoundError, FileExistsError):
+            raise
         except OSError as exc:
             log.warning("hardlink %s -> %s failed (%s); copying instead",
                         src.name, dest, exc)
     with _atomic_destination(dest, keep_mode=True) as temporary:
         shutil.copy2(src, temporary)
+        _require_archive_revision(src, revision)
         if temporary.stat().st_size != src.stat().st_size:
             raise OSError("Incomplete library copy")
+        placed_version = _archive_revision(temporary)
     log.info("Imported %s -> %s", src.name, dest)
+    return placed_version
 
 
 def _inside(path: Path, folder: Path) -> bool:
@@ -208,6 +257,8 @@ def import_torrent_payload(
     template_no_volume: str,
     import_mode: str = "hardlink",
     files: list[Path] | None = None,
+    *,
+    destination_versions: dict[Path, ArchiveVersion] | None = None,
 ) -> list[tuple[Path, Chapter | None, int | None]]:
     """Copies/renames payload files into the library. Returns (dest, matched
     chapter, volume) triples. Shared archives have no single chapter; only
@@ -230,7 +281,10 @@ def import_torrent_payload(
     folder = library_root / (series.folder_name or series_folder(series.title))
     folder.mkdir(parents=True, exist_ok=True)
     imported: list[tuple[Path, Chapter | None, int | None]] = []
-    media = find_media_files(content_path, only)
+    media = find_media_files(content_path, only, include_pdfs=False)
+    # Capture archive identity before matching can read its ComicInfo. An
+    # external payload can become an editable library file during an import.
+    revisions = {item.path: _archive_revision(item.path) for item in media if not item.is_dir}
     _preflight_numbering(media)
     result = match_files(media, chapters)
     _preflight_duplicates(result, chapters)
@@ -267,12 +321,22 @@ def import_torrent_payload(
     def place(media: MediaFile, chapter: Chapter | None, volume: int | None) -> None:
         dest = destination(media, chapter, volume)
         if dest == media.path or dest.exists():
+            placed_version = _archive_revision(dest)
             _validate_existing(dest)
+            recorded_here = (
+                chapter is not None and chapter.downloaded
+                and chapter.file_path == str(dest)
+            )
+            if dest != media.path and not recorded_here and not _matches_payload(media, dest, only):
+                raise FileExistsError(f"Library file already exists and differs from the torrent: {dest}")
+            _require_archive_revision(media.path, revisions.get(media.path))
+            _require_archive_revision(dest, placed_version)
+        elif media.is_dir:
+            placed_version = _pack_images(media.path, dest, only)
         else:
-            if media.is_dir:
-                _pack_images(media.path, dest, only)
-            else:
-                place_file(media.path, dest, import_mode)
+            placed_version = place_file(media.path, dest, import_mode, revision=revisions[media.path])
+        if destination_versions is not None:
+            destination_versions[dest] = placed_version
         imported.append((dest, chapter, volume if chapter is None else None))
 
     for mf in result.matched:
@@ -282,16 +346,22 @@ def import_torrent_payload(
     return imported
 
 
-def _pack_images(img_dir: Path, dest: Path, only: set[Path] | None = None) -> None:
-    images = sorted(
+def _loose_images(img_dir: Path, only: set[Path] | None) -> list[Path]:
+    return sorted(
         (
             p for p in img_dir.iterdir()
             if p.is_file() and p.suffix.lower() in IMAGE_EXTS and (only is None or p in only)
         ),
         key=lambda p: natural_key(p.name),  # 1, 2, 10 — not 1, 10, 2
     )
+
+
+def _pack_images(img_dir: Path, dest: Path, only: set[Path] | None = None) -> ArchiveVersion:
+    images = _loose_images(img_dir, only)
     with _atomic_destination(dest) as temporary:
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_STORED) as zf:
             for img in images:
                 zf.write(img, img.name)
+        placed_version = _archive_revision(temporary)
     log.info("Packed %s (%d images) -> %s", img_dir, len(images), dest)
+    return placed_version

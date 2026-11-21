@@ -138,6 +138,21 @@ async def test_reimporting_a_chapter_onto_its_own_file_still_adopts_it(db_sessio
     assert tags(existing) == {b"A"}
 
 
+async def test_retry_does_not_adopt_a_different_archive_left_at_the_destination(db_session, tmp_path):
+    existing = tmp_path / "manga" / "Test Series" / "Test Series - c012.cbz"
+    cbz(existing, b"A")
+    payload = tmp_path / "qbt" / "Test Series - Chapter 012.cbz"
+    cbz(payload, b"C")
+    download, chapters = await import_payload(
+        db_session, tmp_path, [Chapter(number=12.0)], payload,
+    )
+
+    assert download.status == DownloadStatus.FAILED
+    assert "already exists and differs" in download.error
+    assert not chapters[12.0].downloaded and not chapters[12.0].file_path
+    assert tags(existing) == {b"A"}
+
+
 async def test_chapters_with_distinct_names_still_import_together(db_session, tmp_path):
     payload = tmp_path / "qbt" / "Test Series c012-013"
     cbz(payload / "Test Series - Chapter 012.cbz", b"A")

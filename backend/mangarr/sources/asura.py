@@ -38,7 +38,10 @@ class AsuraSource(DirectSource):
         )
 
     def image_headers(self) -> dict:
-        return {"Referer": f"{SITE_URL}/"}
+        # Keep the CDN request contract self-contained. Production downloads
+        # already set this User-Agent on their shared client, but callers such
+        # as source-health checks may provide a plain httpx client.
+        return {"User-Agent": USER_AGENT, "Referer": f"{SITE_URL}/"}
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
         resp = await rl_request(self._client, "GET", f"{API_URL}{path}",

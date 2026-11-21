@@ -111,7 +111,7 @@ def _all_media(folders: list[Path]) -> list[MediaFile]:
     media: dict[str, MediaFile] = {}
     for folder in folders:
         if Path(folder).exists():
-            for mf in find_media_files(folder):
+            for mf in find_media_files(folder, include_pdfs=False):
                 media.setdefault(_canonical(mf.path), mf)
     return list(media.values())
 
@@ -173,7 +173,7 @@ def analyze(
     template_no_volume: str,
     media: list[MediaFile] | None = None,
 ) -> CleanupPlan:
-    media = list(media) if media is not None else _all_media(folders)
+    media = [item for item in media if not item.is_pdf] if media is not None else _all_media(folders)
     referenced = {_canonical(c.file_path) for c in chapters if c.file_path}
     tracked_ch = {c.number for c in chapters}
     tracked_vol = {c.volume for c in chapters if c.volume is not None}
@@ -275,7 +275,7 @@ def apply_cleanup(
     delete_paths: list[str],
     media: list[MediaFile] | None = None,
 ) -> CleanupResult:
-    media = list(media) if media is not None else _all_media(folders)
+    media = [item for item in media if not item.is_pdf] if media is not None else _all_media(folders)
     media_by_path = {_canonical(mf.path): mf for mf in media}
     coverage = _coverage(media, chapters)
     required = _requirements(coverage, chapters)

@@ -135,6 +135,14 @@ async def test_mangaplus_search_decodes_protobuf_catalog():
 
 # ---------------------------------------------------------------------- Asura
 
+async def test_asura_image_headers_are_self_contained():
+    async with httpx.AsyncClient() as client:
+        headers = AsuraSource(client=client).image_headers()
+    assert headers == {
+        "User-Agent": asura.USER_AGENT,
+        "Referer": f"{asura.SITE_URL}/",
+    }
+
 @respx.mock
 async def test_asura_search():
     src = AsuraSource(client=httpx.AsyncClient())

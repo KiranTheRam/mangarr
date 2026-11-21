@@ -13,6 +13,7 @@ const PAGES = [
   { to: "/calendar", label: "Calendar", keywords: "upcoming releases schedule" },
   { to: "/activity", label: "Activity", keywords: "queue history downloads" },
   { to: "/wanted", label: "Wanted", keywords: "missing chapters" },
+  { to: "/issues", label: "Issues", keywords: "metadata comicinfo warnings ignored" },
   { to: "/settings", label: "Settings", keywords: "sources kavita qbittorrent root folders" },
 ];
 

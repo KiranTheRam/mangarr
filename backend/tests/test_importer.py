@@ -284,3 +284,23 @@ def test_failed_image_pack_is_atomic(tmp_path, monkeypatch):
         _pack_images(folder, dest)
     assert not dest.exists()
     assert not list(tmp_path.glob("*.partial"))
+
+
+@pytest.mark.parametrize("mode", ["copy", "hardlink"])
+def test_torrent_placement_preserves_a_concurrently_published_archive(tmp_path, monkeypatch, mode):
+    from mangarr.library import importer
+
+    source = tmp_path / "torrent.cbz"
+    destination = tmp_path / "library.cbz"
+    source.write_bytes(b"torrent contents")
+    verify_revision = importer._require_archive_revision
+
+    def publish_competing_file(path, revision):
+        destination.write_bytes(b"completed download")
+        verify_revision(path, revision)
+
+    monkeypatch.setattr(importer, "_require_archive_revision", publish_competing_file)
+    with pytest.raises(FileExistsError):
+        importer.place_file(source, destination, mode, revision=importer._archive_revision(source))
+    assert destination.read_bytes() == b"completed download"
+    assert not list(tmp_path.glob("*.partial"))

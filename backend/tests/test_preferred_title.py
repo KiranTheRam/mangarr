@@ -483,6 +483,7 @@ class TestDatabaseMigration:
                 "title_romaji",
                 "title_native",
                 "title_locked",
+                "deletion_pending",
             ]:
                 await conn.exec_driver_sql(f"ALTER TABLE series DROP COLUMN {col}")
             # Insert a series from the past
@@ -500,7 +501,9 @@ class TestDatabaseMigration:
         async with engine.connect() as conn:
             info = await conn.exec_driver_sql("PRAGMA table_info(series)")
             columns = {row[1]: row for row in info.fetchall()}
-            row = (await conn.exec_driver_sql("SELECT provider_title, title_locked FROM series WHERE id = 1")).fetchone()
+            row = (await conn.exec_driver_sql(
+                "SELECT provider_title, title_locked, deletion_pending FROM series WHERE id = 1"
+            )).fetchone()
 
         await engine.dispose()
 
@@ -509,9 +512,11 @@ class TestDatabaseMigration:
         assert "title_romaji" in columns
         assert "title_native" in columns
         assert "title_locked" in columns
+        assert "deletion_pending" in columns
 
         assert row[0] == "Berserk"
         assert row[1] == 0
+        assert row[2] == 0
 
 
 class TestMetadataResultsPreferredTitle:

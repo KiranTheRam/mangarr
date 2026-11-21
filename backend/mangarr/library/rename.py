@@ -143,8 +143,11 @@ def apply_renames(items: list[RenameItem], chapter_by_id: dict[int, Chapter]) ->
             if ch is not None:
                 # same file under a new name: its recorded origin still holds
                 source, group = ch.file_source, ch.file_group
+                pdf_mapping = ch.pdf_mapping
                 ch.file_path = str(dst)
                 ch.file_source, ch.file_group = source, group
+                if dst.is_file() and dst.suffix.lower() == ".pdf":
+                    ch.pdf_mapping = "manual" if pdf_mapping == "manual" else "confirmed"
         log.info("Renamed %s -> %s", src.name, dst.name)
         outcomes.append(RenameOutcome(item, "renamed"))
     return outcomes
