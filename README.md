@@ -231,6 +231,24 @@ cd backend && .venv/bin/python -m pytest
 `npm run build` writes the production bundle to `backend/static/`, which the
 FastAPI app serves when present.
 
+## Backend dependency lock
+
+`backend/requirements.txt` is the pinned dependency lock file for the backend, which also pins the build backend.
+The Docker image verifies hashes from this lock file and from
+`backend/requirements-pip.txt`, which pins the installer. Local development
+installs (`pip install -e '.[dev]'`) and CI resolve dependencies from the
+ranges in `pyproject.toml`.
+
+To refresh the lock file after changing `pyproject.toml` dependencies, run:
+
+```bash
+scripts/lock-backend.sh
+```
+
+This runs `pip-compile` inside the runtime Python container (requires Docker, or
+`CONTAINER=podman`). Commit the resulting `backend/requirements.txt` with your
+changes.
+
 ## App versions
 
 Docker Hub builds from `main` automatically increment the patch version for each
@@ -259,23 +277,6 @@ Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
 `--revision <commit>` to inspect another commit. This requires a full Git clone;
 CI checks out the complete history. Avoid rewriting `main` history, since the
 commit count determines the patch increment.
-
-## Backend dependency lock
-
-`backend/requirements.txt` is the pinned dependency lock file for the backend, which also pins the build backend.
-The Docker image installs only from this lock file with hashes to ensure reproducible
-builds. Local and development installs (`pip install -e '.[dev]'`) and CI continue
-to resolve dependencies directly from the ranges in `pyproject.toml`.
-
-To refresh the lock file after changing `pyproject.toml` dependencies, run:
-
-```bash
-scripts/lock-backend.sh
-```
-
-This runs `pip-compile` inside the runtime Python container (requires Docker, or
-`CONTAINER=podman`). Commit the resulting `backend/requirements.txt` with your
-changes.
 
 ## Configuration
 

@@ -5,19 +5,12 @@ import re
 import tomllib
 
 import pytest
+from packaging.requirements import Requirement
 
 
 def normalize_name(name: str) -> str:
     """PEP 503-normalise a distribution name."""
     return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def extract_distribution_name(spec: str) -> str:
-    """Extract PEP 503-normalised distribution name from a requirement specifier."""
-    match = re.match(r"^\s*([a-zA-Z0-9][a-zA-Z0-9_.-]*)", spec)
-    if not match:
-        raise ValueError(f"Could not parse distribution name from requirement: {spec}")
-    return normalize_name(match.group(1))
 
 
 def parse_lock_file(content: str):
@@ -85,32 +78,29 @@ def test_dependency_lock():
             version = match.group(2)
             locked_packages[pkg_name] = version
 
-            hashes = [line for line in block[1:] if "--hash=sha256:" in line]
+            hashes = [line for line in block[1:] if re.match(r"^--hash=sha256:[0-9a-fA-F]{64}\b", line)]
             assert len(hashes) >= 1, (
                 f"Pinned requirement '{pkg_name}=={version}' in {lock_path.name} "
                 f"is not followed by at least one --hash=sha256: line"
             )
 
-    # 3. Every [project].dependencies entry has a pinned name==version in the lock
+    # The Docker build installs this lock before installing Mangarr with
+    # --no-deps and --no-build-isolation, so CI also verifies the pinned versions.
     project_deps = pyproject.get("project", {}).get("dependencies", [])
-    for dep in project_deps:
-        dist_name = extract_distribution_name(dep)
-        assert dist_name in locked_packages, (
-            f"Distribution '{dist_name}' from project.dependencies is not pinned in {lock_path.name}"
-        )
-
-    # 4. Every [build-system].requires entry has a pinned name==version in the lock
     build_deps = pyproject.get("build-system", {}).get("requires", [])
-    for dep in build_deps:
-        dist_name = extract_distribution_name(dep)
-        assert dist_name in locked_packages, (
-            f"Distribution '{dist_name}' from build-system.requires is not pinned in {lock_path.name}"
+    for spec in [*project_deps, *build_deps]:
+        requirement = Requirement(spec)
+        name = normalize_name(requirement.name)
+        assert name in locked_packages, f"{requirement} is not pinned in {lock_path.name}"
+        pinned = locked_packages[name]
+        assert pinned in requirement.specifier, (
+            f"{name}=={pinned} in {lock_path.name} does not satisfy {requirement}"
         )
 
-    # 5. Dev-only dependencies are not required and not in the lock
+    # Dev-only dependencies are not required and not in the lock
     dev_deps = pyproject.get("project", {}).get("optional-dependencies", {}).get("dev", [])
     for dev_dep in dev_deps:
-        dev_name = extract_distribution_name(dev_dep)
+        dev_name = normalize_name(Requirement(dev_dep).name)
         assert dev_name not in locked_packages, (
             f"Dev-only dependency '{dev_name}' should not be in {lock_path.name}"
         )
