@@ -1462,12 +1462,14 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             )))
     except DownloadCancelled as cancel_exc:
         await session.rollback()
-        await session.execute(
-            sa_update(Download)
-            .where(Download.id == download_id, Download.status == DownloadStatus.DOWNLOADING)
-            .values(status=DownloadStatus.FAILED, error=str(cancel_exc))
-        )
-        await session.commit()
+        current = await session.get(Download, download_id)
+        if current is not None and current.status == DownloadStatus.DOWNLOADING:
+            await session.execute(
+                sa_update(Download)
+                .where(Download.id == download_id, Download.status == DownloadStatus.DOWNLOADING)
+                .values(status=DownloadStatus.FAILED, error=str(cancel_exc))
+            )
+            await session.commit()
         log.info("direct download %d cancelled: %s", download_id, cancel_exc)
         return
     except DuplicateChapterPagesError as duplicate:
