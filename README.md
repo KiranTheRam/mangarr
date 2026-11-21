@@ -255,14 +255,14 @@ increasing. `backend/VERSION` is the release baseline; local installs use that
 baseline unless a build supplies `MANGARR_BUILD_VERSION`. The frontend package
 versions track the manually selected baseline.
 
+Run `python3 scripts/version.py check` to confirm that `backend/VERSION`,
+`frontend/package.json`, and `frontend/package-lock.json` agree. The backend
+tests run this check to ensure the working tree stays consistent.
+
 Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
 `--revision <commit>` to inspect another commit. This requires a full Git clone;
 CI checks out the complete history. Avoid rewriting `main` history, since the
 commit count determines the patch increment.
-
-Run `python3 scripts/version.py check` to confirm that `backend/VERSION`,
-`frontend/package.json`, and `frontend/package-lock.json` agree. The backend
-tests run this check to ensure the working tree stays consistent.
 
 ## Configuration
 
