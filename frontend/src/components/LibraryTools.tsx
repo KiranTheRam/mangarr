@@ -235,7 +235,7 @@ export function SourcesModal({
               <tr key={c.external_id}>
                 <td>
                   {c.title}
-                  {c.source_name === "fanfox" && (
+                  {(c.source_name === "fanfox" || c.source_name === "toonily") && (
                     <button className="btn sm" style={{ marginLeft: 8 }} onClick={() => setPreview(c)}>Details</button>
                   )}
                 </td>
@@ -257,6 +257,9 @@ export function SourcesModal({
           )}
           {details.isFetching && <Spinner />}
           <ErrorNotice error={details.error} />
+          {(details.data?.alt_titles ?? preview.alt_titles).length > 0 && (
+            <p>{(details.data?.alt_titles ?? preview.alt_titles).join(" · ")}</p>
+          )}
           {details.data?.description && <p>{details.data.description}</p>}
         </div>
       )}
