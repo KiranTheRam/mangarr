@@ -230,6 +230,10 @@ npm install
 npm run dev        # Vite dev server on :5173, proxies API to :6996
 ```
 
+Dependabot opens weekly update PRs for backend dependencies, frontend
+dependencies, Docker base images, and GitHub Actions. Each update goes
+through review and CI before merging.
+
 Tests:
 
 ```bash
