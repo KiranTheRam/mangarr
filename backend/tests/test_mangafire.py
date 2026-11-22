@@ -1,6 +1,11 @@
 import httpx
 import pytest
 import respx
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from mangarr.api.search import search_releases
+from mangarr.models import Base, Chapter, Series
+from mangarr.sources import registry
 
 from mangarr.sources._mangafire_vrf import MangaFireSigner, MangaFireTokenError
 from mangarr.sources.mangafire import (
@@ -158,11 +163,12 @@ async def test_other_403s_are_not_retried():
 # globals the real one does and is written as an ES module chunk.
 FAKE_SIGNING_MODULE = """
 var calls = 0;
-globalThis.getProtectionToken = function (path, params) {
+globalThis.vmc_test = {prefix: navigator.appCodeName};
+globalThis.vmc_test.getProtectionToken = function (path, params) {
   calls++;
   var query = Object.keys(params).sort().map(function (k) { return k + '=' + params[k]; });
   var bytes = new TextEncoder().encode(path + '?' + query.join('&'));
-  return navigator.appCodeName + ':' + btoa(String.fromCharCode.apply(null, bytes));
+  return this.prefix + ':' + btoa(String.fromCharCode.apply(null, bytes));
 };
 export{calls as t};
 """
@@ -190,6 +196,44 @@ def _mock_frontend():
 
 
 @respx.mock
+async def test_interactive_search_offers_the_reported_mangafire_decimal_chapters(monkeypatch):
+    _mock_frontend()
+    source = MangaFireSource()
+    monkeypatch.setattr(registry, "enabled_direct_sources", lambda values: [source])
+    title = "Suupaa no Ura de Yani Suu Hanashi"
+    alternate = "Super no Ura de Yani Suu Futari"
+    chapters = [(57, 9323705), (57.1, 9147226), (57.2, 9147227), (57.3, 9147228)]
+    respx.get(f"{API_URL}/titles").respond(200, json={"items": [{"hid": "52oqq", "title": alternate}]})
+    listing = respx.get(f"{API_URL}/titles/52oqq/chapters").respond(200, json={
+        "items": [{"id": item_id, "number": number, "language": "en", "name": "57th Smoke"}
+                  for number, item_id in chapters],
+        "meta": {"hasNext": False},
+    })
+    engine = create_async_engine("sqlite+aiosqlite://")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            series = Series(title=title, alt_titles=alternate, chapters=[
+                Chapter(number=number, downloaded=number == 57) for number, _ in chapters
+            ])
+            session.add(series)
+            await session.commit()
+
+            releases = await search_releases(
+                chapter_id=[chapter.id for chapter in series.chapters if not chapter.downloaded],
+                include_torrents=False, session=session,
+            )
+
+        assert [(release.chapter_number, release.external_id) for release in releases] == [
+            (number, str(item_id)) for number, item_id in chapters[1:]
+        ]
+        assert listing.calls.last.request.url.params["vrf"]
+    finally:
+        await engine.dispose()
+
+
+@respx.mock
 async def test_signer_finds_and_runs_the_sites_signing_module():
     module_route = _mock_frontend()
     signer = MangaFireSigner(BASE_URL)
@@ -201,6 +245,22 @@ async def test_signer_finds_and_runs_the_sites_signing_module():
     assert again == "Mozilla:L2NoYXB0ZXJzLzE/"
     # the loaded module is cached between calls
     assert module_route.call_count == 1
+
+
+@respx.mock
+async def test_signer_keeps_supporting_a_global_token_function():
+    respx.get(f"{BASE_URL}/").mock(
+        return_value=httpx.Response(200, text='<script src="/main.js"></script>')
+    )
+    respx.get(f"{BASE_URL}/main.js").mock(
+        return_value=httpx.Response(
+            200,
+            text='globalThis.getProtectionToken = function(path){return "legacy:" + path;};',
+        )
+    )
+    signer = MangaFireSigner(BASE_URL)
+    async with httpx.AsyncClient() as client:
+        assert await signer.sign(client, "/titles", {}) == "legacy:/titles"
 
 
 @respx.mock

@@ -4,6 +4,9 @@ torrent-imported archives (1.jpg … 10.jpg): a plain name sort reads
 
 import zipfile
 
+import pytest
+
+from mangarr.library import volume_merge
 from mangarr.library.importer import _pack_images
 from mangarr.library.volume_merge import merge_chapter_archives
 
@@ -57,3 +60,41 @@ def test_packing_loose_images_keeps_reading_order(tmp_path):
     _pack_images(pages, dest)
 
     assert _pages_of(dest) == [f"page {name}".encode() for name in UNPADDED]
+
+
+@pytest.mark.parametrize(
+    ("method", "page_limit", "volume_limit", "page_count", "error"),
+    [
+        (zipfile.ZIP_DEFLATED, 7, 32, 3, "expanded size"),
+        (zipfile.ZIP_DEFLATED, 8, 15, 3, "expanded size"),
+        (zipfile.ZIP_DEFLATED, 8, 32, 1, "page count"),
+        (zipfile.ZIP_BZIP2, 8, 32, 3, "unsupported page compression"),
+    ],
+)
+def test_merge_limits_leave_chapter_and_remove_partial(
+    tmp_path, monkeypatch, method, page_limit, volume_limit, page_count, error
+):
+    monkeypatch.setattr(volume_merge, "MAX_MERGE_PAGE_BYTES", page_limit)
+    monkeypatch.setattr(volume_merge, "MAX_MERGE_BYTES", volume_limit)
+    monkeypatch.setattr(volume_merge, "MAX_MERGE_PAGES", page_count)
+    chapter = tmp_path / "chapter.cbz"
+    dest = tmp_path / "volume.cbz"
+    with zipfile.ZipFile(chapter, "w", method) as archive:
+        archive.writestr("1.jpg", b"x" * 8)
+        archive.writestr("2.jpg", b"x" * 8)
+
+    with pytest.raises(ValueError, match=error):
+        merge_chapter_archives([(1, chapter)], dest, "Series", 1)
+    assert list(tmp_path.iterdir()) == [chapter]
+
+
+def test_merge_limits_zip_directory_before_loading_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(volume_merge, "MAX_ZIP_DIRECTORY_BYTES", 128)
+    chapter = tmp_path / "chapter.cbz"
+    dest = tmp_path / "volume.cbz"
+    with zipfile.ZipFile(chapter, "w") as archive:
+        archive.writestr("1.jpg", b"x")
+        archive.writestr("x" * 128 + ".txt", b"")
+    with pytest.raises(ValueError, match="ZIP directory exceeds"):
+        merge_chapter_archives([(1, chapter)], dest, "Series", 1)
+    assert list(tmp_path.iterdir()) == [chapter]

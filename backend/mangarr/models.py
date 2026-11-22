@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -10,10 +11,13 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
@@ -51,6 +55,13 @@ class Series(Base):
     anilist_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)
     mangaupdates_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)
     title: Mapped[str] = mapped_column(String)
+    provider_title: Mapped[str] = mapped_column(String, default="")
+    title_english: Mapped[str] = mapped_column(String, default="")
+    title_romaji: Mapped[str] = mapped_column(String, default="")
+    title_native: Mapped[str] = mapped_column(String, default="")
+    title_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    search_title: Mapped[str] = mapped_column(String, default="")
+    search_templates: Mapped[str] = mapped_column(Text, default="")
     sort_title: Mapped[str] = mapped_column(String, default="")
     alt_titles: Mapped[str] = mapped_column(Text, default="")  # newline-separated
     description: Mapped[str] = mapped_column(Text, default="")
@@ -65,6 +76,7 @@ class Series(Base):
     total_chapters: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_volumes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     monitored: Mapped[bool] = mapped_column(Boolean, default=True)
+    deletion_pending: Mapped[bool] = mapped_column(Boolean, server_default=false())
     root_folder_id: Mapped[int | None] = mapped_column(ForeignKey("root_folders.id"), nullable=True)
     folder_name: Mapped[str] = mapped_column(String, default="")
     # the folder was chosen explicitly by the user — scans must not re-adopt
@@ -107,6 +119,9 @@ class Series(Base):
         back_populates="series", cascade="all, delete-orphan"
     )
     extra_folders: Mapped[list[SeriesFolder]] = relationship(
+        back_populates="series", cascade="all, delete-orphan"
+    )
+    issues: Mapped[list[LibraryIssue]] = relationship(
         back_populates="series", cascade="all, delete-orphan"
     )
 
@@ -180,6 +195,10 @@ class Chapter(Base):
     # files adopted from disk, which upgrades and volume merges never touch.
     file_source: Mapped[str] = mapped_column(String, default="")
     file_group: Mapped[str] = mapped_column(String, default="")
+    # Filename-based PDF adoption can be rechecked. Manual single mappings
+    # stay pinned; manually mapped ranges and renamed files can yield to an
+    # exact chapter file without relying on their current filenames.
+    pdf_mapping: Mapped[str] = mapped_column(String, default="")
 
     series: Mapped[Series] = relationship(back_populates="chapters")
 
@@ -194,6 +213,7 @@ class Chapter(Base):
         if value != self.__dict__.get("file_path"):
             self.file_source = ""
             self.file_group = ""
+            self.pdf_mapping = ""
         return value
 
 
@@ -225,10 +245,12 @@ class Download(Base):
     )
     title: Mapped[str] = mapped_column(String, default="")  # human-readable release title
     source_name: Mapped[str] = mapped_column(String, default="")
-    payload: Mapped[str] = mapped_column(Text, default="")  # source-specific: chapter external id / magnet
+    payload: Mapped[str] = mapped_column(Text, default="")  # source-specific: chapter external id / magnet / torrent URL
     # scanlation group of the grabbed release, when the source reports one
     release_group: Mapped[str] = mapped_column(String, default="")
     torrent_hash: Mapped[str] = mapped_column(String, default="")
+    # Filesystem publication starts after this journal is committed.
+    direct_install: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)  # 0..1
     error: Mapped[str] = mapped_column(Text, default="")
     # a failure a later attempt can be expected to clear (network, timeout,
@@ -255,6 +277,42 @@ class HistoryEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     series: Mapped[Series | None] = relationship()
+    chapter: Mapped[Chapter | None] = relationship()
+
+
+class LibraryIssue(Base):
+    """A currently reproducible library metadata problem.
+
+    Detection upserts these rows by ``key`` and deletes them when the file no
+    longer reproduces the problem. Ignoring an issue is therefore durable
+    while the problem exists, without leaving resolved history in the UI.
+    """
+
+    __tablename__ = "library_issues"
+    __table_args__ = (Index("ux_library_issues_public_id", "public_id", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String, default=lambda: uuid4().hex)
+    revision: Mapped[str] = mapped_column(String, default="")
+    key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
+    chapter_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chapters.id"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String)
+    file_path: Mapped[str] = mapped_column(Text)
+    field: Mapped[str] = mapped_column(String)
+    current_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(String)
+    detail: Mapped[str] = mapped_column(Text)
+    ignored: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    series: Mapped[Series] = relationship(back_populates="issues")
     chapter: Mapped[Chapter | None] = relationship()
 
 

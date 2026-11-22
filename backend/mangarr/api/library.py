@@ -5,22 +5,31 @@ import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .. import settings_service
 from ..db import get_session
-from ..library.matcher import find_series_media_files, match_files
+from ..library.matcher import (
+    find_series_media_files, manual_pdf_mappings, match_files, pdf_file_identity, split_pdf_title_conflicts,
+)
 from ..library.rename import apply_renames, plan_renames
 from ..library.scanner import (
+    chapters_under_folders,
     find_existing_folder,
     resolve_folders,
     resolve_volume_offsets,
     scan_series,
     series_dir,
+    unavailable_extra_folders,
 )
-from ..models import Chapter, RootFolder, Series, SeriesFolder, SeriesSourceLink
+from ..jobs.tasks import series_lock
+from ..metadata_issues import (
+    detect_series_issues, manual_archive_lock, release_archive_owners, relocate_archive_issues,
+    reserve_archive_owners,
+)
+from ..models import Chapter, LibraryIssue, RootFolder, Series, SeriesFolder, SeriesSourceLink
 from ..schemas import (
     CleanupApplyIn,
     CleanupFileOut,
@@ -54,6 +63,7 @@ from ..schemas import (
     VolumeResyncPreviewOut,
 )
 from ..sources import registry
+from ..titles import metadata_titles
 
 router = APIRouter(tags=["library"])
 
@@ -67,7 +77,7 @@ async def _load(session: AsyncSession, series_id: int) -> Series:
             selectinload(Series.root_folder),
             selectinload(Series.extra_folders),
         )
-        .where(Series.id == series_id)
+        .where(Series.id == series_id, Series.deletion_pending.is_(False))
     )
     series = result.scalar_one_or_none()
     if series is None:
@@ -90,9 +100,10 @@ def _volume_offsets_of(series: Series) -> dict[str, int]:
     return resolve_volume_offsets(_root_of(series), series)
 
 
-def _media_of(series: Series):
+def _media_of(series: Series, *, include_pdfs: bool = True):
     return find_series_media_files(
-        _folders_of(series), _active_chapters(series), _volume_offsets_of(series)
+        _folders_of(series), _active_chapters(series), _volume_offsets_of(series),
+        include_pdfs=include_pdfs,
     )
 
 
@@ -140,10 +151,7 @@ def _require_series_media_path(series: Series, raw_path: str) -> Path:
 
 @router.post("/series/{series_id}/scan", response_model=ScanResultOut)
 async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
-    from ..jobs.tasks import acquire_series_lock
-
-    lock = await acquire_series_lock(series_id)
-    try:
+    async with series_lock(series_id), manual_archive_lock:
         series = await _load(session, series_id)
         root = _root_of(series)
         await _require_root_available(session, series)
@@ -161,6 +169,7 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
         )
         if result.root_unavailable:
             raise HTTPException(409, result.root_unavailable)
+        await detect_series_issues(session, series)
         await session.commit()
         return ScanResultOut(
             folder=", ".join(str(f) for f in folders),
@@ -171,8 +180,6 @@ async def scan(series_id: int, session: AsyncSession = Depends(get_session)):
             cleared=result.cleared,
             unmatched=[m.path.name for m in result.unmatched],
         )
-    finally:
-        lock.release()
 
 
 @router.post("/library/scan", status_code=202)
@@ -210,13 +217,17 @@ async def rename_preview(series_id: int, session: AsyncSession = Depends(get_ses
 async def rename_apply(
     series_id: int, body: RenameApplyIn, session: AsyncSession = Depends(get_session)
 ):
-    series = await _load(session, series_id)
-    items = await _plan(session, series)
-    if body.chapter_ids is not None:
-        wanted = set(body.chapter_ids)
-        items = [i for i in items if wanted & set(i.chapter_ids)]
-    outcomes = apply_renames(items, {c.id: c for c in _active_chapters(series)})
-    await session.commit()
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        items = await _plan(session, series)
+        if body.chapter_ids is not None:
+            wanted = set(body.chapter_ids)
+            items = [i for i in items if wanted & set(i.chapter_ids)]
+        outcomes = apply_renames(items, {c.id: c for c in _active_chapters(series)})
+        renamed = [(o.item.current_path, o.item.new_path) for o in outcomes if o.status == "renamed"]
+        if await relocate_archive_issues(session, series_id, renamed):
+            await detect_series_issues(session, series)
+        await session.commit()
     return [
         RenameOutcomeOut(
             current_name=o.item.current_name, new_name=o.item.new_name,
@@ -231,8 +242,12 @@ async def rename_apply(
 @router.get("/series/{series_id}/files", response_model=list[SeriesFileOut])
 async def series_files(series_id: int, session: AsyncSession = Depends(get_session)):
     series = await _load(session, series_id)
-    media = _media_of(series)
-    result = match_files(media, _active_chapters(series))
+    chapters = _active_chapters(series)
+    manual_pdfs = manual_pdf_mappings(chapters)
+    media, pdf_conflicts = split_pdf_title_conflicts(
+        _media_of(series), [series.title, *metadata_titles(series)], manual_pdfs=manual_pdfs,
+    )
+    result = match_files(media, chapters, manual_pdfs=manual_pdfs)
     out: list[SeriesFileOut] = []
     for mf in result.matched:
         out.append(SeriesFileOut(
@@ -241,7 +256,7 @@ async def series_files(series_id: int, session: AsyncSession = Depends(get_sessi
             matched_chapter_id=mf.chapter.id if mf.chapter else None,
             covered_count=len(mf.covered_chapters),
         ))
-    for m in result.unmatched:
+    for m in (*result.unmatched, *pdf_conflicts):
         out.append(SeriesFileOut(
             path=str(m.path), name=m.path.name, is_dir=m.is_dir,
             chapter_number=m.chapter_number, volume_number=m.volume_number,
@@ -250,18 +265,32 @@ async def series_files(series_id: int, session: AsyncSession = Depends(get_sessi
     return out
 
 
+def _pin_pdf_mapping(series: Series, chapter: Chapter, path: Path) -> None:
+    chapter.pdf_mapping = "manual"
+    identity = pdf_file_identity(path)
+    for other in _active_chapters(series):
+        if (identity is not None and other.pdf_mapping == "scan" and other.file_path
+                and pdf_file_identity(Path(other.file_path)) == identity):
+            other.downloaded = False
+            other.file_path = ""
+
+
 @router.post("/series/{series_id}/files/map", status_code=204)
 async def map_file(
     series_id: int, body: FileMapIn, session: AsyncSession = Depends(get_session)
 ):
-    series = await _load(session, series_id)
-    chapter = next((c for c in _active_chapters(series) if c.id == body.chapter_id), None)
-    if chapter is None:
-        raise HTTPException(404, "Chapter not found")
-    media_path = _require_series_media_path(series, body.file_path)
-    chapter.downloaded = True
-    chapter.file_path = str(media_path)
-    await session.commit()
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        chapter = next((c for c in _active_chapters(series) if c.id == body.chapter_id), None)
+        if chapter is None:
+            raise HTTPException(404, "Chapter not found")
+        media_path = _require_series_media_path(series, body.file_path)
+        chapter.downloaded = True
+        chapter.file_path = str(media_path)
+        if media_path.is_file() and media_path.suffix.lower() == ".pdf":
+            _pin_pdf_mapping(series, chapter, media_path)
+        await _reconcile_issues(session, series)
+        await session.commit()
 
 
 @router.get("/series/{series_id}/cleanup", response_model=CleanupPlanOut)
@@ -273,7 +302,7 @@ async def cleanup_plan(series_id: int, session: AsyncSession = Depends(get_sessi
     plan = analyze(
         series, _active_chapters(series), _folders_of(series),
         values["naming_template"], values["naming_template_no_volume"],
-        media=_media_of(series),
+        media=_media_of(series, include_pdfs=False),
     )
 
     def out(f):
@@ -294,22 +323,18 @@ async def cleanup_apply(
 ):
     from ..library.cleanup import apply_cleanup
 
-    from ..jobs.tasks import acquire_series_lock
-
-    lock = await acquire_series_lock(series_id)
-    try:
+    async with series_lock(series_id), manual_archive_lock:
         series = await _load(session, series_id)
         result = apply_cleanup(
             series, _active_chapters(series), _folders_of(series), body.delete,
-            media=_media_of(series),
+            media=_media_of(series, include_pdfs=False),
         )
+        await _reconcile_issues(session, series)
         await session.commit()
         return CleanupResultOut(
             deleted=result.deleted, repointed=result.repointed,
             skipped=result.skipped, freed_bytes=result.freed_bytes,
         )
-    finally:
-        lock.release()
 
 
 @router.post("/series/{series_id}/files/map-range", response_model=FileMapRangeOut)
@@ -321,24 +346,32 @@ async def map_file_range(
     parsed volume onto those chapters so future scans/renames keep working."""
     from ..util import parse_volume_number
 
-    series = await _load(session, series_id)
-    media_path = _require_series_media_path(series, body.file_path)
-    lo, hi = sorted((body.from_number, body.to_number))
-    volume = parse_volume_number(media_path.stem)
-    mapped = 0
-    for ch in _active_chapters(series):
-        if lo <= ch.number <= hi:
-            ch.downloaded = True
-            ch.file_path = str(media_path)
-            if volume is not None:
-                ch.volume = volume
-                ch.volume_source = "manual"
-                ch.volume_locked = True
-            mapped += 1
-    if mapped == 0:
-        raise HTTPException(400, "No tracked chapters in that range")
-    await session.commit()
-    return FileMapRangeOut(mapped=mapped, volume=volume)
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        media_path = _require_series_media_path(series, body.file_path)
+        lo, hi = sorted((body.from_number, body.to_number))
+        volume = parse_volume_number(media_path.stem)
+        is_pdf = media_path.is_file() and media_path.suffix.lower() == ".pdf"
+        mapped = 0
+        for ch in _active_chapters(series):
+            if lo <= ch.number <= hi:
+                ch.downloaded = True
+                ch.file_path = str(media_path)
+                if is_pdf:
+                    if lo == hi:
+                        _pin_pdf_mapping(series, ch, media_path)
+                    else:
+                        ch.pdf_mapping = "confirmed"
+                if volume is not None:
+                    ch.volume = volume
+                    ch.volume_source = "manual"
+                    ch.volume_locked = True
+                mapped += 1
+        if mapped == 0:
+            raise HTTPException(400, "No tracked chapters in that range")
+        await _reconcile_issues(session, series)
+        await session.commit()
+        return FileMapRangeOut(mapped=mapped, volume=volume)
 
 
 # --------------------------------------------------------------- folders
@@ -375,17 +408,21 @@ async def list_folders(series_id: int, session: AsyncSession = Depends(get_sessi
 async def add_folder(
     series_id: int, body: SeriesFolderIn, session: AsyncSession = Depends(get_session)
 ):
-    series = await _load(session, series_id)
-    root = _root_of(series)
-    path = _relative_to_root(root, body.path)
-    if not path or path == series.folder_name or any(f.path == path for f in series.extra_folders):
-        raise HTTPException(400, "Folder already configured for this series")
-    folder = SeriesFolder(
-        series_id=series.id, path=path, volume_offset=body.volume_offset
-    )
-    session.add(folder)
-    await session.commit()
-    await session.refresh(folder)
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        root = _root_of(series)
+        path = _relative_to_root(root, body.path)
+        if not path or path == series.folder_name or any(f.path == path for f in series.extra_folders):
+            raise HTTPException(400, "Folder already configured for this series")
+        folder = SeriesFolder(
+            series_id=series.id, path=path, volume_offset=body.volume_offset
+        )
+        session.add(folder)
+        await session.flush()
+        await session.refresh(series, ["extra_folders"])
+        await _reconcile_issues(session, series)
+        await session.commit()
+        await session.refresh(folder)
     resolved = root / path
     return SeriesFolderOut(
         id=folder.id, path=folder.path, resolved=str(resolved),
@@ -400,13 +437,15 @@ async def update_folder(
     body: SeriesFolderUpdateIn,
     session: AsyncSession = Depends(get_session),
 ):
-    series = await _load(session, series_id)
-    folder = next((item for item in series.extra_folders if item.id == folder_id), None)
-    if folder is None:
-        raise HTTPException(404, "Folder not found")
-    folder.volume_offset = body.volume_offset
-    await session.commit()
-    root = _root_of(series)
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        folder = next((item for item in series.extra_folders if item.id == folder_id), None)
+        if folder is None:
+            raise HTTPException(404, "Folder not found")
+        folder.volume_offset = body.volume_offset
+        await _reconcile_issues(session, series)
+        await session.commit()
+        root = _root_of(series)
     resolved = root / folder.path
     return SeriesFolderOut(
         id=folder.id, path=folder.path, resolved=str(resolved), primary=False,
@@ -418,11 +457,14 @@ async def update_folder(
 async def remove_folder(
     series_id: int, folder_id: int, session: AsyncSession = Depends(get_session)
 ):
-    folder = await session.get(SeriesFolder, folder_id)
-    if folder is None or folder.series_id != series_id:
-        raise HTTPException(404, "Folder not found")
-    await session.delete(folder)
-    await session.commit()
+    async with series_lock(series_id), manual_archive_lock:
+        series = await _load(session, series_id)
+        folder = next((item for item in series.extra_folders if item.id == folder_id), None)
+        if folder is None:
+            raise HTTPException(404, "Folder not found")
+        series.extra_folders.remove(folder)  # delete-orphan removes the row
+        await _reconcile_issues(session, series)
+        await session.commit()
 
 
 # ---------------------------------------------------------- source links
@@ -524,7 +566,7 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
     being rebuilt."""
     from sqlalchemy import delete as sa_delete, func, or_
 
-    from ..jobs.tasks import acquire_series_lock, update_chapters
+    from ..jobs.tasks import _recover_direct_install, acquire_series_lock, update_chapters
     from ..models import Download, DownloadStatus, HistoryEvent
 
     lock = await acquire_series_lock(series_id)
@@ -533,6 +575,10 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
         series = await _load(session, series_id)
         # the rebuild relies on a rescan to restore downloaded state
         await _require_root_available(session, series)
+        if chapters_under_folders(
+            series.chapters, unavailable_extra_folders(_folders_of(series)[1:]),
+        ):
+            raise HTTPException(409, "A configured extra folder with downloaded chapters is unavailable")
         busy = await session.scalar(
             select(func.count(Download.id)).where(
                 Download.series_id == series_id,
@@ -547,61 +593,100 @@ async def resync_chapters(series_id: int, session: AsyncSession = Depends(get_se
                 f"{busy} download(s) for this series are still in progress; wait for "
                 "them to finish or remove them from the queue, then re-sync",
             )
+        pending_installs = (await session.scalars(select(Download).where(
+            Download.series_id == series_id, Download.direct_install.is_not(None),
+        ))).all()
+        if pending_installs:
+            async with manual_archive_lock:
+                for download in pending_installs:
+                    if not await _recover_direct_install(session, download):
+                        await session.commit()  # keep earlier completed repairs
+                        raise HTTPException(
+                            409, "An interrupted archive install could not be recovered. "
+                            "Check the archive and library folder before re-syncing.",
+                        )
         preserved_metadata = {
             ch.number: (
                 ch.title, ch.volume, ch.title_source, ch.volume_source,
                 ch.title_locked, ch.volume_locked, ch.excluded, ch.monitored,
-                ch.downloaded, ch.file_path, ch.released_at, ch.available_sources,
+                ch.downloaded, ch.file_path, ch.released_at, ch.available_sources, ch.pdf_mapping,
             )
             for ch in series.chapters
             if ch.excluded or ch.title_locked or ch.volume_locked
         }
+        preserved_pdfs = {
+            ch.number: (ch.file_path, ch.pdf_mapping, ch.monitored)
+            for ch in series.chapters if not ch.excluded and ch.downloaded
+            and Path(ch.file_path).suffix.lower() == ".pdf" and ch.pdf_mapping != "scan"
+        }
         values = await registry.apply_settings(session)
+        # Deleting the chapter rows hides this series' mappings from every
+        # ownership snapshot until the rescan restores them. Keep claiming the
+        # archives meanwhile, without holding the global archive lock through
+        # the network fetch, so another series cannot rewrite a shared one.
+        await reserve_archive_owners(series_id, [ch.file_path for ch in series.chapters])
         await session.execute(sa_delete(Download).where(
             Download.series_id == series_id,
             or_(Download.chapter_id.isnot(None), Download.status.notin_(active)),
         ))
         await session.execute(sa_delete(HistoryEvent).where(HistoryEvent.series_id == series_id))
+        # Keep dismissals by archive, but detach their chapter IDs before
+        # SQLite can reuse those IDs for the rebuilt chapter list.
+        await session.execute(
+            update(LibraryIssue).where(LibraryIssue.series_id == series_id).values(chapter_id=None)
+        )
         for ch in list(series.chapters):
             await session.delete(ch)
         await session.commit()
 
         series = await _load(session, series_id)
         await update_chapters(session, series, values)
-        # a locked chapter no source re-lists (e.g. a manually mapped extra)
-        # must survive the rebuild — recreate it rather than dropping the
-        # very metadata the lock promised to keep
-        present = {ch.number for ch in series.chapters}
-        for number, saved in preserved_metadata.items():
-            if number not in present:
-                series.chapters.append(
-                    Chapter(number=number, monitored=saved[7], excluded=saved[6])
-                )
-        for ch in series.chapters:
-            saved = preserved_metadata.get(ch.number)
-            if saved is None:
-                continue
-            (
-                title, volume, title_source, volume_source,
-                title_locked, volume_locked, excluded, monitored,
-                downloaded, file_path, released_at, available_sources,
-            ) = saved
-            if excluded:
-                ch.title, ch.volume = title, volume
-                ch.title_source, ch.volume_source = title_source, volume_source
-                ch.title_locked, ch.volume_locked = title_locked, volume_locked
-                ch.excluded, ch.monitored = True, monitored
-                ch.downloaded, ch.file_path = downloaded, file_path
-                ch.released_at, ch.available_sources = released_at, available_sources
-                continue
-            if title_locked:
-                ch.title, ch.title_source, ch.title_locked = title, title_source, True
-            if volume_locked:
-                ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
-        await session.commit()
-        scan = await _scan_now(session, series)
-        return ResyncOut(chapters=len(_active_chapters(series)), matched_chapters=scan)
+        async with manual_archive_lock:
+            # The archive lock now covers the rows until the rescan commits.
+            release_archive_owners(series_id)
+            # a locked chapter no source re-lists (e.g. a manually mapped extra)
+            # must survive the rebuild — recreate it rather than dropping the
+            # very metadata the lock promised to keep
+            present = {ch.number for ch in series.chapters}
+            for number, saved in preserved_metadata.items():
+                if number not in present:
+                    series.chapters.append(
+                        Chapter(number=number, monitored=saved[7], excluded=saved[6])
+                    )
+                    present.add(number)
+            for number, (_, _, monitored) in preserved_pdfs.items():
+                if number not in present:
+                    series.chapters.append(Chapter(number=number, monitored=monitored))
+            for ch in series.chapters:
+                if pdf := preserved_pdfs.get(ch.number):
+                    ch.downloaded = True
+                    ch.file_path, ch.pdf_mapping, ch.monitored = pdf
+                saved = preserved_metadata.get(ch.number)
+                if saved is None:
+                    continue
+                (
+                    title, volume, title_source, volume_source,
+                    title_locked, volume_locked, excluded, monitored,
+                    downloaded, file_path, released_at, available_sources, pdf_mapping,
+                ) = saved
+                if excluded:
+                    ch.title, ch.volume = title, volume
+                    ch.title_source, ch.volume_source = title_source, volume_source
+                    ch.title_locked, ch.volume_locked = title_locked, volume_locked
+                    ch.excluded, ch.monitored = True, monitored
+                    ch.downloaded, ch.file_path = downloaded, file_path
+                    ch.released_at, ch.available_sources = released_at, available_sources
+                    ch.pdf_mapping = pdf_mapping
+                    continue
+                if title_locked:
+                    ch.title, ch.title_source, ch.title_locked = title, title_source, True
+                if volume_locked:
+                    ch.volume, ch.volume_source, ch.volume_locked = volume, volume_source, True
+            await session.commit()
+            scan = await _scan_now(session, series)
+            return ResyncOut(chapters=len(_active_chapters(series)), matched_chapters=scan)
     finally:
+        release_archive_owners(series_id)
         lock.release()
 
 
@@ -646,8 +731,10 @@ def _run_resync(
         if not ch.downloaded or not ch.file_path:
             continue
         before[ch.id] = ch.file_path
-        stem = Path(ch.file_path).stem
-        coverage = parse_filename(stem)
+        path = Path(ch.file_path)
+        if path.suffix.lower() == ".pdf" and ch.pdf_mapping != "scan":
+            continue
+        coverage = parse_filename(path.stem)
         if coverage.volume and not coverage.chapter and not coverage.ambiguous \
                 and not coverage.covers(ch.number, ch.volume):
             ch.downloaded = False
@@ -678,7 +765,7 @@ def _chapter_copies(chapters):
                 volume=ch.volume, volume_source=ch.volume_source,
                 volume_locked=ch.volume_locked,
                 excluded=ch.excluded,
-                downloaded=ch.downloaded, file_path=ch.file_path)
+                downloaded=ch.downloaded, file_path=ch.file_path, pdf_mapping=ch.pdf_mapping)
         for ch in chapters
     ]
 
@@ -767,12 +854,14 @@ async def resync_volumes(
             return VolumeResyncOut(has_data=False, assigned=0, changed=0,
                                    repointed=0, cleared=0)
 
-        # volume archives on disk anchor the chapters the source can't place
-        volume_map = refine_volume_map_with_disk(series, volume_map)
-        assigned, changed, repointed, cleared, _ = _run_resync(
-            series, _active_chapters(series), volume_map, map_sources
-        )
-        await session.commit()
+        async with manual_archive_lock:
+            # volume archives on disk anchor the chapters the source can't place
+            volume_map = refine_volume_map_with_disk(series, volume_map)
+            assigned, changed, repointed, cleared, _ = _run_resync(
+                series, _active_chapters(series), volume_map, map_sources
+            )
+            await _reconcile_issues(session, series)
+            await session.commit()
         return VolumeResyncOut(
             has_data=True, assigned=assigned, changed=changed,
             repointed=repointed, cleared=cleared,
@@ -781,12 +870,23 @@ async def resync_volumes(
         lock.release()
 
 
+async def _reconcile_issues(session: AsyncSession, series: Series) -> None:
+    """Refresh warnings after a mapping or repair-input change, under both locks.
+
+    Resolve always recomputes its recommendation, so this keeps the listing
+    from offering stale repairs until the next scan.
+    """
+    await session.flush()
+    await detect_series_issues(session, series)
+
+
 async def _scan_now(session: AsyncSession, series: Series) -> int:
-    from ..library.scanner import scan_series
     result = scan_series(
         series, _active_chapters(series), _folders_of(series),
         _volume_offsets_of(series), root=_root_of(series),
     )
+    if not result.root_unavailable:
+        await detect_series_issues(session, series)
     await session.commit()
     return result.matched_chapters
 

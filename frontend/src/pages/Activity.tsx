@@ -1,3 +1,4 @@
+import { Icon } from "../components/Icon";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
@@ -34,7 +35,7 @@ function Queue() {
   if (isLoading) return <Spinner />;
   if (error && !data) return <ErrorNotice error={error} retry={() => void refetch()} />;
   if (!data || data.length === 0)
-    return <><ErrorNotice error={error} retry={() => void refetch()} /><EmptyState icon="⇅" title="Queue is empty" hint="Grabbed releases will appear here." /></>;
+    return <><ErrorNotice error={error} retry={() => void refetch()} /><EmptyState icon="activity" title="Queue is empty" hint="Grabbed releases will appear here." /></>;
 
   // only ids still in the queue count (items can finish between refetches)
   const selectedVisible = data.filter((item) => selected.has(item.id)).map((item) => item.id);
@@ -130,7 +131,7 @@ function Queue() {
                       disabled={retry.isPending}
                       onClick={() => retry.mutate(item.id)}
                     >
-                      ↻
+                      <Icon name="refresh" />
                     </button>
                   )}
                   <button
@@ -140,7 +141,7 @@ function Queue() {
                     disabled={remove.isPending}
                     onClick={() => remove.mutate(item.id)}
                   >
-                    ✕
+                    <Icon name="close" />
                   </button>
                 </div>
               </td>
@@ -161,7 +162,7 @@ function History() {
 
   if (isLoading) return <Spinner />;
   if (error && !data) return <ErrorNotice error={error} retry={() => void refetch()} />;
-  if (!data || data.length === 0) return <><ErrorNotice error={error} retry={() => void refetch()} /><EmptyState icon="🕘" title="No history yet" /></>;
+  if (!data || data.length === 0) return <><ErrorNotice error={error} retry={() => void refetch()} /><EmptyState icon="history" title="No history yet" /></>;
 
   return (
     <>

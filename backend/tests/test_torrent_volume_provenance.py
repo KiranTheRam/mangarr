@@ -1,15 +1,21 @@
 import zipfile
+from pathlib import Path
+
+import pytest
+from sqlalchemy import select
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from mangarr.jobs import tasks
 from mangarr.library.naming import DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_NO_VOLUME
 from mangarr.models import (
-    Base, Chapter, Download, DownloadKind, DownloadStatus, RootFolder, Series,
+    Base, Chapter, Download, DownloadKind, DownloadStatus, HistoryEvent, RootFolder, Series,
 )
 
 
-async def test_volume_archive_import_records_nyaa_as_file_source(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source_name", ["", "nyaa", "Torznab / Prowlarr / Tracker"])
+@pytest.mark.parametrize("import_mode", ["copy", "hardlink"])
+async def test_volume_archive_import_records_source(tmp_path, monkeypatch, source_name, import_mode):
     engine = create_async_engine("sqlite+aiosqlite://")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -25,7 +31,7 @@ async def test_volume_archive_import_records_nyaa_as_file_source(tmp_path, monke
             session.add(series)
             await session.commit()
             download = Download(series_id=series.id, kind=DownloadKind.TORRENT,
-                                status=DownloadStatus.IMPORTING, title="Vinland Saga v02")
+                                status=DownloadStatus.IMPORTING, title="Vinland Saga v02", source_name=source_name)
             session.add(download)
             await session.commit()
             source = tmp_path / "Vinland Saga v02.cbz"
@@ -37,7 +43,7 @@ async def test_volume_archive_import_records_nyaa_as_file_source(tmp_path, monke
             await tasks._import_torrent(session, download, source, {
                 "naming_template": DEFAULT_TEMPLATE,
                 "naming_template_no_volume": DEFAULT_TEMPLATE_NO_VOLUME,
-                "import_mode": "copy",
+                "import_mode": import_mode,
             })
             await session.refresh(download)
             assert download.status == DownloadStatus.DONE
@@ -45,6 +51,11 @@ async def test_volume_archive_import_records_nyaa_as_file_source(tmp_path, monke
             for chapter in series.chapters:
                 assert chapter.downloaded
                 assert chapter.file_path.endswith("Vinland Saga - Vol. 02.cbz")
-                assert chapter.file_source == "nyaa"
+                assert chapter.file_source == (source_name or "nyaa")
+            event = await session.scalar(select(HistoryEvent))
+            assert event.source_name == (source_name or "nyaa")
+            assert source.exists()
+            if import_mode == "hardlink":
+                assert source.stat().st_ino == Path(series.chapters[0].file_path).stat().st_ino
     finally:
         await engine.dispose()

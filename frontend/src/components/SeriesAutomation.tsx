@@ -1,3 +1,4 @@
+import { Icon } from "./Icon";
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
@@ -110,6 +111,8 @@ export function AutomationModal({
   const [upgrades, setUpgrades] = useState(series.upgrades_enabled);
   const [cutoff, setCutoff] = useState(series.upgrade_cutoff);
   const [mergeVolumes, setMergeVolumes] = useState(series.merge_volumes);
+  const [searchTitle, setSearchTitle] = useState(series.search_title || "");
+  const [searchTemplates, setSearchTemplates] = useState(series.search_templates || "");
   const [showGroups, setShowGroups] = useState(false);
 
   const modeChanged =
@@ -140,6 +143,8 @@ export function AutomationModal({
         upgrades_enabled: upgrades,
         upgrade_cutoff: cutoff,
         merge_volumes: mergeVolumes,
+        search_title: searchTitle,
+        search_templates: searchTemplates,
       }),
     onSuccess: () => {
       onSaved();
@@ -180,6 +185,13 @@ export function AutomationModal({
       </div>
 
       <div className="automation-section">
+        <h4>Torrent search options</h4>
+        <div className="form-row"><label htmlFor="torrent-search-title">Search title</label><input id="torrent-search-title" value={searchTitle} placeholder={series.title} onChange={(e) => setSearchTitle(e.target.value)} /></div>
+        <div className="form-row"><label htmlFor="torrent-search-templates">Query templates</label><textarea id="torrent-search-templates" value={searchTemplates} placeholder="Use Settings defaults" onChange={(e) => setSearchTemplates(e.target.value)} /></div>
+        <p className="form-hint">Leave blank to use the series titles and Settings defaults. One template per line: {"{series}, {chapter}, {volume}, {year}"}. Examples: {"{series} c{chapter:03d}"}, {"{series} v{volume:02d}"}. Volume templates need chapter-to-volume metadata. These settings affect torrent searches only.</p>
+      </div>
+
+      <div className="automation-section">
         <h4>Sources</h4>
         <p className="form-hint">
           Order in which grabs try sources for this series. Switch a source off to never grab
@@ -194,7 +206,7 @@ export function AutomationModal({
                 <span className="priority-rank">{i + 1}</span>
                 <span className="priority-arrows">
                   <button className="btn icon-btn" disabled={i === 0} onClick={() => move(i, -1)} title="Higher priority">
-                    ↑
+                    <Icon name="arrow-up" />
                   </button>
                   <button
                     className="btn icon-btn"
@@ -202,7 +214,7 @@ export function AutomationModal({
                     onClick={() => move(i, 1)}
                     title="Lower priority"
                   >
-                    ↓
+                    <Icon name="arrow-down" />
                   </button>
                 </span>
                 <span className="priority-name">{sourceLabel(name)}</span>

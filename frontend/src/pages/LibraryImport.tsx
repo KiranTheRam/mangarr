@@ -358,7 +358,7 @@ export default function LibraryImport() {
           <Spinner />
         ) : rows && rows.length === 0 ? (
           <EmptyState
-            icon="✓"
+            icon="check"
             title="Nothing to import"
             hint="Every folder in this root folder already belongs to a series."
           />

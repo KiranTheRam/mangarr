@@ -1,10 +1,12 @@
 import asyncio
+import logging
 from collections.abc import Iterable
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import Integer, case, cast, func, select, update as sa_update
+from sqlalchemy import Integer, case, cast, func, select, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -19,7 +21,7 @@ from ..adding import (
     start_refreshes,
 )
 from ..automation import RESOLVED_MODES, apply_monitor_mode, order_sources
-from ..db import get_session
+from ..db import get_session, session_scope
 from ..jobs.tasks import (
     REFRESHING,
     REMOVED_BY_USER,
@@ -27,13 +29,19 @@ from ..jobs.tasks import (
     acquire_series_lock,
     merge_complete_volumes,
     refresh_series_full,
+    series_lock,
     try_acquire_series_lock,
 )
 from ..library.move import MoveError, anchor_extra_folders, move_series_folder
+from ..metadata_issues import (
+    ArchiveOwnership, detect_series_issues, load_archive_ownership, manual_archive_lock,
+    relocate_archive_issues,
+)
 from ..models import Chapter, Download, DownloadKind, DownloadStatus, RootFolder, Series
 from ..release_schedule import cadence_label, release_schedule
 from ..schemas import (
     AddSeriesIn,
+    ApplyTitlePreferenceOut,
     ChapterMetadataIn,
     ChapterMonitorIn,
     ChapterOut,
@@ -52,8 +60,16 @@ from ..schemas import (
     VolumeMergeOut,
 )
 from ..sources import registry
-from ..titles import english_title, split_alt_titles
-from ..util import is_special_chapter
+from ..titles import (
+    compute_title_variants,
+    english_title,
+    pick_title,
+    set_display_title,
+    split_alt_titles,
+)
+from ..util import finish_before_cancel, is_special_chapter
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/series", tags=["series"])
 
@@ -87,7 +103,9 @@ def _apply_counts(out: SeriesOut, counts: _Counts) -> None:
 
 def _series_out(series: Series, counts: _Counts) -> SeriesOut:
     out = SeriesOut.model_validate(series)
-    out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
+    out.english_title = series.title_english or english_title(
+        series.provider_title or series.title, split_alt_titles(series.alt_titles)
+    )
     _apply_counts(out, counts)
     return out
 
@@ -177,7 +195,9 @@ async def list_series(session: AsyncSession = Depends(get_session)):
     )
     for series_id, *totals in rows.all():
         counts[series_id] = _Counts(*(int(t or 0) for t in totals))
-    result = await session.execute(select(Series).order_by(Series.sort_title, Series.title))
+    result = await session.execute(
+        select(Series).where(Series.deletion_pending.is_(False)).order_by(Series.sort_title, Series.title)
+    )
     return [
         _series_out(s, counts.get(s.id, _Counts()))
         for s in result.scalars().all()
@@ -222,47 +242,86 @@ async def add_series(body: AddSeriesIn, session: AsyncSession = Depends(get_sess
 
 async def _series_in_order(session: AsyncSession, series_ids: list[int], *options) -> list[Series]:
     """The requested series that exist, in the order they were given."""
-    result = await session.execute(select(Series).options(*options).where(Series.id.in_(series_ids)))
+    result = await session.execute(select(Series).options(*options).where(
+        Series.id.in_(series_ids), Series.deletion_pending.is_(False),
+    ))
     by_id = {s.id: s for s in result.scalars().all()}
     return [by_id[i] for i in dict.fromkeys(series_ids) if i in by_id]
 
 
 async def _change_root_folder(
-    session: AsyncSession, series: Series, new_root: RootFolder, move_files: bool
+    session: AsyncSession, series: Series, new_root: RootFolder, body: SeriesEditorIn,
 ) -> bool:
-    """Point the series at another root folder, optionally moving its folder
-    there first. Returns whether files moved; raises MoveError (with nothing
-    changed) when the move can't happen."""
-    if not move_files or series.root_folder is None:
-        if series.root_folder is not None:
-            anchor_extra_folders(series, Path(series.root_folder.path))
-        series.root_folder = new_root
-        return False
-    in_flight = await session.scalar(
-        select(Download.id).where(
-            Download.series_id == series.id,
-            Download.status.in_([
-                DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
-            ]),
-        ).limit(1)
+    """Apply monitoring edits and change the root, moving files when requested.
+
+    Returns whether files moved. A MoveError leaves the root and files in place.
+    """
+    lock = (
+        await try_acquire_series_lock(series.id)
+        if body.move_files else await acquire_series_lock(series.id)
     )
-    if in_flight is not None:
-        # an import would write into the old folder after it moved away
-        raise MoveError("downloads are in progress; move it once they finish")
-    lock = await try_acquire_series_lock(series.id)
     if lock is None:
+        _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
+        if series.root_folder_id == new_root.id:
+            return False
         raise MoveError("the series is refreshing; try again once it finishes")
     try:
-        old_root = Path(series.root_folder.path)
-        moved = await move_series_folder(series, new_root)
-        anchor_extra_folders(series, old_root)
-        series.root_folder = new_root
-        # commit while still holding the lock, so the next refresh already
-        # sees the files at their new paths
-        await session.commit()
+        async with manual_archive_lock:
+            # Defer writes from bulk monitoring edits until the root change commits.
+            with session.no_autoflush:
+                # The bulk editor's preloaded paths can predate a rename or a
+                # scan. Re-read the series and its mappings before changing them.
+                current = await session.scalar(
+                    select(Series)
+                    .options(
+                        selectinload(Series.chapters), selectinload(Series.extra_folders),
+                        selectinload(Series.root_folder),
+                    )
+                    .where(Series.id == series.id, Series.deletion_pending.is_(False))
+                    .execution_options(populate_existing=True)
+                )
+                if current is None:
+                    raise MoveError("the series no longer exists")
+                _apply_monitoring(current, body.monitored, body.monitor_mode, body.monitor_from)
+                if current.root_folder_id == new_root.id:
+                    return False
+                if not body.move_files or current.root_folder is None:
+                    if current.root_folder is not None:
+                        anchor_extra_folders(current, Path(current.root_folder.path))
+                    current.root_folder = new_root
+                    await session.commit()
+                    return False
+                in_flight = await session.scalar(
+                    select(Download.id).where(
+                        Download.series_id == current.id,
+                        Download.status.in_([
+                            DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+                        ]),
+                    ).limit(1)
+                )
+            if in_flight is not None:
+                raise MoveError("downloads are in progress; move it once they finish")
+
+            async def move_and_save() -> bool:
+                old_root = Path(current.root_folder.path)
+                old_paths = {chapter.id: chapter.file_path for chapter in current.chapters}
+                moved = await move_series_folder(current, new_root)
+                anchor_extra_folders(current, old_root)
+                current.root_folder = new_root
+                if moved:
+                    renames = list(dict.fromkeys(
+                        (old_paths[chapter.id], chapter.file_path)
+                        for chapter in current.chapters
+                        if old_paths[chapter.id] and old_paths[chapter.id] != chapter.file_path
+                    ))
+                    if await relocate_archive_issues(session, current.id, renames):
+                        await detect_series_issues(session, current)
+                await session.commit()
+                return moved
+
+            return await finish_before_cancel(asyncio.create_task(move_and_save()))
     finally:
         lock.release()
-    return moved
 
 
 @router.put("/editor", response_model=SeriesEditorOut)
@@ -285,10 +344,9 @@ async def edit_series_bulk(body: SeriesEditorIn, session: AsyncSession = Depends
     values = await settings_service.get_all(session) if new_root and body.move_files else {}
     out = SeriesEditorOut(updated=0)
     for series in series_list:
-        _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
-        if new_root is not None and series.root_folder_id != new_root.id:
+        if new_root is not None:
             try:
-                moved = await _change_root_folder(session, series, new_root, body.move_files)
+                moved = await _change_root_folder(session, series, new_root, body)
             except MoveError as exc:
                 out.problems.append(
                     SeriesEditorProblemOut(series_id=series.id, title=series.title, detail=str(exc))
@@ -297,6 +355,8 @@ async def edit_series_bulk(body: SeriesEditorIn, session: AsyncSession = Depends
             if moved:
                 out.moved += 1
                 _notify_kavita(values, series)
+        else:
+            _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
         out.updated += 1
     await session.commit()
     return out
@@ -336,12 +396,67 @@ async def _cancel_direct_downloads(session: AsyncSession, series_ids: list[int])
 @router.post("/editor/delete", response_model=SeriesBulkOut)
 async def delete_series_bulk(body: SeriesBulkIn, session: AsyncSession = Depends(get_session)):
     """Remove many series from the library. Files on disk are kept."""
-    series_list = await _series_in_order(session, body.series_ids)
-    await _cancel_direct_downloads(session, [series.id for series in series_list])
-    for series in series_list:
+    deleted = 0
+    for series_id in dict.fromkeys(body.series_ids):
+        deleted += await _delete_series_locked(session, series_id)
+    return SeriesBulkOut(count=deleted)
+
+
+_deletions: dict[int, asyncio.Task[None]] = {}
+
+
+def _schedule_deletion(series_id: int) -> None:
+    if series_id not in _deletions:
+        task = asyncio.create_task(_delete_when_free(series_id))
+        _deletions[series_id] = task
+        task.add_done_callback(lambda _: _deletions.pop(series_id, None))
+
+
+async def resume_pending_deletions() -> None:
+    async with session_scope() as session:
+        pending = (await session.scalars(select(Series.id).where(Series.deletion_pending))).all()
+    for series_id in pending:
+        _schedule_deletion(series_id)
+
+
+async def _delete_series_locked(session: AsyncSession, series_id: int) -> bool:
+    """Delete one series after in-flight archive writes and imports finish.
+
+    Repairs, downloads, and imports validate the series under its lock and
+    write files before releasing it, so deletion must take the same lock.
+    When the lock is busy, stop the series' downloads now and finish the
+    deletion in the background instead of making the request wait.
+    """
+    series = await session.get(Series, series_id, populate_existing=True)
+    if series is None:
+        return False
+    lock = series_lock(series_id)
+    if lock.locked() or getattr(lock, "_waiters", None):
+        series.deletion_pending = True
+        await _cancel_direct_downloads(session, [series_id])
+        await session.commit()
+        _schedule_deletion(series_id)
+        return True
+    async with lock:
+        series = await session.get(Series, series_id, populate_existing=True)
+        if series is None:
+            return False
+        await _cancel_direct_downloads(session, [series.id])
         await session.delete(series)
-    await session.commit()
-    return SeriesBulkOut(count=len(series_list))
+        await session.commit()
+        return True
+
+
+async def _delete_when_free(series_id: int) -> None:
+    try:
+        async with series_lock(series_id), session_scope() as session:
+            series = await session.get(Series, series_id)
+            if series is not None and series.deletion_pending:
+                await _cancel_direct_downloads(session, [series_id])
+                await session.delete(series)
+                await session.commit()
+    except Exception:
+        log.exception("deleting series %d failed", series_id)
 
 
 @router.get("/{series_id}", response_model=SeriesDetailOut)
@@ -349,13 +464,15 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     result = await session.execute(
         select(Series)
         .options(selectinload(Series.chapters), selectinload(Series.source_links))
-        .where(Series.id == series_id)
+        .where(Series.id == series_id, Series.deletion_pending.is_(False))
     )
     series = result.scalar_one_or_none()
     if series is None:
         raise HTTPException(404, "Series not found")
     out = SeriesDetailOut.model_validate(series)
-    out.english_title = english_title(series.title, split_alt_titles(series.alt_titles))
+    out.english_title = series.title_english or english_title(
+        series.provider_title or series.title, split_alt_titles(series.alt_titles)
+    )
     _apply_counts(out, _count_chapters(series.chapters))
     out.refreshing = series_id in REFRESHING
     out.global_source_order = _content_source_names(await settings_service.get_all(session))
@@ -368,16 +485,140 @@ async def get_series(series_id: int, session: AsyncSession = Depends(get_session
     return out
 
 
+def _retitle(series: Series, title: str) -> bool:
+    if not series.provider_title:
+        series.provider_title = series.title
+    return set_display_title(series, title)
+
+
+def _apply_title_preference(series: Series, preference: str) -> bool:
+    variants = {
+        "english": series.title_english,
+        "romaji": series.title_romaji,
+        "native": series.title_native,
+    }
+    provider_title = series.provider_title or series.title
+    if not any(variants.values()):
+        variants = compute_title_variants(None, provider_title, split_alt_titles(series.alt_titles))
+        series.title_english = variants["english"]
+        series.title_romaji = variants["romaji"]
+        series.title_native = variants["native"]
+    return _retitle(series, pick_title(preference, variants, provider_title))
+
+
+@router.post("/apply-title-preference", response_model=ApplyTitlePreferenceOut)
+async def apply_title_preference(session: AsyncSession = Depends(get_session)):
+    """Apply the preferred title language to all unlocked series."""
+    async with manual_archive_lock:
+        # Serialize with edits and refreshes before reading title locks.
+        await session.execute(text("BEGIN IMMEDIATE"))
+        values = await settings_service.get_all(session)
+        pref = values.get("preferred_title_language", "provider")
+        unlocked = await session.scalars(select(Series).where(
+            Series.title_locked.is_(False), Series.deletion_pending.is_(False),
+        ))
+        retitled = [series.id for series in unlocked if _apply_title_preference(series, pref)]
+        await session.commit()
+    # Series recommendations compare against the title; refresh them per
+    # series in lock order (series lock, then archive lock).
+    ownership = await load_archive_ownership(session) if retitled else None
+    for series_id in retitled:
+        await _refresh_issues_when_free(session, series_id, ownership)
+    return ApplyTitlePreferenceOut(count=len(retitled), updated=len(retitled))
+
+
 @router.put("/{series_id}", response_model=SeriesDetailOut)
 async def update_series(
     series_id: int, body: SeriesUpdateIn, session: AsyncSession = Depends(get_session)
 ):
+    changes_layout = body.root_folder_id is not None or body.folder_name is not None
+    changes_title = body.title is not None or body.title_locked is not None
+    async with AsyncExitStack() as locks:
+        if changes_layout:
+            await locks.enter_async_context(series_lock(series_id))
+        if changes_layout or changes_title:
+            # A repair uses both the library layout and title to validate its
+            # recommendation. Acquire archive locks before SQLite's write lock.
+            await locks.enter_async_context(manual_archive_lock)
+        await _apply_series_edit(series_id, body, session)
+        if changes_layout:
+            await _refresh_issues(session, series_id)
+    if changes_title and not changes_layout:
+        # A title edit must not wait behind a refresh holding the series.
+        await _refresh_issues_when_free(session, series_id)
+    return await get_series(series_id, session)
+
+
+_issue_refreshes: set[asyncio.Task] = set()
+
+
+async def _refresh_issues_when_free(
+    session: AsyncSession, series_id: int, ownership: ArchiveOwnership | None = None,
+) -> None:
+    """Refresh warnings now if the series is idle, else once its holder finishes."""
+    lock = series_lock(series_id)
+    if not (lock.locked() or getattr(lock, "_waiters", None)):
+        async with lock, manual_archive_lock:
+            await _refresh_issues(session, series_id, ownership)
+        return
+
+    async def later() -> None:
+        try:
+            async with series_lock(series_id), manual_archive_lock, session_scope() as background:
+                await _refresh_issues(background, series_id)
+        except Exception:
+            log.exception("refreshing metadata issues for series %d failed", series_id)
+
+    task = asyncio.get_running_loop().create_task(later())
+    _issue_refreshes.add(task)
+    task.add_done_callback(_issue_refreshes.discard)
+
+
+async def _refresh_issues(
+    session: AsyncSession, series_id: int, ownership: ArchiveOwnership | None = None,
+) -> None:
+    """Recompute warnings after a title or layout change, under both locks."""
+    series = await session.get(Series, series_id, populate_existing=True)
+    if series is not None and not series.deletion_pending:
+        await detect_series_issues(session, series, ownership)
+        await session.commit()
+
+
+async def _apply_series_edit(
+    series_id: int, body: SeriesUpdateIn, session: AsyncSession,
+) -> None:
+    new_title = body.title.strip() if body.title is not None else None
+    if new_title == "":
+        raise HTTPException(422, "Title cannot be empty")
+    if new_title is not None or body.title_locked is not None:
+        await session.execute(text("BEGIN IMMEDIATE"))
     result = await session.execute(
-        select(Series).options(selectinload(Series.chapters)).where(Series.id == series_id)
+        select(Series).options(selectinload(Series.chapters)).where(
+            Series.id == series_id, Series.deletion_pending.is_(False),
+        )
     )
     series = result.scalar_one_or_none()
     if series is None:
         raise HTTPException(404, "Series not found")
+    if new_title is not None:
+        _retitle(series, new_title)
+        series.title_locked = True
+    elif body.title_locked is False:
+        series.title_locked = False
+        values = await settings_service.get_all(session)
+        _apply_title_preference(series, values.get("preferred_title_language", "provider"))
+    elif body.title_locked is True:
+        series.title_locked = True
+    if body.search_templates is not None:
+        from ..sources.queries import validate_templates
+
+        try:
+            validate_templates(body.search_templates)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        series.search_templates = body.search_templates.strip()
+    if body.search_title is not None:
+        series.search_title = body.search_title.strip()
     _apply_monitoring(series, body.monitored, body.monitor_mode, body.monitor_from)
     if body.source_priority is not None:
         _check_source_names(body.source_priority, "source_priority")
@@ -408,17 +649,12 @@ async def update_series(
     if body.folder_pinned is not None:
         series.folder_pinned = body.folder_pinned
     await session.commit()
-    return await get_series(series_id, session)
 
 
 @router.delete("/{series_id}", status_code=204)
 async def delete_series(series_id: int, session: AsyncSession = Depends(get_session)):
-    series = await session.get(Series, series_id)
-    if series is None:
+    if not await _delete_series_locked(session, series_id):
         raise HTTPException(404, "Series not found")
-    await _cancel_direct_downloads(session, [series.id])
-    await session.delete(series)
-    await session.commit()
 
 
 @router.post("/{series_id}/refresh", status_code=202)
@@ -457,25 +693,28 @@ async def update_chapter_metadata(
     body: ChapterMetadataIn,
     session: AsyncSession = Depends(get_session),
 ):
-    chapter = await session.get(Chapter, chapter_id)
-    if chapter is None or chapter.series_id != series_id:
-        raise HTTPException(404, "Chapter not found")
-    # only an actual edit becomes "manual" provenance; saving an unchanged
-    # value (e.g. locking a wikipedia title in place) keeps its real source
-    title = body.title.strip()
-    if title != chapter.title:
-        chapter.title = title
-        chapter.title_source = "manual" if title else ""
-    if body.volume != chapter.volume:
-        chapter.volume = body.volume
-        chapter.volume_source = "manual" if body.volume is not None else ""
-    chapter.title_locked = body.title_locked
-    chapter.volume_locked = body.volume_locked
-    if body.excluded is not None:
-        chapter.excluded = body.excluded
-    await session.commit()
-    await session.refresh(chapter)
-    return chapter
+    async with series_lock(series_id), manual_archive_lock:
+        chapter = await session.get(Chapter, chapter_id)
+        if chapter is None or chapter.series_id != series_id:
+            raise HTTPException(404, "Chapter not found")
+        # Only an actual edit changes provenance. Locking an unchanged value
+        # keeps its source.
+        title = body.title.strip()
+        if title != chapter.title:
+            chapter.title = title
+            chapter.title_source = "manual" if title else ""
+        if body.volume != chapter.volume:
+            chapter.volume = body.volume
+            chapter.volume_source = "manual" if body.volume is not None else ""
+        chapter.title_locked = body.title_locked
+        chapter.volume_locked = body.volume_locked
+        if body.excluded is not None:
+            chapter.excluded = body.excluded
+        await session.commit()
+        # Volume and exclusion feed the volume recommendations.
+        await _refresh_issues(session, series_id)
+        await session.refresh(chapter)
+        return chapter
 
 
 @router.get("/{series_id}/groups", response_model=list[SeriesGroupOut])

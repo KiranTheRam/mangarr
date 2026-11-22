@@ -4,8 +4,11 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from functools import partial
+from typing import TypeVar
 
 import httpx
 
@@ -22,6 +25,38 @@ os.umask(_UMASK)
 # reset to this or a reader running as another user (Kavita, Komga) can't open
 # them.
 NEW_FILE_MODE = 0o666 & ~_UMASK
+_Result = TypeVar("_Result")
+
+
+async def finish_before_cancel(work: asyncio.Future[_Result]) -> _Result:
+    """Keep the caller's locks and cleanup active until started work finishes."""
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        while not work.done():
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not work.cancelled():
+            work.exception()
+        raise
+
+
+async def run_file_work(function: Callable[..., _Result], *args, **kwargs) -> _Result:
+    """Wait for a filesystem worker even when its caller is cancelled."""
+    loop = asyncio.get_running_loop()
+    work = loop.run_in_executor(None, partial(function, *args, **kwargs))
+    return await finish_before_cancel(work)
+
+
+def safe_error_reason(error: Exception) -> str:
+    """Describe failures without logging credential-bearing request URLs."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    kind = type(error).__name__
+    return f"{kind} (HTTP {status})" if status else kind
 
 
 class RateLimiter:

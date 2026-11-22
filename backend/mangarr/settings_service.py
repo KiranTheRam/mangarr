@@ -21,6 +21,7 @@ CONTENT_SOURCE_NAMES = (
 
 DEFAULTS: dict[str, str] = {
     # Media management
+    "preferred_title_language": "provider",
     "naming_template": "{series} - Ch. {chapter:04.1f}",
     "naming_template_no_volume": "{series} - Ch. {chapter:04.1f}",
     # Optional lossy optimization of new direct-download pages only.
@@ -38,6 +39,9 @@ DEFAULTS: dict[str, str] = {
     "mangadex_username": "",
     "mangadex_password": "",
     "mangadex_language": "en",
+    "torznab_indexers": "[]",
+    "torrent_query_templates": "{series}",
+    "torrent_monitor_enabled": "false",
     # qBittorrent
     "qbittorrent_url": "http://localhost:8080",
     "qbittorrent_username": "admin",
@@ -128,6 +132,15 @@ def validate(values: dict[str, str]) -> None:
     from .library.naming import chapter_filename
     from .download.images import ImageOptimization
 
+    from .sources.torznab import validate_indexers
+    from .sources.queries import validate_templates
+
+    if "torznab_indexers" in values:
+        validate_indexers(values["torznab_indexers"])
+    if "torrent_query_templates" in values:
+        validate_templates(values["torrent_query_templates"], required=True)
+    if values.get("torrent_monitor_enabled", "false") not in {"true", "false"}:
+        raise ValueError("torrent_monitor_enabled must be true or false")
     ImageOptimization.from_settings(values)
 
     for key in ("naming_template", "naming_template_no_volume"):
@@ -172,6 +185,12 @@ def validate(values: dict[str, str]) -> None:
         if values["finished_series_mode"] not in FINISHED_SERIES_MODES:
             raise ValueError(
                 "finished_series_mode must be one of " + ", ".join(FINISHED_SERIES_MODES)
+            )
+
+    if "preferred_title_language" in values:
+        if values["preferred_title_language"] not in {"provider", "english", "romaji", "native"}:
+            raise ValueError(
+                "preferred_title_language must be one of provider, english, romaji, native"
             )
 
     for key in ("download_proxy_url", *(f"source_{name}_proxy_url" for name in SOURCE_PROXY_NAMES)):

@@ -1,9 +1,12 @@
+import { Icon } from "../components/Icon";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import type {
   Chapter,
+  ComicInfo,
+  LibraryIssue,
   QueueItem,
   Release,
   ScanResult,
@@ -30,6 +33,7 @@ import {
 } from "../components/LibraryTools";
 import { AutomationModal, monitorModeLabel } from "../components/SeriesAutomation";
 import { RelatedTitles } from "../components/RelatedTitles";
+import { SeriesIssues } from "../components/MetadataIssues";
 import { sanitizeDescription } from "../sanitize";
 import { sourceLabel } from "../sources";
 
@@ -49,6 +53,8 @@ function InteractiveSearch({
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
+  const [queryInput, setQueryInput] = useState("");
+  const [manualQuery, setManualQuery] = useState("");
   const params = useMemo(() => {
     const q = new URLSearchParams();
     if (chapterIds && chapterIds.length > 0) {
@@ -57,8 +63,9 @@ function InteractiveSearch({
       q.set("series_id", String(seriesId));
     }
     if (!includeTorrents) q.set("include_torrents", "false");
+    if (manualQuery) q.set("q", manualQuery);
     return q.toString();
-  }, [seriesId, chapterIds, includeTorrents]);
+  }, [seriesId, chapterIds, includeTorrents, manualQuery]);
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["releases", params],
     queryFn: () => api.get<Release[]>(`/search/releases?${params}`),
@@ -112,6 +119,7 @@ function InteractiveSearch({
     }
     return api.post("/queue/grab", {
       series_id: seriesId,
+      source_name: release.source_name,
       magnet: release.magnet,
       title: release.title,
     });
@@ -167,6 +175,12 @@ function InteractiveSearch({
 
   return (
     <Modal title={`Search — ${title}`} onClose={onClose}>
+      {includeTorrents && <form className="form-row" onSubmit={(event) => { event.preventDefault(); setManualQuery(queryInput.trim()); }}>
+        <label htmlFor="torrent-manual-query">Torrent search query</label>
+        <input id="torrent-manual-query" value={queryInput} placeholder="Automatic queries" onChange={(event) => setQueryInput(event.target.value)} />
+        <button className="btn" type="submit">Search</button>
+      </form>}
+      {includeTorrents && <p className="form-hint">Leave blank for automatic torrent queries. Direct source results use the series links.</p>}
       {isLoading ? (
         <Spinner />
       ) : isError ? (
@@ -257,7 +271,7 @@ function InteractiveSearch({
                       }
                       onClick={() => grab.mutate(r)}
                     >
-                      ⇓
+                      <Icon name="download" />
                     </button>
                   </td>
                 </tr>
@@ -500,13 +514,59 @@ function groupByVolume(chapters: Chapter[]): { volume: number | null; chapters: 
     .map(([volume, chs]) => ({ volume, chapters: chs.sort((a, b) => b.number - a.number) }));
 }
 
-function ChapterMetadataModal({
+function archiveFields(info: ComicInfo) {
+  return {
+    series: info.series ?? "",
+    number: info.number ?? "",
+    volume: info.volume ?? "",
+    title: info.title ?? "",
+    page_count: info.page_count ?? "",
+  };
+}
+
+type ArchiveFields = ReturnType<typeof archiveFields>;
+type ComicInfoUpdate = {
+  revision: string;
+  series?: string | null;
+  number?: string | null;
+  title?: string | null;
+  volume?: number | null;
+  page_count?: number | null;
+};
+
+export function comicInfoUpdate(original: ComicInfo, fields: ArchiveFields) {
+  const payload: ComicInfoUpdate = { revision: original.revision };
+  for (const field of ["series", "number", "title"] as const) {
+    const value = fields[field].trim() || null;
+    if (value !== original[field]) payload[field] = value;
+  }
+  for (const field of ["volume", "page_count"] as const) {
+    if (fields[field] === (original[field] ?? "")) continue;
+    const value = fields[field].trim() || null;
+    if (value === original[field]) continue;
+    if (value === null) {
+      payload[field] = null;
+      continue;
+    }
+    const number = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(number) || number < 1) {
+      const label = field === "volume" ? "Volume" : "Page count";
+      return { payload: null, error: `${label} must be a positive whole number.` };
+    }
+    payload[field] = number;
+  }
+  return { payload: Object.keys(payload).length > 1 ? payload : null, error: null };
+}
+
+export function ChapterMetadataModal({
   seriesId,
+  seriesTitle,
   chapter,
   onClose,
   onSaved,
 }: {
   seriesId: number;
+  seriesTitle: string;
   chapter: Chapter;
   onClose: () => void;
   onSaved: () => void;
@@ -516,8 +576,24 @@ function ChapterMetadataModal({
   const [titleLocked, setTitleLocked] = useState(chapter.title_locked);
   const [volumeLocked, setVolumeLocked] = useState(chapter.volume_locked);
   const [excluded, setExcluded] = useState(chapter.excluded);
-  const save = useMutation({
-    mutationFn: () => api.put(`/series/${seriesId}/chapters/${chapter.id}/metadata`, {
+  const [draft, setDraft] = useState<{ original: ComicInfo; fields: ArchiveFields } | null>(null);
+  const queryClient = useQueryClient();
+  const archiveKey = ["comicinfo", seriesId, chapter.id];
+  const chapterPath = `/series/${seriesId}/chapters/${chapter.id}`;
+  const canInspectArchive = Boolean(
+    chapter.downloaded && chapter.file_path && /\.(cbz|zip)$/i.test(chapter.file_path),
+  );
+  const comicInfo = useQuery({
+    queryKey: archiveKey,
+    queryFn: () => api.get<ComicInfo>(`${chapterPath}/comicinfo`),
+    enabled: canInspectArchive,
+    retry: false,
+  });
+  const fields = draft?.fields ?? (comicInfo.data ? archiveFields(comicInfo.data) : null);
+  const archiveUpdate = draft ? comicInfoUpdate(draft.original, draft.fields) : null;
+  const archivePayload = archiveUpdate?.payload ?? null;
+  const saveChapter = useMutation({
+    mutationFn: () => api.put(`${chapterPath}/metadata`, {
       title,
       volume: volume.trim() === "" ? null : Number(volume),
       title_locked: titleLocked,
@@ -526,72 +602,301 @@ function ChapterMetadataModal({
     }),
     onSuccess: () => {
       onSaved();
-      onClose();
+      void queryClient.invalidateQueries({ queryKey: archiveKey });
     },
   });
+  const saveArchive = useMutation({
+    mutationFn: (payload: ComicInfoUpdate) => api.put<ComicInfo>(`${chapterPath}/comicinfo`, payload),
+    onSuccess: (info) => {
+      queryClient.setQueryData(archiveKey, info);
+      setDraft(null);
+      onSaved();
+    },
+  });
+  const saving = saveChapter.isPending || saveArchive.isPending;
+  const close = () => { if (!saving) onClose(); };
+  const changeFile = (field: keyof ArchiveFields) =>
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const value = event.target.value;
+      const info = comicInfo.data;
+      if (!info) return;
+      setDraft((previous) => {
+        const original = previous?.original ?? info;
+        const fields = { ...(previous?.fields ?? archiveFields(original)), [field]: value };
+        return { original, fields };
+      });
+      saveArchive.reset();
+    };
   return (
-    <Modal title={`Edit ${chapterLabel(chapter.number, chapter.volume)}`} onClose={onClose}>
+    <Modal title={`Edit ${chapterLabel(chapter.number, chapter.volume)}`} onClose={close}>
+      <fieldset className="chapter-metadata-fields" disabled={saving} onChange={() => saveChapter.reset()}>
+        <div className="metadata-section-title">Mangarr chapter metadata</div>
+        <div className="form-row">
+          <label>Title</label>
+          <input
+            value={title}
+            onChange={(event) => {
+              setTitle(event.target.value);
+              setTitleLocked(true);
+            }}
+          />
+        </div>
+        <div className="form-row">
+          <label>Volume</label>
+          <input
+            type="number"
+            min="1"
+            value={volume}
+            onChange={(event) => {
+              setVolume(event.target.value);
+              setVolumeLocked(true);
+            }}
+          />
+        </div>
+        <div className={`chapter-exclusion${excluded ? " active" : ""}`}>
+          <label className="chapter-edit-option chapter-exclusion-toggle">
+            <input
+              type="checkbox"
+              checked={excluded}
+              onChange={(event) => setExcluded(event.target.checked)}
+            />
+            <span>
+              <strong>Exclude this chapter</strong>
+              <small>
+                Keep it visible so it can be restored, but skip it when calculating missing
+                chapters and during refreshes, searches, scans, and downloads.
+              </small>
+            </span>
+          </label>
+        </div>
+        <div className="chapter-lock-options" aria-label="Metadata refresh options">
+          <label className="chapter-edit-option">
+            <input
+              type="checkbox"
+              checked={titleLocked}
+              onChange={(event) => setTitleLocked(event.target.checked)}
+            />
+            <span>Keep this title during future refreshes</span>
+          </label>
+          <label className="chapter-edit-option">
+            <input
+              type="checkbox"
+              checked={volumeLocked}
+              onChange={(event) => setVolumeLocked(event.target.checked)}
+            />
+            <span>Keep this volume during future refreshes/resyncs</span>
+          </label>
+        </div>
+      </fieldset>
+      <ErrorNotice error={saveChapter.error} />
+      <div className="modal-actions chapter-edit-actions">
+        {saveChapter.isSuccess && <span role="status">Mangarr metadata saved</span>}
+        <button className="btn primary" disabled={saving || (volume !== "" && Number(volume) < 1)} onClick={() => saveChapter.mutate()}>
+          {saveChapter.isPending ? "Saving…" : "Save Mangarr metadata"}
+        </button>
+      </div>
+      {canInspectArchive && comicInfo.isLoading && (
+        <p className="form-hint">Reading ComicInfo.xml from the chapter archive…</p>
+      )}
+      {comicInfo.data && fields && (
+        <fieldset className="comicinfo-editor chapter-metadata-fields" disabled={saving || comicInfo.isError}>
+          <div className="metadata-section-title">
+            ComicInfo.xml inside the file
+            <span className={`pill ${comicInfo.data.exists ? "blue" : "gray"}`}>
+              {comicInfo.data.exists ? "Present" : "Not present"}
+            </span>
+          </div>
+          <p className="form-hint">
+            These embedded fields control how Kavita and other comic readers group and label
+            the archive. Leave a field blank to remove it.
+          </p>
+          <div className="comicinfo-fields">
+            <div className="form-row"><label>Series</label><input value={fields.series} placeholder={seriesTitle} onChange={changeFile("series")} /></div>
+            <div className="form-row"><label>Number</label><input value={fields.number} placeholder={String(chapter.number)} onChange={changeFile("number")} /></div>
+            <div className="form-row"><label>Volume</label><input inputMode="numeric" value={fields.volume} onChange={changeFile("volume")} /></div>
+            <div className="form-row"><label>Title</label><input value={fields.title} onChange={changeFile("title")} /></div>
+            <div className="form-row">
+              <label>Page count</label>
+              <input inputMode="numeric" value={fields.page_count} onChange={changeFile("page_count")} />
+              <small>{comicInfo.data.actual_page_count} image pages in archive</small>
+            </div>
+          </div>
+          <div className="filepath" title={comicInfo.data.file_path}>{comicInfo.data.file_path}</div>
+          {archiveUpdate?.error && <p className="form-hint" role="alert">{archiveUpdate.error}</p>}
+          <ErrorNotice error={saveArchive.error} />
+          <div className="modal-actions chapter-edit-actions">
+            {saveArchive.isSuccess && <span role="status">ComicInfo saved</span>}
+            <button
+              className="btn primary"
+              disabled={!archivePayload}
+              onClick={() => { if (archivePayload) saveArchive.mutate(archivePayload); }}
+            >
+              {saveArchive.isPending ? "Saving…" : "Save ComicInfo"}
+            </button>
+          </div>
+        </fieldset>
+      )}
+      {comicInfo.error && (
+        <p className="form-hint">ComicInfo editor unavailable. {comicInfo.error.message}</p>
+      )}
+      <div className="modal-actions">
+        <button className="btn" disabled={saving} onClick={close}>Close</button>
+      </div>
+    </Modal>
+  );
+}
+
+function TitleEditorModal({
+  series,
+  onClose,
+  onSave,
+}: {
+  series: SeriesDetailType;
+  onClose: () => void;
+  onSave: (updates: { title?: string; title_locked?: boolean }) => Promise<void>;
+}) {
+  const [customTitle, setCustomTitle] = useState(series.title);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const rawKnown = [
+    { label: "Provider title", title: series.provider_title },
+    { label: "English", title: series.title_english },
+    { label: "Romaji", title: series.title_romaji },
+    { label: "Native", title: series.title_native },
+    ...(series.alt_titles || "")
+      .split("\n")
+      .map((t: string) => t.trim())
+      .filter(Boolean)
+      .map((t: string) => ({ label: "Alternate", title: t })),
+  ].filter((item) => item.title && item.title.trim());
+
+  const seen = new Set<string>();
+  const knownTitles: { label: string; title: string }[] = [];
+  for (const item of rawKnown) {
+    const key = item.title.trim().toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      knownTitles.push(item);
+    }
+  }
+
+  async function handleSave() {
+    const trimmed = customTitle.trim();
+    if (!trimmed) {
+      setError("Title cannot be empty");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ title: trimmed });
+      onClose();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleUnlock() {
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ title_locked: false });
+      onClose();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal title="Edit Series Title" onClose={onClose}>
+      {error && <div className="error-banner">{error}</div>}
+
+      {series.title_locked && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: "8px 12px",
+            background: "var(--bg-subtle)",
+            borderRadius: 6,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+          }}
+        >
+          <span>
+            <strong>Title locked</strong> — overrides metadata refresh and global preference.
+          </span>
+          <button
+            type="button"
+            className="btn sm"
+            disabled={saving}
+            onClick={handleUnlock}
+          >
+            Unlock (use preference)
+          </button>
+        </div>
+      )}
+
       <div className="form-row">
         <label>Title</label>
         <input
-          value={title}
-          onChange={(event) => {
-            setTitle(event.target.value);
-            setTitleLocked(true);
-          }}
+          type="text"
+          value={customTitle}
+          onChange={(event) => setCustomTitle(event.target.value)}
+          placeholder="Series title"
         />
       </div>
-      <div className="form-row">
-        <label>Volume</label>
-        <input
-          type="number"
-          min="1"
-          value={volume}
-          onChange={(event) => {
-            setVolume(event.target.value);
-            setVolumeLocked(true);
-          }}
-        />
-      </div>
-      <div className={`chapter-exclusion${excluded ? " active" : ""}`}>
-        <label className="chapter-edit-option chapter-exclusion-toggle">
-          <input
-            type="checkbox"
-            checked={excluded}
-            onChange={(event) => setExcluded(event.target.checked)}
-          />
-          <span>
-            <strong>Exclude this chapter</strong>
-            <small>
-              Keep it visible so it can be restored, but skip it when calculating missing
-              chapters and during refreshes, searches, scans, and downloads.
-            </small>
-          </span>
-        </label>
-      </div>
-      <div className="chapter-lock-options" aria-label="Metadata refresh options">
-        <label className="chapter-edit-option">
-          <input
-            type="checkbox"
-            checked={titleLocked}
-            onChange={(event) => setTitleLocked(event.target.checked)}
-          />
-          <span>Keep this title during future refreshes</span>
-        </label>
-        <label className="chapter-edit-option">
-          <input
-            type="checkbox"
-            checked={volumeLocked}
-            onChange={(event) => setVolumeLocked(event.target.checked)}
-          />
-          <span>Keep this volume during future refreshes/resyncs</span>
-        </label>
-      </div>
-      {save.isError && <div className="error-banner">{(save.error as Error).message}</div>}
-      <div className="modal-actions chapter-edit-actions">
-        <button className="btn" onClick={onClose}>Cancel</button>
-        <button className="btn primary" disabled={save.isPending || (volume !== "" && Number(volume) < 1)} onClick={() => save.mutate()}>
-          {save.isPending ? "Saving…" : "Save"}
+
+      {knownTitles.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <label style={{ fontSize: 13, fontWeight: 600, color: "var(--text-dim)" }}>
+            Known titles:
+          </label>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8, maxHeight: 180, overflowY: "auto" }}>
+            {knownTitles.map((item, idx) => (
+              <button
+                key={idx}
+                type="button"
+                className="btn sm"
+                style={{
+                  textAlign: "left",
+                  justifyContent: "flex-start",
+                  display: "flex",
+                  gap: 8,
+                  padding: "6px 10px",
+                  borderColor: customTitle.trim() === item.title ? "var(--primary)" : undefined,
+                }}
+                onClick={() => setCustomTitle(item.title)}
+              >
+                <span className="tag" style={{ fontSize: 11, padding: "1px 6px" }}>
+                  {item.label}
+                </span>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {item.title}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="modal-actions" style={{ marginTop: 20 }}>
+        <button type="button" className="btn" onClick={onClose} disabled={saving}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="btn primary"
+          onClick={handleSave}
+          disabled={saving || !customTitle.trim()}
+        >
+          {saving ? "Saving…" : "Save (lock title)"}
         </button>
       </div>
     </Modal>
@@ -617,6 +922,7 @@ export default function SeriesDetail() {
   const [descExpanded, setDescExpanded] = useState(false);
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const toggleReveal = (k: string) => setRevealed((r) => ({ ...r, [k]: !r[k] }));
+  const [editingTitle, setEditingTitle] = useState(false);
   const [showRename, setShowRename] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [showSources, setShowSources] = useState(false);
@@ -648,9 +954,18 @@ export default function SeriesDetail() {
     refetchInterval: 2000,
   });
 
+  const { data: seriesIssues = [] } = useQuery({
+    queryKey: ["series-issues", seriesId],
+    queryFn: () => api.get<LibraryIssue[]>(`/issues?ignored=false&series_id=${seriesId}`),
+    enabled: Number.isFinite(seriesId),
+    refetchInterval: 30000,
+  });
+
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ["series", seriesId] });
     queryClient.invalidateQueries({ queryKey: ["series"] });
+    queryClient.invalidateQueries({ queryKey: ["series-issues", seriesId] });
+    queryClient.invalidateQueries({ queryKey: ["issues"] });
   };
 
   const toggleMonitor = useMutation({
@@ -905,7 +1220,7 @@ export default function SeriesDetail() {
                   toggleChapter.mutate({ chapterIds: [ch.id], monitored: !ch.monitored })
                 }
               >
-                {ch.monitored ? "🔖" : "◻"}
+                {ch.monitored ? <Icon name="bookmark" /> : <Icon name="bookmark-off" />}
               </button>
             </td>
             <td className="cell-chapter">
@@ -960,7 +1275,7 @@ export default function SeriesDetail() {
                 title={`Edit title, volume, and exclusion${ch.volume_source ? ` (volume source: ${ch.volume_source})` : ""}`}
                 onClick={() => setEditingChapter(ch)}
               >
-                ✏️
+                <Icon name="rename" />
               </button>
               <button
                 className="btn icon-btn"
@@ -974,7 +1289,7 @@ export default function SeriesDetail() {
                   })
                 }
               >
-                🔍
+                <Icon name="search" />
               </button>
             </td>
           </tr>
@@ -992,7 +1307,7 @@ export default function SeriesDetail() {
           onClick={() => refresh.mutate()}
           disabled={refresh.isPending}
         >
-          {refresh.isPending ? "Refreshing…" : "⟳ Refresh"}
+          {refresh.isPending ? "Refreshing…" : <><Icon name="refresh" /> Refresh</>}
         </button>
         <button
           className="btn"
@@ -1000,28 +1315,28 @@ export default function SeriesDetail() {
           onClick={() => scan.mutate()}
           disabled={scan.isPending}
         >
-          {scan.isPending ? "Scanning…" : "🗂 Scan Disk"}
+          {scan.isPending ? "Scanning…" : <><Icon name="scan" /> Scan Disk</>}
         </button>
         <button
           className="btn"
           title="Browse detected files and manually map unmatched files"
           onClick={() => setShowFiles(true)}
         >
-          📄 Files
+          <Icon name="files" /> Files
         </button>
         <button
           className="btn"
           title="Preview and apply the configured file naming pattern"
           onClick={() => setShowRename(true)}
         >
-          ✏️ Rename
+          <Icon name="rename" /> Rename
         </button>
         <button
           className="btn"
           title="Find duplicate or orphaned files that can be cleaned up"
           onClick={() => setShowCleanup(true)}
         >
-          🧹 Clean up
+          <Icon name="cleanup" /> Clean up
         </button>
         <button
           className="btn"
@@ -1041,21 +1356,21 @@ export default function SeriesDetail() {
             })
           }
         >
-          🔍 Search Missing
+          <Icon name="search-missing" /> Search Missing
         </button>
         <button
           className="btn"
           title="Search direct sources and torrent indexers for this series, including whole-volume packs"
           onClick={() => setSearch({ title: `${series.title} (all releases)` })}
         >
-          🔍 Search Releases
+          <Icon name="search" /> Search Releases
         </button>
         <button
           className="btn"
           title="Monitoring mode, source order, scanlation groups, upgrades, and volume merging"
           onClick={() => setShowAutomation(true)}
         >
-          ⚙ Automation
+          <Icon name="settings" /> Automation
         </button>
         <button
           className="btn"
@@ -1063,7 +1378,7 @@ export default function SeriesDetail() {
           onClick={() => toggleMonitor.mutate()}
           disabled={toggleMonitor.isPending}
         >
-          {series.monitored ? "🔖 Monitored" : "◻ Unmonitored"}
+          {series.monitored ? <><Icon name="bookmark" /> Monitored</> : <><Icon name="bookmark-off" /> Unmonitored</>}
         </button>
         <button
           className="btn danger"
@@ -1074,7 +1389,7 @@ export default function SeriesDetail() {
               deleteSeries.mutate();
           }}
         >
-          ✕
+          <Icon name="close" />
         </button>
       </Toolbar>
       <div className="content">
@@ -1150,6 +1465,24 @@ export default function SeriesDetail() {
               <h2>
                 {series.title}{" "}
                 {series.year && <span style={{ color: "var(--text-dim)" }}>({series.year})</span>}
+                {series.title_locked && (
+                  <span
+                    className="pill gray"
+                    style={{ marginLeft: 8, fontSize: 12, verticalAlign: "middle" }}
+                    title="Title is locked"
+                  >
+                    Locked
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="btn sm"
+                  style={{ marginLeft: 8, verticalAlign: "middle" }}
+                  onClick={() => setEditingTitle(true)}
+                  title="Edit title"
+                >
+                  Edit title
+                </button>
               </h2>
               {series.english_title && series.english_title !== series.title && (
                 <div className="alt-title-line series-alt-title">
@@ -1207,7 +1540,7 @@ export default function SeriesDetail() {
             <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               {series.source_links.map((sl) => (
                 <span className="tag" key={sl.id} title={sl.external_title}>
-                  🔗 {sl.source_name}
+                  <Icon name="link" /> {sl.source_name}
                 </span>
               ))}
               <button className="btn sm" onClick={() => setShowSources(true)}>
@@ -1219,6 +1552,8 @@ export default function SeriesDetail() {
         </div>
 
         <RelatedTitles seriesId={seriesId} />
+
+        <SeriesIssues issues={seriesIssues} onChanged={invalidate} />
 
         {series.chapters.length > 0 && (
           <div className="chapter-selection">
@@ -1243,7 +1578,7 @@ export default function SeriesDetail() {
                   disabled={toggleChapter.isPending}
                   onClick={() => toggleChapter.mutate({ chapterIds: selectedIds, monitored: true })}
                 >
-                  🔖 Monitor
+                  <Icon name="bookmark" /> Monitor
                 </button>
                 <button
                   className="btn sm"
@@ -1251,10 +1586,10 @@ export default function SeriesDetail() {
                   disabled={toggleChapter.isPending}
                   onClick={() => toggleChapter.mutate({ chapterIds: selectedIds, monitored: false })}
                 >
-                  ◻ Unmonitor
+                  <Icon name="bookmark-off" /> Unmonitor
                 </button>
                 <button className="btn primary sm" onClick={searchSelected}>
-                  🔍 Search {selectedIds.length} selected
+                  <Icon name="search-missing" /> Search {selectedIds.length} selected
                 </button>
               </>
             )}
@@ -1275,7 +1610,7 @@ export default function SeriesDetail() {
               title={allCollapsed ? "Expand every volume section" : "Collapse every volume section"}
               onClick={() => setAllCollapsed(!allCollapsed)}
             >
-              {allCollapsed ? "▸ Expand all" : "▾ Collapse all"}
+              {allCollapsed ? <><Icon name="chevron-right" /> Expand all</> : <><Icon name="chevron-down" /> Collapse all</>}
             </button>
           </div>
           {groups.map(({ volume, chapters }) => {
@@ -1296,7 +1631,7 @@ export default function SeriesDetail() {
                   className="volume-header"
                   onClick={() => setCollapsed({ ...collapsed, [key]: !isCollapsed })}
                 >
-                  <span className="chevron">{isCollapsed ? "▸" : "▾"}</span>
+                  <span className="chevron">{isCollapsed ? <Icon name="chevron-right" /> : <Icon name="chevron-down" />}</span>
                   <button
                     className={`monitor-toggle${allMonitored ? " on" : ""}`}
                     title={included.length === 0 ? "Every chapter in this volume is excluded" : allMonitored ? "Unmonitor this volume" : "Monitor this volume"}
@@ -1309,7 +1644,7 @@ export default function SeriesDetail() {
                       });
                     }}
                   >
-                    {allMonitored ? "🔖" : "◻"}
+                    {allMonitored ? <Icon name="bookmark" /> : <Icon name="bookmark-off" />}
                   </button>
                   {archiveFile ? (
                     <h4
@@ -1351,9 +1686,20 @@ export default function SeriesDetail() {
           onClose={() => setSearch(null)}
         />
       )}
+      {editingTitle && (
+        <TitleEditorModal
+          series={series}
+          onClose={() => setEditingTitle(false)}
+          onSave={async (updates) => {
+            await api.put(`/series/${seriesId}`, updates);
+            invalidate();
+          }}
+        />
+      )}
       {editingChapter && (
         <ChapterMetadataModal
           seriesId={seriesId}
+          seriesTitle={series.title}
           chapter={editingChapter}
           onClose={() => setEditingChapter(null)}
           onSaved={invalidate}

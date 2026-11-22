@@ -47,6 +47,8 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 # existing tables, so they're added here (SQLite ALTER TABLE ADD COLUMN)
 _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     # (table, column, type, unique index name or None)
+    ("series", "search_title", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "search_templates", "TEXT NOT NULL DEFAULT ''", None),
     ("series", "mangaupdates_id", "BIGINT", "ux_series_mangaupdates_id"),
     ("series", "folder_pinned", "BOOLEAN NOT NULL DEFAULT 0", None),
     ("series", "metadata_refreshed_at", "DATETIME", None),
@@ -70,10 +72,20 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
     ("series", "last_monitored_at", "DATETIME", None),
     ("chapters", "file_source", "VARCHAR NOT NULL DEFAULT ''", None),
     ("chapters", "file_group", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("chapters", "pdf_mapping", "VARCHAR NOT NULL DEFAULT ''", None),
     ("downloads", "release_group", "VARCHAR NOT NULL DEFAULT ''", None),
     ("series_folders", "volume_offset", "INTEGER", None),
     # existing failures keep their 7-day block (they were never classified)
     ("downloads", "transient_error", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("downloads", "direct_install", "JSON", None),
+    ("series", "provider_title", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_english", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_romaji", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_native", "VARCHAR NOT NULL DEFAULT ''", None),
+    ("series", "title_locked", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("series", "deletion_pending", "BOOLEAN NOT NULL DEFAULT 0", None),
+    ("library_issues", "public_id", "VARCHAR NOT NULL DEFAULT ''", "ux_library_issues_public_id"),
+    ("library_issues", "revision", "VARCHAR NOT NULL DEFAULT ''", None),
 ]
 
 # Chapters mangarr downloaded before file provenance was tracked: the latest
@@ -87,6 +99,13 @@ UPDATE chapters SET file_source = COALESCE((
     ORDER BY h.id DESC LIMIT 1
 ), '')
 WHERE downloaded = 1 AND file_path != ''
+"""
+
+# Existing series titles all originated from the metadata provider. Runs once
+# when provider_title is first added.
+_BACKFILL_PROVIDER_TITLE = """
+UPDATE series SET provider_title = title
+WHERE provider_title = ''
 """
 
 
@@ -104,6 +123,13 @@ async def init_db() -> None:
                 )
                 if (table, column) == ("chapters", "file_source"):
                     await conn.exec_driver_sql(_BACKFILL_FILE_SOURCE)
+                if (table, column) == ("series", "provider_title"):
+                    await conn.exec_driver_sql(_BACKFILL_PROVIDER_TITLE)
+            if (table, column) == ("library_issues", "public_id"):
+                await conn.exec_driver_sql(
+                    "UPDATE library_issues SET public_id = lower(hex(randomblob(16))) "
+                    "WHERE public_id = ''"
+                )
             if index:
                 await conn.exec_driver_sql(
                     f"CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table} ({column})"

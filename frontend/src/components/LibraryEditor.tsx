@@ -1,3 +1,4 @@
+import { Icon } from "./Icon";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
@@ -226,7 +227,7 @@ export function LibraryEditorBar({
       )}
       <div className="editor-bar-actions">
         <button className="btn" disabled={none} onClick={() => setDialog("edit")}>
-          ✎ Edit
+          <Icon name="rename" /> Edit
         </button>
         <button
           className="btn"
@@ -234,7 +235,7 @@ export function LibraryEditorBar({
           title="Refresh metadata and chapter lists"
           onClick={() => refresh.mutate(false)}
         >
-          ↻ Refresh
+          <Icon name="refresh" /> Refresh
         </button>
         <button
           className="btn"
@@ -242,10 +243,10 @@ export function LibraryEditorBar({
           title="Refresh, then queue every missing chapter the series' monitoring wants (unmonitored series grab nothing)"
           onClick={() => refresh.mutate(true)}
         >
-          <span>🔍 Search<span className="wide-only"> missing</span></span>
+          <span><Icon name="search" /> Search<span className="wide-only"> missing</span></span>
         </button>
         <button className="btn danger" disabled={none} onClick={() => setDialog("delete")}>
-          ✕ Remove
+          <Icon name="close" /> Remove
         </button>
         {/* phones leave it out for room; the highlighted Select button exits too */}
         <button className="btn primary editor-bar-done" onClick={onDone}>

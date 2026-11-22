@@ -94,8 +94,13 @@ docker compose up -d
 The default Compose file runs the published `kirantheram/mangarr:latest`
 Docker Hub image and stores configuration and media under `./data`. Open
 <http://localhost:6996> after it starts.
+Follow the setup screen to create a browser login.
 The image's healthcheck polls `GET /ping` (no API key needed), so
 `docker ps` shows the container as `healthy` once Mangarr is serving.
+
+The Dockerfile pins the Node and Python base images by digest so rebuilds use
+the same base images. To update one, run
+`docker buildx imagetools inspect <image:tag>` and replace its digest.
 
 First-run checklist, in the mangarr UI:
 
@@ -212,6 +217,10 @@ it won't re-download what's on disk.
 Matching is filename-based and handles the usual variety: `Series - Ch. 12.cbz`,
 `Series ch. 12`, `Volume 03.cbr`, `Series v03 (2019).cbz`, whole-volume archives
 (which mark every chapter in that volume), and folders of loose images.
+Library Import and Scan Disk also recognize existing PDFs. Use chapter or
+volume names such as `Series - Ch. 12.pdf`, `Series Ch. 12-15.pdf`, or
+`Series Vol. 03.pdf`. Mangarr keeps the original PDFs in place and marks
+matched chapters as owned. Use **Files** to map any unmatched PDFs by hand.
 
 ## Local development
 
@@ -220,7 +229,7 @@ Backend (Python ≥3.11):
 ```bash
 cd backend
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/uvicorn mangarr.main:app --port 6996 --reload
+MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true .venv/bin/uvicorn mangarr.main:app --port 6996 --reload
 ```
 
 Frontend (Node 20.19+ or 22.12+, as required by Vite 8):
@@ -231,6 +240,10 @@ npm install
 npm run dev        # Vite dev server on :5173, proxies API to :6996
 ```
 
+Dependabot opens weekly update PRs for backend dependencies, frontend
+dependencies, Docker base images, and GitHub Actions. Each update goes
+through review and CI before merging.
+
 Tests:
 
 ```bash
@@ -239,6 +252,57 @@ cd backend && .venv/bin/python -m pytest
 
 `npm run build` writes the production bundle to `backend/static/`, which the
 FastAPI app serves when present.
+
+## Backend dependency lock
+
+`backend/requirements.txt` is the pinned dependency lock file for the backend, which also pins the build backend.
+The Docker image verifies hashes from this lock file and from
+`backend/requirements-pip.txt`, which pins the installer. Local development
+installs (`pip install -e '.[dev]'`) and CI resolve dependencies from the
+ranges in `pyproject.toml`.
+
+To refresh the lock file after changing `pyproject.toml` dependencies, run:
+
+```bash
+scripts/lock-backend.sh
+```
+
+This runs `pip-compile` inside the runtime Python container (requires Docker, or
+`CONTAINER=podman`). Commit the resulting `backend/requirements.txt` with your
+changes.
+
+## App versions
+
+Docker Hub builds from `main` automatically increment the patch version for each
+main-branch commit after the latest explicit version change. A merged PR counts
+once when merged with a merge commit or squash merge; a rebase merge counts each
+commit added to `main`. The version is calculated from Git history, so rerunning
+the same build keeps the same version and needs no bot commits or write token.
+The image's app/API version uses this calculated version. Existing `v*` tag
+builds continue to use the tag as their version.
+
+To choose a version manually, run this from the repository root:
+
+```bash
+python3 scripts/version.py set 1.2.0
+```
+
+Commit the resulting `backend/VERSION`, `frontend/package.json`, and
+`frontend/package-lock.json` changes and merge them into `main`. That merge builds
+as exactly `1.2.0`; subsequent main commits build as `1.2.1`, `1.2.2`, and so on.
+Choose a version higher than the latest published version to keep versions
+increasing. `backend/VERSION` is the release baseline; local installs use that
+baseline unless a build supplies `MANGARR_BUILD_VERSION`. The frontend package
+versions track the manually selected baseline.
+
+Run `python3 scripts/version.py check` to confirm that `backend/VERSION`,
+`frontend/package.json`, and `frontend/package-lock.json` agree. The backend
+tests run this check to ensure the working tree stays consistent.
+
+Run `python3 scripts/version.py show` to inspect the version for `HEAD`, or add
+`--revision <commit>` to inspect another commit. This requires a full Git clone;
+CI checks out the complete history. Avoid rewriting `main` history, since the
+commit count determines the patch increment.
 
 ## Configuration
 
@@ -252,8 +316,9 @@ Environment variables (all optional):
 | `MANGARR_SQLITE_WAL` | `true`        | Use SQLite WAL mode (see below)                   |
 | `MANGARR_LOG_LEVEL`  | `INFO`        | Log level (uppercase: `DEBUG`, `INFO`, `WARNING`) |
 | `MANGARR_API_KEY`    | *(generated)* | Fixed web UI API key instead of a generated one   |
-| `MANGARR_AUTH_USERNAME` | *(empty)* | Optional browser HTTP Basic login username |
+| `MANGARR_AUTH_USERNAME` | *(empty)* | Deployment-managed browser login username |
 | `MANGARR_AUTH_PASSWORD` | *(empty)* | Browser login password; set together with username |
+| `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER` | `false` | Allow browser access without built-in login on an explicitly trusted deployment |
 | `MANGARR_ALLOWED_HOSTS` | `[]` | Additional exact DNS names as a JSON array (no scheme, port or wildcard) |
 
 `MANGARR_HOST` and `MANGARR_PORT` apply when Mangarr is started with
@@ -280,15 +345,60 @@ revoked independently.
 
 ### Browser access and upgrading
 
-Browser login is opt-in to preserve existing installations: set both
-`MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD`, then restart. The browser
-prompts for credentials before serving the UI or `/initialize.json`. Partial
-configuration fails startup instead of silently disabling login. To recover
-access, change or remove both values in your environment and restart. Use HTTPS
-on a trusted reverse proxy when credentials travel across the network; Basic
-authentication itself does not encrypt them. There is no automatic local-address
-bypass. With login disabled, anyone who can reach the app using an allowed Host
-can still obtain full API access; startup logs warn about this mode.
+If Mangarr has no browser login, the first visit after installing or upgrading
+opens a setup screen. Choose a username and password to create the login and
+start using Mangarr immediately.
+Complete this step on a trusted local network before exposing Mangarr through
+a public reverse proxy or port forward. The first person who submits the form
+creates the login. The library UI and browser API key stay behind the login
+boundary during setup. Existing API-key integrations continue to work.
+
+Use **Settings → Browser Security** to sign out or change an app-managed
+password. A password change requires the current password and signs out all
+browser sessions. API keys continue to work. Browser sessions expire after
+seven days. After upgrading from an older release, sign in again to create a
+session scoped to the instance's address and port.
+
+Mangarr stores the password hash in `browser_login.json` in the data directory.
+If you forget the password, run the local reset command from an interactive
+terminal. With Docker Compose, run this while the container is running:
+
+```bash
+docker compose exec mangarr mangarr-entrypoint python -m mangarr.reset_password
+```
+
+On Unraid, open the Mangarr container console and run
+`mangarr-entrypoint python -m mangarr.reset_password`.
+
+For a direct Python install, run `python -m mangarr.reset_password` as the
+service user with the same working directory, Python environment and
+`MANGARR_DATA_DIR` as the server. Enter and confirm your new password at the
+hidden prompts. The reset keeps your username, signs out all browser sessions,
+and leaves API keys available throughout. Mangarr applies the change immediately.
+The sign-in screen includes recovery instructions, and the reset command shows
+your username before prompting.
+
+After five failed sign-ins from the same client
+in a one-minute window, the next attempt in that window returns HTTP 429 with
+a `Retry-After` header. A successful sign-in clears the client's count. The
+limit is per server process and groups IPv6 clients by their /64 prefix.
+Clients behind a reverse proxy share its limit by default. To use the original
+client addresses, set `FORWARDED_ALLOW_IPS` to the addresses of trusted proxies
+that sanitize forwarding headers. If you launch Uvicorn directly, configure
+`--forwarded-allow-ips` explicitly (`''` to trust no proxies).
+
+When both `MANGARR_AUTH_USERNAME` and `MANGARR_AUTH_PASSWORD` are set, use
+those credentials on the Mangarr sign-in page. They take precedence over an
+app-managed login. Update the deployment credentials and restart Mangarr to
+reset this login and sign out existing sessions. Setting only one fails startup.
+Scripts can use the `/api/v1` endpoints with `X-Api-Key`.
+Use HTTPS on a trusted reverse proxy when credentials travel across the network.
+
+Custom deployments can explicitly set `MANGARR_ALLOW_UNAUTHENTICATED_BROWSER=true`
+before creating a login and with both credential variables unset, for example when an authenticated reverse proxy
+is the only route to Mangarr. In this mode any client with direct access to
+Mangarr can obtain full API access. If an existing instance was accessible to
+untrusted clients before upgrading, rotate its bootstrap and named API keys.
 
 Host validation is always enabled, including for API clients. IP addresses
 (IPv4 or bracketed IPv6) and `localhost` work by default. **Before upgrading**,
@@ -297,13 +407,14 @@ add every DNS name used by browsers, reverse proxies and integration clients to
 Names match exactly, ignoring case, without a trailing dot; paths, schemes,
 ports and wildcards are not allowed in the list. An unknown Host gets HTTP 400
 with configuration instructions; direct IP access remains available for recovery.
-Proxies must preserve an allowed Host or set it explicitly. Forwarded headers
-never establish trust. Host validation limits DNS rebinding; it is not login.
+Reverse proxies must preserve the browser's Host header for browser traffic.
+For API-key clients, proxies can preserve an allowed Host or set it explicitly.
+Forwarded headers never establish trust. Host validation limits DNS rebinding.
 
-Existing named API keys and `X-Api-Key` clients continue to work without browser
-credentials. Browser credentials alone do not authenticate API calls; API keys
-alone do not unlock browser bootstrap when login is enabled. `/ping` remains
-public and contains no secrets. Bootstrap responses use `Cache-Control: no-store`.
+Existing named API keys and `X-Api-Key` clients continue to work independently
+of browser sessions. When Mangarr manages the login, the browser uses a
+session cookie for UI and API requests. API keys alone do not unlock browser
+bootstrap when login is enabled. `/ping` remains public and contains no secrets.
 
 Saved integration secrets are bound to the exact saved URL (including scheme,
 port and path), and qBittorrent passwords also to the username. After changing
@@ -424,3 +535,62 @@ legitimate.
   source/metadata plugin interfaces are already in place.
 - Discord notifications, and notifications on grab (a webhook on import
   already exists — see Features).
+
+## Torznab, Prowlarr, and Jackett (optional)
+
+In **Settings → Torznab indexers**, add one or more indexers with a name,
+Torznab API URL, API key, and comma-separated category IDs. Copy the API URL
+from Prowlarr or Jackett (for example `http://prowlarr:9696/1/api` or
+`http://jackett:9117/api/v2.0/indexers/my-indexer/results/torznab/api`). Use the
+base API URL without query parameters; Mangarr supplies the key and query.
+An aggregate Torznab endpoint can also be used when supported by your server.
+The default category is comics (`7030`); choose the category IDs your indexer
+uses for manga/books. Search type defaults to `search`; select `book` only
+when the indexer supports it. API keys are masked after saving. Changing a
+saved API URL requires re-entering its key.
+
+Enable and configure qBittorrent to include torrent releases in **Search
+Releases**. Nyaa and direct sources keep their existing controls. Results show
+the configured feed/tracker, size, seeders, and leechers. Both magnets and
+HTTP(S) torrent-file links work, including redirects to magnets. Torrent files
+need a v1 btih identity: v1 and hybrid torrents are supported; v2-only metadata
+is rejected before submission to qBittorrent. Completed
+torrents use the existing chapter/volume importer, preserving the actual
+source in Activity, history, and file provenance. Mount qBittorrent's completed
+paths into Mangarr and configure the shared downloads directory. Hardlinks
+keep seeding without duplicating data when downloads and library share a
+filesystem; copy mode handles separate filesystems.
+
+**Default torrent query templates** in Settings accept one variant per line
+(up to 10 templates and 20 rendered queries per search). The default,
+`{series}`, searches the title and known alternative titles. In a series'
+**Automation → Torrent search options**, override the title or templates,
+for example:
+
+```text
+{series} c{chapter:03d}
+{series} v{volume:02d}
+{series} {year}
+```
+
+Tokens are `{series}`, `{chapter}`, `{volume}`, and `{year}` (the series year).
+Chapter padding preserves decimals: chapter 12.5 becomes `c012.5`. Volume
+queries need a chapter-to-volume map. Chapter-scoped searches render those
+chapters; series-wide searches render the known, non-excluded chapters.
+If a numeric template has no applicable metadata, a title search is used.
+Blank per-series fields restore the defaults. The release dialog also accepts
+a manual torrent query; clear it to return to automatic variants. These query
+settings do not change direct-source discovery.
+
+Add-time **Search now** uses enabled indexers and Mangarr's existing coverage
+selector: matching series title, maximum size, minimum seeders, then chapter
+and volume coverage from torrent metadata (or a parseable release title when
+metadata is unavailable). Volume-only releases need a chapter-to-volume map;
+unknown coverage is never assumed to mean the entire series.
+
+**Scheduled torrent fallback** is off by default. Enable it in Settings to
+also search enabled torrent indexers after direct sources during scheduled
+monitoring and monitored Search Missing passes. It respects monitored and
+excluded chapters, requires at least one seeder, skips series with active
+downloads or unavailable library roots, and applies the normal failure
+cooldown to failed torrent releases. Explicit manual grabs remain available.

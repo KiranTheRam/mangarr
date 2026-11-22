@@ -1,6 +1,7 @@
-import { useEffect, useState, type ChangeEvent } from "react";
+import { Icon } from "../components/Icon";
+import { useEffect, useState, type ChangeEvent, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../api/client";
+import { api, browserAuthMode, updateBrowserLogin } from "../api/client";
 import type {
   ApiKey,
   KavitaTestResult,
@@ -11,6 +12,70 @@ import { ImageOptimizationPreview } from "../components/ImageOptimizationPreview
 import { FolderBrowser } from "../components/FolderBrowser";
 import { ErrorNotice, Spinner, Toggle, Toolbar } from "../components/common";
 import { SOURCE_LABELS } from "../sources";
+
+function BrowserSecurity({ dirty }: { dirty: boolean }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const mode = browserAuthMode();
+
+  async function submit(action: "password" | "logout", event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault();
+    const form = event?.currentTarget;
+    const fields = new URLSearchParams();
+    if (form) {
+      new FormData(form).forEach((value, name) => fields.set(name, String(value)));
+      if (fields.get("password") !== fields.get("confirmation")) {
+        setError("The new passwords do not match.");
+        return;
+      }
+    }
+    setError("");
+    setBusy(true);
+    try {
+      await updateBrowserLogin(action, form ? fields : undefined);
+      form?.reset();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Could not update the browser login.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="settings-section" aria-labelledby="browser-security-title">
+      <h3 id="browser-security-title">Browser Security</h3>
+      {mode !== "external" ? (
+        <>
+          <p className="section-hint">
+            {mode === "environment"
+              ? "This login is managed by your deployment. Change the configured password and restart Mangarr."
+              : "Changing your password signs out every browser session. API keys keep working."}
+          </p>
+          {dirty && <p className="section-hint">Save your other settings before continuing.</p>}
+          {error && <p role="alert">{error}</p>}
+          {mode === "managed" && <form onSubmit={(event) => void submit("password", event)}>
+            <div className="form-row">
+              <label htmlFor="browser-current-password">Current password</label>
+              <input id="browser-current-password" name="current" type="password" autoComplete="current-password" maxLength={256} required />
+            </div>
+            <div className="form-row">
+              <label htmlFor="browser-new-password">New password</label>
+              <input id="browser-new-password" name="password" type="password" autoComplete="new-password" minLength={8} maxLength={256} required />
+            </div>
+            <div className="form-row">
+              <label htmlFor="browser-confirm-password">Confirm new password</label>
+              <input id="browser-confirm-password" name="confirmation" type="password" autoComplete="new-password" minLength={8} maxLength={256} required />
+            </div>
+            <button className="btn primary" disabled={busy || dirty}>Change Password</button>
+          </form>}{" "}
+          <button className="btn" type="button" disabled={busy || dirty} onClick={() => void submit("logout")}>Sign Out</button>
+        </>
+      ) : (
+        <p className="section-hint">Mangarr's browser login is disabled for this deployment.</p>
+      )}
+    </section>
+  );
+}
 
 function RootFolders() {
   const queryClient = useQueryClient();
@@ -40,8 +105,8 @@ function RootFolders() {
       {data?.map((rf) => (
         <div className="form-row" key={rf.id}>
           <label style={{ width: "auto", flex: 1 }}>{rf.path}</label>
-          <button className="btn icon-btn" onClick={() => remove.mutate(rf.id)}>
-            ✕
+          <button className="btn icon-btn" aria-label={`Remove root folder ${rf.path}`} onClick={() => remove.mutate(rf.id)}>
+            <Icon name="close" />
           </button>
         </div>
       ))}
@@ -98,7 +163,7 @@ function ApiKeyRow({ apiKey, onRemove }: { apiKey: ApiKey; onRemove: () => void 
         {copied ? "Copied" : "Copy"}
       </button>
       <button className="btn icon-btn" title="Revoke key" aria-label={`Revoke ${apiKey.name}`} onClick={onRemove}>
-        ✕
+        <Icon name="close" />
       </button>
     </div>
   );
@@ -158,6 +223,43 @@ function ApiKeys() {
       </div>
     </div>
   );
+}
+
+interface TorznabConfig {
+  id: string;
+  name: string;
+  url: string;
+  api_key: string;
+  categories: string;
+  search_type: string;
+  enabled: boolean;
+}
+
+export function TorznabSettings({ form, setForm }: { form: SettingsType; setForm: (form: SettingsType) => void }) {
+  const entries: TorznabConfig[] = JSON.parse(form.torznab_indexers || "[]");
+  const update = (next: TorznabConfig[]) => setForm({ ...form, torznab_indexers: JSON.stringify(next) });
+  return <div className="settings-section">
+    <h3>Torznab indexers (optional)</h3>
+    <p className="section-hint">Add API URLs from Prowlarr, Jackett, or a Torznab indexer. Enable qBittorrent to search and download. Re-enter the API key after changing an indexer's URL.</p>
+    {entries.map((entry, index) => {
+      const set = (patch: Partial<TorznabConfig>) => update(entries.map((item, i) => i === index ? { ...item, ...patch } : item));
+      return <fieldset key={entry.id} style={{ marginBottom: 16 }}>
+        <legend>{entry.name || "New indexer"}</legend>
+        <Toggle label="Enable indexer" on={entry.enabled} onChange={(enabled) => set({ enabled })} />
+        {([ ["name", "Name"], ["url", "Torznab API URL"], ["api_key", "API key"], ["categories", "Categories"] ] as const).map(([key, label]) => <div className="form-row" key={key}>
+          <label htmlFor={`${entry.id}-${key}`}>{label}</label>
+          <input id={`${entry.id}-${key}`} type={key === "api_key" ? "password" : "text"} placeholder={key === "url" ? "http://prowlarr:9696/1/api" : ""} value={entry[key]} onChange={(e) => set({ [key]: e.target.value })} />
+        </div>)}
+        <div className="form-row"><label htmlFor={`${entry.id}-type`}>Search type</label><select id={`${entry.id}-type`} value={entry.search_type} onChange={(e) => set({ search_type: e.target.value })}><option value="search">Search</option><option value="book">Book</option></select></div>
+        <button className="btn sm" onClick={() => update(entries.filter((_, i) => i !== index))}>Remove indexer</button>
+      </fieldset>;
+    })}
+    <button className="btn" onClick={() => update([...entries, { id: Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join(""), name: "", url: "", api_key: "", categories: "7030", search_type: "search", enabled: true }])}>Add Torznab indexer</button>
+    <div className="form-row"><label htmlFor="torrent-templates">Default torrent query templates</label><textarea id="torrent-templates" value={form.torrent_query_templates ?? "{series}"} onChange={(e) => setForm({ ...form, torrent_query_templates: e.target.value })} /></div>
+    <p className="section-hint">One variant per line (up to 10). Tokens: {"{series}, {chapter}, {volume}, {year}"}. Examples: {"{series} c{chapter:03d}"} or {"{series} v{volume:02d}"}. Decimal chapter numbers are preserved. Volume queries require chapter-to-volume metadata. Override these in a series' Automation options.</p>
+    <div className="form-row"><label>Scheduled torrent fallback</label><Toggle label="Search torrents for missing monitored chapters" on={form.torrent_monitor_enabled === "true"} onChange={(enabled) => setForm({ ...form, torrent_monitor_enabled: String(enabled) })} /></div>
+    <p className="section-hint">After direct sources, search enabled torrent indexers for missing monitored chapters. Requires seeders and matching chapter/volume coverage. Active downloads and recently failed releases are skipped. Add-time Search now uses torrents regardless of this toggle.</p>
+  </div>;
 }
 
 const SOURCE_HINTS: Record<string, string> = {
@@ -233,7 +335,7 @@ export function SourcePriority({
             <span className="priority-rank">{i + 1}</span>
             <span className="priority-arrows">
               <button className="btn icon-btn" disabled={i === 0} onClick={() => move(i, -1)} title="Higher priority">
-                ↑
+                <Icon name="arrow-up" />
               </button>
               <button
                 className="btn icon-btn"
@@ -241,7 +343,7 @@ export function SourcePriority({
                 onClick={() => move(i, 1)}
                 title="Lower priority"
               >
-                ↓
+                <Icon name="arrow-down" />
               </button>
             </span>
             <span className="priority-name">{SOURCE_LABELS[name] ?? name}</span>
@@ -533,7 +635,7 @@ function KavitaSettings({
           <span
             style={{ fontSize: 13, color: testResult.startsWith("✔") ? "var(--success)" : "var(--danger)" }}
           >
-            {testResult}
+            {<><Icon name={testResult.startsWith("✔") ? "check" : "close"} /> {testResult.replace(/^[✔✖]\s*/, "")}</>}
           </span>
         )}
       </div>
@@ -673,6 +775,7 @@ export default function Settings() {
   });
 
   const [webhookTest, setWebhookTest] = useState<string | null>(null);
+  const [applyingTitlePref, setApplyingTitlePref] = useState(false);
   const testWebhook = useMutation({
     mutationFn: () =>
       api.post("/settings/webhook/test", {
@@ -717,6 +820,7 @@ export default function Settings() {
         <ErrorNotice error={loadError} retry={() => void retryLoad()} />
         <ErrorNotice error={save.error} />
         <RootFolders />
+        <BrowserSecurity dirty={dirty} />
         <ApiKeys />
 
         <div className="settings-section">
@@ -725,6 +829,55 @@ export default function Settings() {
             Naming uses {"{series}"}, {"{volume:02d}"} and {"{chapter:04.1f}"} placeholders. Output
             is Komga/Kavita-friendly CBZ.
           </p>
+          <div className="form-row">
+            <label>Preferred title</label>
+            <select
+              value={form.preferred_title_language ?? "provider"}
+              onChange={set("preferred_title_language")}
+            >
+              <option value="provider">Provider (default)</option>
+              <option value="english">English</option>
+              <option value="romaji">Romaji</option>
+              <option value="native">Native</option>
+            </select>
+          </div>
+          <p className="section-hint">
+            Preferred title language when adding series and for future download filenames.
+          </p>
+          <div className="form-row">
+            <label>Apply to existing</label>
+            <button
+              type="button"
+              className="btn"
+              disabled={applyingTitlePref || dirty}
+              onClick={async () => {
+                if (
+                  !window.confirm(
+                    "Apply the preferred title language to all unlocked existing series? Existing folders and files are NOT renamed."
+                  )
+                ) {
+                  return;
+                }
+                setApplyingTitlePref(true);
+                try {
+                  const res = await api.post<{ count: number }>("/series/apply-title-preference");
+                  window.alert(`Updated ${res.count} series.`);
+                  queryClient.invalidateQueries({ queryKey: ["series"] });
+                } catch (err) {
+                  window.alert(`Failed to apply title preference: ${(err as Error).message}`);
+                } finally {
+                  setApplyingTitlePref(false);
+                }
+              }}
+            >
+              {applyingTitlePref ? "Applying…" : "Apply to existing series"}
+            </button>
+          </div>
+          {dirty && (
+            <p className="section-hint">
+              Save your settings before applying the preferred title to existing series.
+            </p>
+          )}
           <div className="form-row">
             <label>Chapter naming (with volume)</label>
             {text("naming_template")}
@@ -819,10 +972,12 @@ export default function Settings() {
           </div>
         </div>
 
+        <TorznabSettings form={form} setForm={setForm} />
+
         <div className="settings-section">
           <h3>Download Client — qBittorrent</h3>
           <p className="section-hint">
-            Torrent grabs (Nyaa releases) are sent to qBittorrent and imported when complete.
+            Torrent grabs (Nyaa and Torznab releases) are sent to qBittorrent and imported when complete.
             Re-enter the password after changing the URL or username, before testing or saving.
           </p>
           <div className="form-row">
@@ -884,7 +1039,7 @@ export default function Settings() {
             </button>
             {qbtTest && (
               <span style={{ fontSize: 13, color: qbtTest.startsWith("✔") ? "var(--success)" : "var(--danger)" }}>
-                {qbtTest}
+                {<><Icon name={qbtTest.startsWith("✔") ? "check" : "close"} /> {qbtTest.replace(/^[✔✖]\s*/, "")}</>}
               </span>
             )}
           </div>
@@ -925,7 +1080,7 @@ export default function Settings() {
             </button>
             {webhookTest && (
               <span style={{ fontSize: 13, color: webhookTest.startsWith("✔") ? "var(--success)" : "var(--danger)" }}>
-                {webhookTest}
+                {<><Icon name={webhookTest.startsWith("✔") ? "check" : "close"} /> {webhookTest.replace(/^[✔✖]\s*/, "")}</>}
               </span>
             )}
           </div>

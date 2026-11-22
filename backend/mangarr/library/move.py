@@ -64,8 +64,10 @@ async def move_series_folder(series: Series, new_root: RootFolder) -> bool:
         if moved is not None:
             # same file in a new place: its recorded origin still holds
             source, group = chapter.file_source, chapter.file_group
+            pdf_mapping = chapter.pdf_mapping
             chapter.file_path = moved
             chapter.file_source, chapter.file_group = source, group
+            chapter.pdf_mapping = pdf_mapping
     for folder in series.extra_folders:
         # a relative path resolves against the root (an absolute one as-is)
         moved = _rebase(str(old_root / folder.path), old_dir, new_dir)

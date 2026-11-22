@@ -34,6 +34,9 @@ def retained_secret(current: dict[str, str], key: str, destination: dict[str, st
 @router.get("")
 async def get_settings(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
     values = await settings_service.get_all(session)
+    from ..sources.torznab import mask_indexers
+
+    values["torznab_indexers"] = mask_indexers(values["torznab_indexers"])
     for key in settings_service.SECRET_KEYS:
         if values.get(key):
             values[key] = MASK
@@ -48,6 +51,10 @@ async def update_settings(
     to_save = {k: v for k, v in body.items() if v != MASK}
     try:
         current = await settings_service.get_all(session)
+        if "torznab_indexers" in to_save:
+            from ..sources.torznab import restore_keys
+
+            to_save["torznab_indexers"] = restore_keys(to_save["torznab_indexers"], current["torznab_indexers"])
         merged = {**current, **to_save}
         for key, fields in SECRET_DESTINATIONS.items():
             if current.get(key) and key not in to_save:

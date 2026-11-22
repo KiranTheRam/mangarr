@@ -107,6 +107,11 @@ class AniListProvider(MetadataProvider):
     def _to_metadata(self, media: dict) -> SeriesMetadata:
         titles = media.get("title") or {}
         title = titles.get("english") or titles.get("romaji") or titles.get("native") or "Unknown"
+        labeled_titles = {
+            k: titles[k]
+            for k in ("english", "romaji", "native")
+            if titles.get(k) and isinstance(titles[k], str)
+        }
         alt = [
             t
             for t in [titles.get("romaji"), titles.get("native"), *(media.get("synonyms") or [])]
@@ -117,6 +122,7 @@ class AniListProvider(MetadataProvider):
             provider=self.name,
             provider_id=str(media["id"]),
             title=title,
+            titles=labeled_titles,
             alt_titles=alt,
             description=media.get("description") or "",
             status=STATUS_MAP.get(media.get("status") or "", "unknown"),

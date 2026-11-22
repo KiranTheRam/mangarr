@@ -29,8 +29,16 @@ IMAGE = "https://data.tnlycdn.com/chapter/002.jpg"
 TBATE = "the-beginning-after-the-end-54f5cb7c"
 RANKER = "i-stole-the-number-one-rankers-soul-fd156026"
 RANKER_TITLE = "I Stole the Number One Ranker’s Soul"
-READER_LABEL = '<ol class="breadcrumb"><li class="active">Chapter 1</li></ol>'
 WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 " + b"page-content"
+
+
+def reader_identity(path=CHAPTER, title="Chapter 1"):
+    slug = path.strip("/").rsplit("/", 1)[-1]
+    return f"""
+      <link rel="canonical" href="{BASE_URL}{path}">
+      <ol class="breadcrumb"><li class="active">{title}</li></ol>
+      <div class="chapter-option selected" data-value="{slug}">{title}</div>
+    """
 
 
 @pytest.fixture(autouse=True)
@@ -89,8 +97,8 @@ async def test_reader_order_lazy_images_and_request_local_referers():
       <img src="https://ads.test/ad.jpg">
     </div>"""
     other = CHAPTER.replace("chapter-1", "chapter-2")
-    respx.get(BASE_URL + CHAPTER).respond(200, text=READER_LABEL + reader)
-    respx.get(BASE_URL + other).respond(200, text=READER_LABEL + reader)
+    respx.get(BASE_URL + CHAPTER).respond(200, text=reader_identity() + reader)
+    respx.get(BASE_URL + other).respond(200, text=reader_identity(other, "Chapter 2") + reader)
     seen = []
 
     def image_response(request):
@@ -115,7 +123,7 @@ async def test_reader_order_lazy_images_and_request_local_referers():
 @pytest.mark.parametrize("suffix, accept", [(".JPEG?token=test", "image/jpeg"), (".png", "*/*"), (".webp", "*/*")])
 async def test_jpeg_preference_preserves_other_image_formats(suffix, accept):
     image_url = "https://data.tnlycdn.com/chapter/page" + suffix
-    respx.get(BASE_URL + CHAPTER).respond(200, text=READER_LABEL + f"""
+    respx.get(BASE_URL + CHAPTER).respond(200, text=reader_identity() + f"""
       <div class="reading-content"><img class="wp-manga-chapter-img" src="{image_url}"></div>
     """)
     image = respx.get(image_url).respond(200, content=WEBP)
@@ -129,7 +137,7 @@ async def test_jpeg_preference_preserves_other_image_formats(suffix, accept):
 
 @respx.mock
 async def test_real_downloader_packages_webp_at_jpg_url_and_uses_proxy(tmp_path, monkeypatch):
-    respx.get(BASE_URL + CHAPTER).respond(200, text=READER_LABEL + f"""
+    respx.get(BASE_URL + CHAPTER).respond(200, text=reader_identity() + f"""
       <div class="reading-content"><img class="wp-manga-chapter-img" src="{IMAGE}"></div>
     """)
     respx.get(IMAGE).respond(200, content=WEBP)
@@ -309,13 +317,11 @@ async def test_reader_and_catalog_reject_unmapped_side_story_episodes():
       <li class="wp-manga-chapter"><a href="{path}chapter-174-a/">Chapter 174 - Part A</a></li>
       <li class="wp-manga-chapter"><a href="{path}chapter-174-b/">Chapter 174 - Part B</a></li>
     """)
-    respx.get(BASE_URL + final).respond(200, text=f"""
-      <ol class="breadcrumb"><li class="active">{final_label}</li></ol>
+    respx.get(BASE_URL + final).respond(200, text=reader_identity(final, final_label) + f"""
       <div class="reading-content"><img class="wp-manga-chapter-img" src="{IMAGE}"></div>
     """)
     old_part = path + "chapter-174-a/"
-    respx.get(BASE_URL + old_part).respond(200, text=f"""
-      <ol class="breadcrumb"><li class="active">Chapter 174 - Part A</li></ol>
+    respx.get(BASE_URL + old_part).respond(200, text=reader_identity(old_part, "Chapter 174 - Part A") + f"""
       <div class="chapter-option" data-value="chapter-174-b">Chapter 174 - Part B</div>
       <div class="reading-content"><img class="wp-manga-chapter-img" src="{IMAGE}"></div>
     """)
@@ -333,10 +339,30 @@ class PrefixOnlyImage(httpx.AsyncByteStream):
         pytest.fail("verification continued reading the image body")
 
 
-def reader_html(image):
-    return READER_LABEL + f"""
+def reader_html(image, *, path=CHAPTER, title="Chapter 1"):
+    return reader_identity(path, title) + f"""
       <div class="reading-content"><img class="wp-manga-chapter-img" data-src="{image}"></div>
     """
+
+
+@respx.mock
+@pytest.mark.parametrize("reader_part", ["canonical", "selected chapter", "chapter number"])
+async def test_reader_rejects_content_for_a_different_chapter(reader_part):
+    other = CHAPTER.replace("chapter-1", "chapter-2")
+    content = reader_html(IMAGE)
+    if reader_part == "canonical":
+        content = content.replace(f'href="{BASE_URL}{CHAPTER}"', f'href="{BASE_URL}{other}"')
+    elif reader_part == "selected chapter":
+        content = content.replace('data-value="chapter-1"', 'data-value="chapter-2"')
+    else:
+        content = content.replace("Chapter 1</li>", "Chapter 2</li>")
+    respx.get(BASE_URL + CHAPTER).respond(200, text=content)
+
+    async with httpx.AsyncClient() as client:
+        source = ToonilySource(client)
+        assert await source.get_pages(CHAPTER) == []
+        assert await source.verify_chapters([CHAPTER]) == set()
+    assert len(respx.calls) == 2
 
 
 @respx.mock
@@ -384,13 +410,15 @@ async def test_verification_reads_a_prefix_and_caches_per_task_route(monkeypatch
 async def test_verification_checks_only_bounded_candidates_and_rejects_unsafe_responses(monkeypatch):
     offsite, redirected, too_large, later = [CHAPTER.replace("chapter-1", f"chapter-{n}") for n in range(2, 6)]
     respx.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE))
-    respx.get(BASE_URL + offsite).respond(200, text=reader_html("https://data.tnlycdn.com@127.0.0.1/image"))
+    respx.get(BASE_URL + offsite).respond(200, text=reader_html(
+        "https://data.tnlycdn.com@127.0.0.1/image", path=offsite, title="Chapter 2",
+    ))
     respx.get(IMAGE).respond(302, headers={"Location": "http://127.0.0.1/image"})
     respx.get(BASE_URL + redirected).respond(302, headers={"Location": "http://127.0.0.1/reader"})
     respx.get(BASE_URL + too_large).respond(
         200, headers={"Content-Length": str(toonily.MAX_READER_BYTES + 1)},
     )
-    unchecked = respx.get(BASE_URL + later).respond(200, text=reader_html(IMAGE))
+    unchecked = respx.get(BASE_URL + later).respond(200, text=reader_html(IMAGE, path=later, title="Chapter 5"))
     monkeypatch.setattr(toonily, "MAX_CHAPTER_CHECKS", 2)
     async with httpx.AsyncClient() as client:
         source = ToonilySource(client)
@@ -399,6 +427,22 @@ async def test_verification_checks_only_bounded_candidates_and_rejects_unsafe_re
         assert not await source.verify_chapters([redirected])
         assert not await source.verify_chapters([too_large])
     assert len(respx.calls) == 5
+
+
+@respx.mock
+async def test_verification_continues_after_an_oversized_reader():
+    earlier = CHAPTER.replace("chapter-1", "chapter-0")
+    oversized = respx.get(BASE_URL + earlier).respond(
+        200, headers={"Content-Length": str(toonily.MAX_READER_BYTES + 1)},
+    )
+    respx.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE))
+    image = respx.get(IMAGE).respond(206, content=WEBP)
+
+    async with httpx.AsyncClient() as client:
+        source = ToonilySource(client)
+        assert await source.verify_chapters([earlier, CHAPTER]) == {CHAPTER}
+        assert await source.verify_chapters([earlier, CHAPTER]) == {CHAPTER}
+    assert oversized.call_count == image.call_count == 1
 
 
 @respx.mock

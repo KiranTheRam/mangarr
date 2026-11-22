@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .comicinfo import COMICINFO_INT_MAX
+
 MonitorMode = Literal["all", "missing", "future", "from_chapter", "latest_volume", "none"]
 
 
@@ -91,9 +93,16 @@ class SeriesOut(BaseModel):
     special_downloaded_count: int = 0
     monitor_mode: str = "all"
     monitor_from: float | None = None
+    provider_title: str = ""
+    title_english: str = ""
+    title_romaji: str = ""
+    title_native: str = ""
+    title_locked: bool = False
 
 
 class SeriesDetailOut(SeriesOut):
+    search_title: str = ""
+    search_templates: str = ""
     chapters: list[ChapterOut] = []
     source_links: list[SourceLinkOut] = []
     refreshing: bool = False  # a full refresh is running in the background
@@ -163,6 +172,10 @@ class FolderPreviewOut(BaseModel):
 
 
 class SeriesUpdateIn(BaseModel):
+    title: str | None = None
+    title_locked: bool | None = None
+    search_title: str | None = None
+    search_templates: str | None = None
     monitored: bool | None = None
     root_folder_id: int | None = None
     folder_name: str | None = None
@@ -219,6 +232,11 @@ class SeriesBulkOut(BaseModel):
     count: int
 
 
+class ApplyTitlePreferenceOut(BaseModel):
+    count: int
+    updated: int = 0
+
+
 class SeriesGroupOut(BaseModel):
     """A scanlation group a linked source offers for the series."""
     source_name: str
@@ -244,11 +262,88 @@ class ChapterMetadataIn(BaseModel):
     excluded: bool | None = None
 
 
+class ComicInfoOut(BaseModel):
+    file_path: str
+    revision: str
+    exists: bool
+    series: str | None
+    number: str | None
+    volume: str | None
+    title: str | None
+    page_count: str | None
+    actual_page_count: int
+
+
+class ComicInfoUpdateIn(BaseModel):
+    revision: str
+    series: str | None = None
+    number: str | None = None
+    volume: int | None = None
+    title: str | None = None
+    page_count: int | None = None
+
+    @field_validator("series", "number", "title")
+    @classmethod
+    def _trim_optional_text(cls, value):
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        return value or None
+
+    @field_validator("number")
+    @classmethod
+    def _single_chapter_number(cls, value):
+        from .comicinfo import number_spans_chapters
+
+        if number_spans_chapters(value):
+            raise ValueError("Number must describe a single chapter")
+        return value
+
+    @field_validator("volume", "page_count")
+    @classmethod
+    def _positive_optional_integer(cls, value, info):
+        if value is not None and value < 1:
+            raise ValueError(f"{info.field_name} must be at least 1")
+        if value is not None and value > COMICINFO_INT_MAX:
+            raise ValueError(f"{info.field_name} must be at most {COMICINFO_INT_MAX}")
+        return value
+
+
+class LibraryIssueOut(BaseModel):
+    id: str
+    revision: str
+    series_id: int
+    series_title: str
+    chapter_id: int | None
+    chapter_number: float | None
+    kind: str
+    file_path: str
+    field: str
+    current_value: str | None
+    suggested_value: str | None
+    title: str
+    detail: str
+    ignored: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class IssueResolveIn(BaseModel):
+    revision: str
+
+
+class IssueScanOut(BaseModel):
+    active: int
+    ignored: int
+
+
 class MetadataResult(BaseModel):
     provider: str
     provider_id: str
     title: str
+    preferred_title: str = ""
     english_title: str = ""
+    matched_title: str = ""
     alt_titles: list[str]
     description: str
     status: str

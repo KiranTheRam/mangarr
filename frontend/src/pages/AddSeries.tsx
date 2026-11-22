@@ -94,7 +94,7 @@ export default function AddSeries() {
         {isFetching ? (
           <Spinner />
         ) : results && results.length === 0 ? (
-          <EmptyState icon="🔍" title="No results" hint="Try a different title." />
+          <EmptyState icon="search" title="No results" hint="Try a different title." />
         ) : (
           results?.map((r) => {
             const clickable = canAdd && !r.in_library;
@@ -119,6 +119,9 @@ export default function AddSeries() {
                   </h3>
                   {r.english_title && r.english_title !== r.title && (
                     <div className="alt-title-line">English: {r.english_title}</div>
+                  )}
+                  {r.matched_title && r.matched_title !== r.title && r.matched_title !== r.english_title && (
+                    <div className="alt-title-line">Matched title: {r.matched_title}</div>
                   )}
                   <span className={`pill ${statusPill[r.status] ?? "gray"}`}>{r.status}</span>{" "}
                   {r.total_chapters && <span className="tag">{r.total_chapters} chapters</span>}

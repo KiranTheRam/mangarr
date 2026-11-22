@@ -1,3 +1,4 @@
+import { Icon } from "../components/Icon";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
@@ -77,7 +78,7 @@ function PosterCard({
         },
       })}
     >
-      {selecting && <div className="poster-check" aria-hidden="true">{selected ? "✓" : ""}</div>}
+      {selecting && <div className="poster-check" aria-hidden="true">{selected ? <Icon name="check" /> : ""}</div>}
       {series.cover_url ? (
         <img src={series.cover_url} alt={series.title} loading="lazy" />
       ) : (
@@ -191,7 +192,7 @@ export default function Library() {
             title="Select series to edit, refresh, search or remove several at once"
             onClick={() => (selected ? stopSelecting() : setSelected(new Set()))}
           >
-            ☑ Select
+            <Icon name="check" /> Select
           </button>
         )}
         <Link to="/add" className="btn primary">
@@ -204,13 +205,13 @@ export default function Library() {
           <Spinner />
         ) : !data && error ? null : !data || data.length === 0 ? (
           <EmptyState
-            icon="📚"
+            icon="library"
             title="Your library is empty"
             hint="Add a series to start building your manga collection."
           />
         ) : !filtered || filtered.length === 0 ? (
           <EmptyState
-            icon="🔍"
+            icon="search"
             title="No matches"
             hint={
               q

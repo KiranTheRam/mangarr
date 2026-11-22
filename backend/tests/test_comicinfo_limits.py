@@ -26,7 +26,7 @@ def test_compressed_oversized_metadata_not_opened(tmp_path, monkeypatch, reader,
     open_member.assert_not_called()
 
 
-def test_bounded_stream_even_if_declared_size_is_small(monkeypatch):
+def test_bounded_stream_even_if_declared_size_is_small():
     info = zipfile.ZipInfo("ComicInfo.xml")
     info.file_size = 10
     archive = Mock()
@@ -34,20 +34,22 @@ def test_bounded_stream_even_if_declared_size_is_small(monkeypatch):
     stream = Mock(wraps=io.BytesIO(b"x" * (matcher.MAX_COMICINFO_BYTES + 5)))
     archive.open.return_value.__enter__ = Mock(return_value=stream)
     archive.open.return_value.__exit__ = Mock(return_value=False)
-    monkeypatch.setattr(zipfile, "ZipFile", Mock(return_value=Mock(__enter__=Mock(return_value=archive), __exit__=Mock(return_value=False))))
-    assert matcher._read_comicinfo_title(None) == ""
+    assert matcher._read_comicinfo_title(archive) == ""
     stream.read.assert_called_once_with(matcher.MAX_COMICINFO_BYTES + 1)
     archive.open.assert_called_once_with(info)
 
 
-def test_duplicate_name_opens_checked_entry(tmp_path):
+def test_duplicate_metadata_name_is_not_used_for_matching(tmp_path, monkeypatch):
     path = tmp_path / "duplicate.cbz"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("ComicInfo.xml", "<ComicInfo><Title>first</Title><Number>1</Number></ComicInfo>")
         with pytest.warns(UserWarning):
             archive.writestr("ComicInfo.xml", b"x" * (matcher.MAX_COMICINFO_BYTES + 1))
-    assert matcher.comicinfo_title(path) == "first"
-    assert matcher.comicinfo_number(path) == 1
+    open_member = Mock(side_effect=AssertionError("ambiguous metadata must not be opened"))
+    monkeypatch.setattr(zipfile.ZipFile, "open", open_member)
+    assert matcher.comicinfo_title(path) == ""
+    assert matcher.comicinfo_number(path) is None
+    open_member.assert_not_called()
 
 
 @pytest.mark.parametrize("data", [b"bad xml", b"<ComicInfo><Number>bad</Number></ComicInfo>"])

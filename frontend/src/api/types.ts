@@ -42,6 +42,42 @@ export interface Chapter {
   file_group: string;
 }
 
+export interface ComicInfo {
+  file_path: string;
+  revision: string;
+  exists: boolean;
+  series: string | null;
+  number: string | null;
+  volume: string | null;
+  title: string | null;
+  page_count: string | null;
+  actual_page_count: number;
+}
+
+export interface LibraryIssue {
+  id: string;
+  revision: string;
+  series_id: number;
+  series_title: string;
+  chapter_id: number | null;
+  chapter_number: number | null;
+  kind: string;
+  file_path: string;
+  field: string;
+  current_value: string | null;
+  suggested_value: string | null;
+  title: string;
+  detail: string;
+  ignored: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IssueScanResult {
+  active: number;
+  ignored: number;
+}
+
 export interface Series {
   id: number;
   anilist_id: number | null;
@@ -70,6 +106,11 @@ export interface Series {
   special_downloaded_count: number;
   monitor_mode: MonitorMode;
   monitor_from: number | null;
+  provider_title: string;
+  title_english: string;
+  title_romaji: string;
+  title_native: string;
+  title_locked: boolean;
 }
 
 export type MonitorMode = "all" | "missing" | "future" | "from_chapter" | "latest_volume" | "none";
@@ -83,6 +124,8 @@ export interface SeriesEditorResult {
 }
 
 export interface SeriesDetail extends Series {
+  search_title: string;
+  search_templates: string;
   chapters: Chapter[];
   source_links: SourceLink[];
   refreshing: boolean;
@@ -113,7 +156,9 @@ export interface MetadataResult {
   provider: string;
   provider_id: string;
   title: string;
+  preferred_title: string;
   english_title: string;
+  matched_title: string;
   alt_titles: string[];
   description: string;
   status: string;

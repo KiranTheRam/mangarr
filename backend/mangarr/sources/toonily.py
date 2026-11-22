@@ -287,6 +287,13 @@ class ToonilySource(DirectSource):
             follow_redirects=False, headers={"Accept-Encoding": "identity"}, **kwargs,
         )
         soup = BeautifulSoup(content, "lxml", from_encoding="utf-8")
+        canonical = soup.select_one("link[rel=canonical][href]")
+        try:
+            if canonical is None or _chapter_path(canonical["href"]) != path:
+                return []
+        except ValueError:
+            return []
+
         label = soup.select_one(".breadcrumb li.active")
         title = label.get_text(" ", strip=True) if label else ""
         chapter = _CHAPTER.match(title)
@@ -295,12 +302,19 @@ class ToonilySource(DirectSource):
         # Older queued IDs may refer to one of several parts at this number.
         chapter_slug = path.strip("/").rsplit("/", 1)[-1]
         number = float(chapter[1])
+        selected = False
         for option in soup.select(".chapter-option[data-value]"):
-            if option["data-value"] == chapter_slug:
-                continue
+            slug = option["data-value"]
             other = _CHAPTER.match(option.get_text(" ", strip=True))
-            if other and float(other[1]) == number:
+            same_number = bool(other and float(other[1]) == number)
+            if "selected" in option.get("class", ()):
+                if slug != chapter_slug or not same_number:
+                    return []
+                selected = True
+            elif slug != chapter_slug and same_number:
                 return []
+        if not selected:
+            return []
         pages = {}
         for image in soup.select(".reading-content img.wp-manga-chapter-img"):
             url = str(image.get("data-src") or image.get("data-lazy-src") or image.get("src") or "").strip()
@@ -384,7 +398,11 @@ class ToonilySource(DirectSource):
             ) as images:
                 for path in list(pending)[:limit]:
                     key = (path, proxy)
-                    result = await self._probe_chapter(images, path)
+                    try:
+                        result = await self._probe_chapter(images, path)
+                    except (httpx.InvalidURL, ValueError):
+                        # An oversized reader or invalid image URL affects this chapter.
+                        result = False
                     ttl = AVAILABLE_TTL if result else UNAVAILABLE_TTL
                     self._availability[key] = (time.monotonic() + ttl, result)
                     self._availability.move_to_end(key)
@@ -392,7 +410,7 @@ class ToonilySource(DirectSource):
                         self._availability.popitem(last=False)
                     if result:
                         available.update(pending[path])
-        except (httpx.HTTPError, httpx.InvalidURL, ValueError, TimeoutError) as exc:
+        except (httpx.HTTPError, ValueError, TimeoutError) as exc:
             # Unverified releases stay hidden, and transport failures are not cached.
             log.warning("Toonily availability check stopped (%s)", type(exc).__name__)
         return available

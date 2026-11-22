@@ -38,6 +38,26 @@ _RELATIVE_IMPORT = re.compile(
 )
 _TRAILING_EXPORT = re.compile(r"export\s*\{[^}]*\}\s*;?\s*$")
 
+_TOKEN_RESOLVER = f"""
+(function () {{
+  if (typeof globalThis.{TOKEN_FUNCTION} === 'function') return true;
+  var names = Object.getOwnPropertyNames(globalThis);
+  for (var i = 0; i < names.length; i++) {{
+    var candidate;
+    try {{ candidate = globalThis[names[i]]; }} catch (error) {{ continue; }}
+    if (candidate === null ||
+        (typeof candidate !== 'object' && typeof candidate !== 'function')) continue;
+    var tokenFunction;
+    try {{ tokenFunction = candidate.{TOKEN_FUNCTION}; }} catch (error) {{ continue; }}
+    if (typeof tokenFunction === 'function') {{
+      globalThis.{TOKEN_FUNCTION} = tokenFunction.bind(candidate);
+      return true;
+    }}
+  }}
+  return false;
+}})()
+"""
+
 # The signing module expects a browser: it keys its bytecode on
 # navigator.appCodeName and encodes with TextEncoder/atob/btoa.  Timers are
 # no-ops so its periodic anti-debugging checks never run.
@@ -172,12 +192,12 @@ class MangaFireSigner:
             module = _TRAILING_EXPORT.sub("", source.strip())
             # end on a primitive: the module's last statement may be an object
             await _run(context, f"{_BROWSER_SHIM}\n{module}\n;true")
-            available = await _run(context, f"typeof globalThis.{TOKEN_FUNCTION}")
+            available = await _run(context, _TOKEN_RESOLVER)
         except Exception as exc:
             raise MangaFireTokenError(
                 f"MangaFire signing module failed to load: {exc}"
             ) from exc
-        if available != "function":
+        if available is not True:
             raise MangaFireTokenError(
                 f"MangaFire signing module does not define {TOKEN_FUNCTION}"
             )

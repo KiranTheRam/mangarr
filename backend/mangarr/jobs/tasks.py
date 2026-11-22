@@ -2,21 +2,25 @@
 processing, qBittorrent sync, and the monitor loop."""
 
 import asyncio
-import base64
-import binascii
 import logging
+import os
 import re
+import shutil
 import time
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from tempfile import mkdtemp
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import kavita, notifications
+from .. import kavita, notifications, settings_service
 from ..automation import (
     FINISHED_SERIES_MODES,
     MERGED_FILE_SOURCE,
@@ -41,10 +45,16 @@ from ..db import session_scope
 from ..download.direct import DuplicateChapterPagesError, download_chapter_to_cbz
 from ..download.images import ImageOptimization
 from ..download.qbittorrent import QbtClient
+from ..download.torrent import magnet_btih_hex
 from ..filename import parse_filename
+from ..library.archive_members import ArchiveVersion, archive_version
 from ..library.importer import import_torrent_payload
-from ..library.matcher import find_media_files, find_series_media_files, match_files
+from ..library.matcher import (
+    find_media_files, find_series_media_files, manual_pdf_mappings, match_files, pdf_file_identity,
+    split_pdf_title_conflicts,
+)
 from ..library.naming import chapter_path, series_folder, volume_filename
+from ..library.publish import publish_new_file
 from ..library.volume_merge import merge_chapter_archives
 from ..metadata.anilist import provider as anilist
 from ..metadata.mangaupdates import provider as mangaupdates
@@ -54,19 +64,32 @@ from ..models import (
     DownloadKind,
     DownloadStatus,
     HistoryEvent,
+    RootFolder,
     Series,
+    SeriesFolder,
+    SeriesSourceLink,
     SeriesStatus,
 )
 from ..sources import registry
 from ..sources.base import DirectSource, SourceChapter
-from ..titles import plausible_title_match, source_title_key, split_alt_titles, title_queries
+from ..titles import (
+    alternate_titles,
+    compute_title_variants,
+    metadata_title_queries,
+    metadata_titles,
+    pick_title,
+    plausible_title_match,
+    set_display_title,
+    source_title_key,
+)
 from ..torrent_selection import select_best_torrent
-from ..util import is_transient_error, normalize_title
+from ..util import finish_before_cancel, is_transient_error, normalize_title, run_file_work, safe_error_reason
+
+if TYPE_CHECKING:
+    from ..metadata_issues import ArchiveOwnership
 from ..volumes import distribute_over_disk_volumes, select_labeled_volume_map
 
 log = logging.getLogger(__name__)
-
-BTIH_RE = re.compile(r"btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
 
 # error text marking a download the user cancelled — it must not count as a
 # source failure (which would stop the monitor from ever retrying that
@@ -87,6 +110,10 @@ NO_ROOT_FOLDER = "series has no root folder configured"
 # none of these are the source's fault, so the monitor's failed-grab block
 # leaves them out
 NOT_SOURCE_FAILURES = (LIBRARY_UNAVAILABLE, SOURCE_DISABLED, NO_ROOT_FOLDER)
+
+ACTIVE_DOWNLOAD_STATUSES = (
+    DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING,
+)
 
 # upgrades share the single direct queue with new chapters; a series that
 # just had upgrades enabled must not flood it in one pass
@@ -216,8 +243,11 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
         await anilist.get_series(str(series.anilist_id)) if series.anilist_id else None
     )
     if meta is not None:
-        series.title = meta.title
-        series.alt_titles = "\n".join(meta.alt_titles)
+        series.provider_title = meta.title
+        variants = compute_title_variants(getattr(meta, "titles", None), meta.title, meta.alt_titles)
+        series.title_english = variants["english"]
+        series.title_romaji = variants["romaji"]
+        series.title_native = variants["native"]
         series.description = meta.description
         series.status = SeriesStatus(meta.status)
         series.year = meta.year
@@ -234,12 +264,27 @@ async def refresh_series_metadata(session: AsyncSession, series: Series) -> None
             series.total_chapters = max(mu_meta.total_chapters, series.total_chapters or 0)
         if mu_meta.total_volumes:
             series.total_volumes = max(mu_meta.total_volumes, series.total_volumes or 0)
-        # MangaUpdates' associated titles help cross-source matching
-        if meta is None or meta is not mu_meta:
-            known = set(series.alt_titles.split("\n"))
-            extra = [t for t in mu_meta.alt_titles if t and t not in known]
-            series.alt_titles = "\n".join(filter(None, [series.alt_titles, *extra]))
     series.metadata_refreshed_at = datetime.now(timezone.utc)
+    represented_title = ""
+    if meta is not None:
+        # Flush the metadata to take the SQLite writer lock, then read the
+        # title fields again. They may have changed during the provider call.
+        await session.flush()
+        await session.refresh(series, ["title", "title_locked", "folder_name", "sort_title"])
+        if not series.title_locked:
+            values = await settings_service.get_all(session)
+            pref = values.get("preferred_title_language", "provider")
+            set_display_title(series, pick_title(pref, variants, series.provider_title))
+        represented_titles = [meta.title, *variants.values()]
+        if series.title in represented_titles:
+            represented_title = series.title
+        aliases = [*represented_titles, *meta.alt_titles]
+    else:
+        aliases = metadata_titles(series)
+    if mu_meta is not None and mu_meta is not meta:
+        aliases.extend(mu_meta.alt_titles)
+    if meta is not None or mu_meta is not None:
+        series.alt_titles = alternate_titles(represented_title, aliases)
     await session.commit()
 
 
@@ -275,7 +320,7 @@ async def link_mangaupdates(series: Series) -> bool:
 # ---------------------------------------------------------- source linking
 
 def _titles_of(series: Series) -> list[str]:
-    return title_queries(series.title, split_alt_titles(series.alt_titles))
+    return metadata_title_queries(series)
 
 
 # (series_id, source_name) → monotonic time before which auto-linking should
@@ -685,10 +730,14 @@ def disk_volume_numbers(series: Series) -> set[int]:
         resolve_volume_offsets(Path(series.root_folder.path), series)
         if series.root_folder is not None else {}
     )
-    media = find_series_media_files(
-        folders, [chapter for chapter in series.chapters if not chapter.excluded], offsets
+    chapters = [chapter for chapter in series.chapters if not chapter.excluded]
+    manual_pdfs = manual_pdf_mappings(chapters)
+    media, _ = split_pdf_title_conflicts(
+        find_series_media_files(folders, chapters, offsets), [series.title, *metadata_titles(series)],
     )
     for mf in media:
+        if manual_pdfs and mf.is_pdf and pdf_file_identity(mf.path) in manual_pdfs:
+            continue
         if mf.coverage and mf.coverage.is_range and mf.coverage.volume and not mf.coverage.chapter:
             low, high = mf.coverage.volume
             volumes.update(range(low, high + 1))
@@ -731,13 +780,20 @@ def refine_volume_map_with_disk(
 
 async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> int:
     """Clear downloaded state for chapters whose recorded media file is gone."""
+    from ..library.scanner import chapters_under_folders, unavailable_extra_folders
+
     reason = await library_root_unavailable(session, series)
     if reason:
         log.warning("Not checking files of %r: %s", series.title, reason)
         return 0
+    extras = (
+        [Path(series.root_folder.path) / folder.path for folder in series.extra_folders]
+        if series.root_folder is not None else []
+    )
+    protected = chapters_under_folders(series.chapters, unavailable_extra_folders(extras))
     missing = 0
     for chapter in series.chapters:
-        if chapter.excluded:
+        if chapter.excluded or chapter in protected:
             continue
         if not chapter.downloaded:
             continue
@@ -751,22 +807,33 @@ async def reconcile_downloaded_files(session: AsyncSession, series: Series) -> i
     return missing
 
 
-async def scan_series_folder(session: AsyncSession, series: Series) -> None:
+async def scan_series_folder(
+    session: AsyncSession, series: Series, *, scan_issues: bool = True,
+) -> bool:
     """Adopt existing library folders for the series and mark chapters that are
-    already on disk as owned (so they aren't re-downloaded)."""
-    from ..library.scanner import resolve_volume_offsets, scan_series
+    already on disk as owned (so they aren't re-downloaded).
 
-    folders = _series_folders(series)
-    if not folders:
-        return
-    offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
-    scan_series(
-        series, [chapter for chapter in series.chapters if not chapter.excluded],
-        folders, offsets,
-        root=Path(series.root_folder.path),
-        expect_content=await root_expects_content(session, series),
-    )
-    await session.commit()
+    The caller holds the series lock. Commit adoptions before releasing the
+    archive lock so an editor sees all owners when it checks an archive.
+    """
+    from ..library.scanner import resolve_volume_offsets, scan_series
+    from ..metadata_issues import detect_series_issues, manual_archive_lock
+
+    async with manual_archive_lock:
+        folders = _series_folders(series)
+        if not folders:
+            return False
+        offsets = resolve_volume_offsets(Path(series.root_folder.path), series)
+        result = scan_series(
+            series, [chapter for chapter in series.chapters if not chapter.excluded],
+            folders, offsets,
+            root=Path(series.root_folder.path),
+            expect_content=await root_expects_content(session, series),
+        )
+        if scan_issues and not result.root_unavailable:
+            await detect_series_issues(session, series)
+        await session.commit()
+    return not result.root_unavailable
 
 
 # series ids with a full refresh in flight, so the UI can show what's
@@ -777,7 +844,7 @@ REFRESHING: set[int] = set()
 _SERIES_LOCKS: dict[int, asyncio.Lock] = {}
 
 
-def _series_lock(series_id: int) -> asyncio.Lock:
+def series_lock(series_id: int) -> asyncio.Lock:
     lock = _SERIES_LOCKS.get(series_id)
     if lock is None:
         lock = asyncio.Lock()
@@ -786,13 +853,13 @@ def _series_lock(series_id: int) -> asyncio.Lock:
 
 
 async def acquire_series_lock(series_id: int) -> asyncio.Lock:
-    lock = _series_lock(series_id)
+    lock = series_lock(series_id)
     await lock.acquire()
     return lock
 
 
 async def try_acquire_series_lock(series_id: int) -> asyncio.Lock | None:
-    lock = _series_lock(series_id)
+    lock = series_lock(series_id)
     if lock.locked():
         return None
     await lock.acquire()
@@ -800,7 +867,8 @@ async def try_acquire_series_lock(series_id: int) -> asyncio.Lock | None:
 
 
 async def refresh_series_full(
-    series_id: int, grab_missing: bool = False, only_monitored: bool = False
+    series_id: int, grab_missing: bool = False, only_monitored: bool = False,
+    *, force_scan: bool = False,
 ) -> None:
     REFRESHING.add(series_id)
     lock = await acquire_series_lock(series_id)
@@ -821,7 +889,7 @@ async def refresh_series_full(
             await link_sources(session, series, values)
             await update_chapters(session, series, values, chapter_cache)
             # adopt existing on-disk files before the monitor considers grabbing
-            if values.get("library_scan_on_add", "true") == "true":
+            if force_scan or values.get("library_scan_on_add", "true") == "true":
                 try:
                     await scan_series_folder(session, series)
                 except Exception as exc:
@@ -834,6 +902,8 @@ async def refresh_series_full(
                 await grab_missing_chapters(
                     session, series, values, chapter_cache=chapter_cache,
                 )
+                if values.get("torrent_monitor_enabled") == "true":
+                    await auto_grab_best_torrent(session, series, values, only_monitored=True)
             elif grab_missing:
                 # explicit one-time search (e.g. "search for missing" at add
                 # time): runs even for unmonitored series, whose chapters carry
@@ -859,30 +929,60 @@ async def refresh_series_full(
 async def scan_all_series() -> None:
     """Scan every series' folder to adopt on-disk files (background job)."""
     async with session_scope() as session:
-        series_ids = [row[0] for row in (await session.execute(select(Series.id))).all()]
+        series_ids = (await session.scalars(select(Series.id).where(Series.deletion_pending.is_(False)))).all()
+    scanned_ids = []
     for series_id in series_ids:
-        async with session_scope() as session:
+        async with series_lock(series_id), session_scope() as session:
             series = await _load_series(session, series_id)
             if series is not None:
                 try:
-                    await scan_series_folder(session, series)
+                    if await scan_series_folder(session, series, scan_issues=False):
+                        scanned_ids.append(series_id)
                 except Exception as exc:
                     log.warning("library scan failed for series %d: %s", series_id, exc)
+    await _scan_metadata_issues(scanned_ids)
+
+
+async def _scan_metadata_issues(series_ids: list[int]) -> None:
+    """Build one ownership snapshot after all file mappings have been committed."""
+    from ..metadata_issues import detect_series_issues, load_archive_ownership
+
+    if not series_ids:
+        return
+    async with session_scope() as session:
+        ownership = await load_archive_ownership(session)
+    for series_id in series_ids:
+        async with series_lock(series_id), session_scope() as session:
+            try:
+                series = await _load_series(session, series_id)
+                if series is not None:
+                    await detect_series_issues(session, series, ownership)
+                    await session.commit()
+            except Exception as exc:
+                log.warning("metadata scan failed for series %d: %s", series_id, exc)
 
 
 def _notify_kavita(values: dict[str, str], series: Series) -> None:
     """Ask Kavita to scan the library this series' files live in.
 
     Kavita names a series from the ComicInfo <Series> mangarr writes (the
-    series title) or else from the folder name, so only those two are offered.
-    Alternate titles are not: a series Kavita has not seen yet matches nothing
-    under its own name, and an alternate such as "Berserk" (for "Berserk of
-    Gluttony") would then pick an unrelated series and scan it instead of the
-    library that holds the new folder.
+    series title), older files' provider title, or else from the folder name,
+    so only those are offered. Alternate titles are deliberately NOT
+    offered: a series Kavita has not seen yet matches nothing under its own
+    name, and an alternate such as "Berserk" (for "Berserk of Gluttony") would
+    then pick an unrelated series and scan it instead of the library that
+    holds the new folder.
     """
     if series.root_folder is None:
         return
-    titles = [series.title, series.folder_name]
+    candidates = [series.title, series.folder_name, getattr(series, "provider_title", "")]
+    titles: list[str] = []
+    seen: set[str] = set()
+    for t in candidates:
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            titles.append(t)
     kavita.notify_import(values, series.root_folder_id, series.root_folder.path, titles)
 
 
@@ -893,7 +993,7 @@ async def _load_series(session: AsyncSession, series_id: int) -> Series | None:
         select(Series)
         .options(selectinload(Series.chapters), selectinload(Series.source_links),
                  selectinload(Series.root_folder), selectinload(Series.extra_folders))
-        .where(Series.id == series_id)
+        .where(Series.id == series_id, Series.deletion_pending.is_(False))
     )
     return result.scalar_one_or_none()
 
@@ -936,22 +1036,6 @@ async def enqueue_direct(
     return dl
 
 
-def magnet_btih_hex(magnet: str) -> str:
-    """The magnet's info-hash in the lowercase hex form qBittorrent reports.
-    Base32 hashes (older magnet links) are converted — matching against
-    qBittorrent by their raw form would never succeed."""
-    m = BTIH_RE.search(magnet)
-    if not m:
-        return ""
-    raw = m.group(1)
-    if len(raw) == 40:
-        return raw.lower()
-    try:
-        return base64.b32decode(raw).hex()
-    except (binascii.Error, ValueError):
-        return ""
-
-
 def torrent_save_path(base: str, category: str) -> str | None:
     """Return the category's final path without duplicating its suffix.
 
@@ -974,12 +1058,18 @@ def torrent_save_path(base: str, category: str) -> str | None:
 
 
 async def submit_torrent(magnet: str, values: dict[str, str]) -> str:
-    """Submit a magnet to qBittorrent and return its normalized info hash.
+    """Submit a magnet or torrent-file URL and return its normalized info hash.
 
     Kept separate from the database row creation so a failed torrent can be
     submitted again without replacing its Activity entry.
     """
-    torrent_hash = magnet_btih_hex(magnet)
+    torrent_data = None
+    if magnet.startswith(("http://", "https://")):
+        from ..download.torrent import fetch_torrent
+
+        magnet, torrent_hash, torrent_data = await fetch_torrent(magnet)
+    else:
+        torrent_hash = magnet_btih_hex(magnet)
     if not torrent_hash:
         raise ValueError("magnet link must include a valid btih info hash")
     client = QbtClient(
@@ -994,7 +1084,10 @@ async def submit_torrent(magnet: str, values: dict[str, str]) -> str:
         base = values.get("downloads_dir", "").strip() or await client.default_save_path()
         save_path = torrent_save_path(base, category)
         await client.ensure_category(category, save_path)
-        await client.add_magnet(magnet, category=category, save_path=save_path)
+        if torrent_data is not None:
+            await client.add_torrent(torrent_data, category=category, save_path=save_path)
+        else:
+            await client.add_magnet(magnet, category=category, save_path=save_path)
     finally:
         await client.close()
     return torrent_hash
@@ -1002,24 +1095,34 @@ async def submit_torrent(magnet: str, values: dict[str, str]) -> str:
 
 async def enqueue_torrent(
     session: AsyncSession, series: Series | None, magnet: str, title: str, values: dict[str, str],
+    source_name: str = "manual",
 ) -> Download:
+    if series is not None and not await _series_accepts_downloads(session, series.id):
+        raise DownloadCancelled("series no longer exists or is being deleted")
     torrent_hash = await submit_torrent(magnet, values)
     dl = Download(
         series_id=series.id if series else None,
         kind=DownloadKind.TORRENT,
         status=DownloadStatus.DOWNLOADING,
         title=title,
-        source_name="nyaa",
+        source_name=source_name,
         payload=magnet,
         torrent_hash=torrent_hash,
     )
     session.add(dl)
     session.add(HistoryEvent(
         series_id=series.id if series else None, event="grabbed",
-        source_name="nyaa", detail=title,
+        source_name=source_name, detail=title,
     ))
     await session.commit()
     return dl
+
+
+async def _series_accepts_downloads(session: AsyncSession, series_id: int) -> bool:
+    with session.no_autoflush:
+        return await session.scalar(
+            select(Series.id).where(Series.id == series_id, Series.deletion_pending.is_(False))
+        ) is not None
 
 
 @dataclass(frozen=True)
@@ -1029,9 +1132,10 @@ class AutomaticTorrentGrab:
 
 
 async def auto_grab_best_torrent(
-    session: AsyncSession, series: Series, values: dict[str, str]
+    session: AsyncSession, series: Series, values: dict[str, str],
+    *, only_monitored: bool = False,
 ) -> AutomaticTorrentGrab | None:
-    """Inspect Nyaa metadata and queue one best-coverage add-time release.
+    """Inspect torrent metadata and queue one best-coverage release.
 
     Returns the new download id and its expected chapter coverage. The id lets
     the caller distinguish this torrent from an older series-level download;
@@ -1043,11 +1147,14 @@ async def auto_grab_best_torrent(
         or not registry.enabled_torrent_indexers(values)
     ):
         return None
+    reason = await library_root_unavailable(session, series)
+    if reason:
+        log.warning("Not grabbing torrents for %r: %s", series.title, reason)
+        return None
     existing_download = await session.scalar(
         select(Download.id)
         .where(
             Download.series_id == series.id,
-            Download.chapter_id.is_(None),
             Download.status.in_([
                 DownloadStatus.QUEUED,
                 DownloadStatus.DOWNLOADING,
@@ -1058,23 +1165,34 @@ async def auto_grab_best_torrent(
     )
     if existing_download is not None:
         log.info(
-            "automatic torrent search skipped for %r: series download %d is in flight",
+            "automatic torrent search skipped for %r: download %d is in flight",
             series.title,
             existing_download,
         )
         return None
+    failures = (await session.execute(
+        select(Download.source_name, Download.payload, Download.torrent_hash).where(
+            Download.series_id == series.id,
+            Download.kind == DownloadKind.TORRENT,
+            failed_grab_blocks(datetime.now(timezone.utc), include_series=True),
+        )
+    )).all()
     try:
         max_gib = int(values.get("torrent_auto_max_size_gib", "30"))
         min_seeders = int(values.get("torrent_auto_min_seeders", "1"))
         selection = await select_best_torrent(
             series,
-            [chapter for chapter in series.chapters if not chapter.excluded],
+            [chapter for chapter in series.chapters
+             if not chapter.excluded and (chapter.monitored or not only_monitored)],
             registry.enabled_torrent_indexers(values),
             max_size_bytes=max_gib * 1024**3,
-            min_seeders=min_seeders,
+            min_seeders=max(1, min_seeders) if only_monitored else min_seeders,
+            values=values,
+            blocked_payloads={(source, payload) for source, payload, _ in failures},
+            blocked_hashes={info_hash.lower() for _, _, info_hash in failures if info_hash},
         )
     except Exception as exc:
-        log.warning("automatic torrent search failed for %r: %s", series.title, exc)
+        log.warning("automatic torrent search failed for %r: %s", series.title, safe_error_reason(exc))
         return None
     if selection is None:
         if not any(
@@ -1095,10 +1213,11 @@ async def auto_grab_best_torrent(
         return None
     try:
         download = await enqueue_torrent(
-            session, series, selection.release.magnet, selection.release.title, values
+            session, series, selection.release.magnet, selection.release.title, values,
+            source_name=selection.release.source_name
         )
     except Exception as exc:
-        log.warning("automatic torrent grab failed for %r: %s", series.title, exc)
+        log.warning("automatic torrent grab failed for %r: %s", series.title, safe_error_reason(exc))
         return None
     log.info(
         "automatic torrent selected %r for %r: %d chapter(s), %d seeder(s), %.2f GiB",
@@ -1134,6 +1253,8 @@ async def process_direct_queue() -> None:
 
 
 async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
+    from ..metadata_issues import load_archive_ownership, manual_archive_lock
+
     download_id = dl.id
     source_name = dl.source_name
     values = await registry.apply_settings(session)
@@ -1240,24 +1361,12 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
             last_progress_commit = now
             await session.commit()
 
-    dest: Path | None = None
-    dest_preexisted = False
-    try:
-        # inside the try: a broken naming template must fail THIS download
-        # (visibly, with an error) instead of crashing the queue worker and
-        # leaving the row stuck in "downloading"
-        dest = chapter_path(
-            Path(root),
-            values["naming_template"], values["naming_template_no_volume"],
-            series.title, series.folder_name,
-            chapter.number, chapter.volume, chapter.title,
-        )
-        # a template that drops precision can still map two chapters to one
-        # file; writing would silently replace the other chapter's archive
+    async def check_destination_owner(dest: Path) -> ArchiveVersion | None:
+        # A template that drops precision can map two chapters to one file.
         owner = await session.scalar(
             select(Chapter.number).where(
-                Chapter.series_id == series.id,
-                Chapter.id != chapter.id,
+                Chapter.series_id == series_id,
+                Chapter.id != chapter_id,
                 Chapter.file_path == str(dest),
             )
         )
@@ -1266,9 +1375,53 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
                 f"{dest.name} already holds chapter {owner:g}; "
                 "use a naming template that keeps chapter numbers distinct"
             )
-        dest_preexisted = dest.exists()
+        # Another series (or an alias) can map the same file; installing
+        # would replace that chapter's archive with this download.
+        try:
+            dest_stat = dest.stat()
+        except FileNotFoundError:
+            return None
+        ownership = await load_archive_ownership(session)
+        version = archive_version(dest_stat)
+        owners = ownership.owners.get(version[:2], set())
+        others = owners - {chapter_id}
+        if others or str(dest) in ownership.unavailable:
+            raise RuntimeError(
+                f"{dest.name} is mapped by another chapter or series; remap or rename "
+                "that file before downloading this chapter"
+            )
+        if not owners:
+            raise FileExistsError(f"{dest.name} already exists without a chapter mapping")
+        return version
+
+    def destination_path(directory: str) -> Path:
+        return chapter_path(
+            Path(directory),
+            values["naming_template"], values["naming_template_no_volume"],
+            series.title, series.folder_name,
+            chapter.number, chapter.volume, chapter.title,
+        )
+
+    staged: Path | None = None
+    download_task: asyncio.Task | None = None
+    try:
+        if dl.direct_install is not None:
+            async with series_lock(series_id), manual_archive_lock:
+                await ensure_not_cancelled(force=True)
+                if not await _recover_direct_install(session, dl):
+                    raise LibraryUnavailableError("could not recover the interrupted archive install")
+                await session.commit()
+        # inside the try: a broken naming template must fail THIS download
+        # (visibly, with an error) instead of crashing the queue worker and
+        # leaving the row stuck in "downloading"
+        dest = destination_path(root)
+        await check_destination_owner(dest)
+        # A scan must not adopt the download before the worker updates its
+        # mapping. Keep it on the destination filesystem for atomic install.
+        # Name it for the download so a retry overwrites what a crash left.
+        staged = dest.with_name(f".mangarr-direct-{download_id}.staged")
         download_task = asyncio.create_task(download_chapter_to_cbz(
-            source, dl.payload, series, chapter, dest,
+            source, dl.payload, series, chapter, staged,
             progress_cb=on_progress,
             cancel_cb=check_still_wanted,
             web_url="",
@@ -1292,47 +1445,51 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
                     f"stalled: no page finished for {stall_seconds / 60:g} minutes; "
                     "download cancelled so the queue can continue"
                 )
-        await ensure_not_cancelled(force=True)
+        async with series_lock(series_id), manual_archive_lock:
+            # A rename or manual mapping could have changed the current file
+            # while pages were in flight. Install against the current mapping.
+            await ensure_not_cancelled(force=True)
+            await session.refresh(chapter)
+            await session.refresh(series, ["root_folder_id", "root_folder", "folder_name", "title"])
+            if series.root_folder is None or destination_path(series.root_folder.path) != dest:
+                raise LibraryUnavailableError("the chapter destination changed while downloading")
+            expected_destination = await check_destination_owner(dest)
+            await finish_before_cancel(asyncio.create_task(_install_direct_download(
+                session, dl, series, chapter, staged, dest, check_still_wanted, expected_destination,
+            )))
     except DownloadCancelled as cancel_exc:
         await session.rollback()
-        if dest is not None and not dest_preexisted:
-            for path in (dest, dest.with_suffix(".cbz.partial")):
-                try:
-                    if path.exists():
-                        path.unlink()
-                except OSError as os_exc:
-                    log.warning("could not remove cancelled download artifact %s: %s", path, os_exc)
         current = await session.get(Download, download_id)
-        if current is not None and not (
-            current.status == DownloadStatus.FAILED and current.error == REMOVED_BY_USER
-        ):
-            current.status = DownloadStatus.FAILED
-            current.error = str(cancel_exc)
+        if current is not None and current.status == DownloadStatus.DOWNLOADING:
+            await session.execute(
+                sa_update(Download)
+                .where(Download.id == download_id, Download.status == DownloadStatus.DOWNLOADING)
+                .values(status=DownloadStatus.FAILED, error=str(cancel_exc))
+            )
             await session.commit()
         log.info("direct download %d cancelled: %s", download_id, cancel_exc)
         return
     except DuplicateChapterPagesError as duplicate:
-        # This is a source-listing alias, not a transient network failure. Keep
-        # the chapter as an excluded tombstone so refreshes cannot recreate or
-        # repeatedly fetch it. The guard runs before write_cbz, so no media
-        # artifact needs to be removed here.
+        # The duplicate check runs before the archive write. Only the failed
+        # release changes here, so any existing copy of the chapter stays intact.
         await session.rollback()
-        current_dl = await session.get(Download, download_id)
-        current_chapter = await session.get(Chapter, chapter_id)
-        if current_dl is None or current_chapter is None:
+        error = f"duplicate pages rejected: {duplicate}"[:500]
+        rejected = await session.execute(
+            sa_update(Download)
+            .where(Download.id == download_id, Download.status == DownloadStatus.DOWNLOADING)
+            .values(status=DownloadStatus.FAILED, error=error, transient_error=False)
+            .execution_options(synchronize_session=False)
+        )
+        if rejected.rowcount != 1:
+            await session.rollback()
             return
-        current_chapter.excluded = True
-        current_chapter.monitored = False
-        current_chapter.downloaded = False
-        current_chapter.file_path = ""
-        current_dl.status = DownloadStatus.FAILED
-        current_dl.error = f"duplicate pages rejected and chapter excluded: {duplicate}"[:500]
         session.add(HistoryEvent(
             series_id=series_id, chapter_id=chapter_id, event="duplicate_rejected",
-            source_name=source_name, detail=current_dl.error,
+            source_name=source_name, detail=error,
         ))
         await session.commit()
         log.warning("direct download %d rejected: %s", download_id, duplicate)
+        await _queue_duplicate_fallback(session, series_id, download_id, error)
         return
     except Exception as exc:
         # a library that went away mid-download is not a source failure: mark
@@ -1352,12 +1509,6 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         # a progress commit may have been cancelled mid-flight when the page
         # fetches were torn down; reset the session before recording failure
         await session.rollback()
-        if unavailable and dest is not None:
-            partial = dest.with_suffix(".cbz.partial")
-            try:
-                partial.unlink(missing_ok=True)
-            except OSError as os_exc:
-                log.warning("could not remove partial download %s: %s", partial, os_exc)
         dl = await session.get(Download, download_id)
         if dl is None:
             return
@@ -1390,6 +1541,156 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
         ))
         await session.commit()
         return
+    finally:
+        if download_task is not None and not download_task.done():
+            download_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await download_task
+        if staged is not None:
+            for artifact in (staged, staged.with_suffix(".cbz.partial")):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError as exc:
+                    log.warning("could not remove staged download artifact %s: %s", artifact, exc)
+
+    notifications.notify_import(values, series.id, f"Chapter {chapter.number:g}")
+    _notify_kavita(values, series)
+
+
+def _backup_direct_archive(dest: Path, backup: Path) -> None:
+    if dest.is_symlink():
+        # Preserve the link itself, including a relative target.
+        backup.symlink_to(os.readlink(dest))
+        return
+    try:
+        os.link(dest, backup)
+    except OSError:
+        shutil.copy2(dest, backup)
+
+
+def _direct_entry_version(path: Path) -> ArchiveVersion | None:
+    try:
+        return archive_version(path.lstat())
+    except FileNotFoundError:
+        if not path.parent.is_dir():
+            raise
+        return None
+
+
+def _remove_direct_backup(backup: Path) -> None:
+    if not backup.parent.parent.is_dir():
+        raise FileNotFoundError(f"download backup directory is unavailable: {backup.parent.parent}")
+    backup.unlink(missing_ok=True)
+    with suppress(FileNotFoundError):
+        backup.parent.rmdir()
+
+
+def _rollback_direct_archive(install: dict) -> None:
+    dest = Path(install["destination"])
+    current = _direct_entry_version(dest)
+    backup = Path(install["backup"]) if install["backup"] else None
+    if current == tuple(install["version"]):
+        if backup is None:
+            dest.unlink()
+        else:
+            if list(archive_version(backup.lstat())) != install["previous_versions"][-1]:
+                raise FileExistsError(f"previous archive changed after it was backed up: {backup}")
+            backup.replace(dest)
+    elif (backup is not None and list(current or ()) not in install["previous_versions"]
+          and os.path.lexists(backup)):
+        raise FileExistsError(f"{dest.name} changed after publication. Previous archive: {backup}")
+    if backup is not None:
+        _remove_direct_backup(backup)
+
+
+async def _recover_direct_install(session: AsyncSession, dl: Download) -> bool:
+    from ..metadata_issues import load_archive_ownership
+
+    install = dl.direct_install
+    assert install is not None
+    dest = Path(install["destination"])
+    try:
+        # An unmounted share can expose a different directory at the same
+        # path. Keep the journal until the recorded directory is accessible.
+        directory = await asyncio.to_thread(dest.parent.stat)
+        if list(archive_version(directory)[:2]) != install["directory"]:
+            raise FileNotFoundError(f"download directory changed: {dest.parent}")
+        if dl.status == DownloadStatus.DONE:
+            if install["backup"]:
+                await run_file_work(_remove_direct_backup, Path(install["backup"]))
+        else:
+            current = await asyncio.to_thread(_direct_entry_version, dest)
+            if current == tuple(install["version"]):
+                ownership = await load_archive_ownership(session)
+                if ownership.owners.get(current[:2], set()) - {dl.chapter_id}:
+                    raise FileExistsError("another chapter now maps the interrupted download")
+            await run_file_work(_rollback_direct_archive, install)
+    except OSError as exc:
+        log.warning("could not recover direct download %d at %s: %s", dl.id, install["destination"], exc)
+        return False
+    dl.direct_install = None
+    return True
+
+
+@asynccontextmanager
+async def _publish_direct_archive(
+    session: AsyncSession, dl: Download, staged: Path, dest: Path,
+    expected_destination: ArchiveVersion | None,
+    check_still_wanted: Callable[[], Awaitable[None]],
+):
+    """Publish for the database commit and undo our publication on failure."""
+    backup = None
+    previous_versions = []
+    keep_backup = False
+    try:
+        if expected_destination is not None:
+            original_entry = archive_version(dest.lstat())
+            backup = Path(mkdtemp(dir=dest.parent, prefix=".mangarr-direct-rollback-")) / "previous"
+            await run_file_work(_backup_direct_archive, dest, backup)
+            previous_versions = [list(original_entry), list(archive_version(backup.lstat()))]
+        await check_still_wanted()
+        install = {
+            "destination": str(dest.absolute()),
+            "directory": list(archive_version(dest.parent.stat())[:2]),
+            "version": list(archive_version(staged.lstat())),
+            "backup": str(backup.absolute()) if backup else None,
+            "previous_versions": previous_versions,
+        }
+        dl.direct_install = install
+        await session.commit()
+        await check_still_wanted()
+        if list(archive_version(staged.lstat())) != install["version"]:
+            raise FileExistsError(f"staged download changed while it was being installed: {staged.name}")
+        if backup is None:
+            publish_new_file(staged, dest)
+        else:
+            if (archive_version(dest.lstat()) != original_entry
+                    or archive_version(dest.stat()) != expected_destination):
+                raise FileExistsError(f"{dest.name} changed while the download was being installed")
+            staged.replace(dest)
+        try:
+            yield
+        except Exception:
+            try:
+                await run_file_work(_rollback_direct_archive, install)
+            except OSError as exc:
+                keep_backup = True
+                log.warning("could not roll back uncommitted download at %s: %s", dest, exc)
+            raise
+    finally:
+        if backup is not None and not keep_backup:
+            try:
+                _remove_direct_backup(backup)
+            except OSError as exc:
+                log.warning("could not clean up download backup %s: %s", backup, exc)
+
+
+async def _install_direct_download(
+    session: AsyncSession, dl: Download, series: Series, chapter: Chapter, staged: Path, dest: Path,
+    check_still_wanted: Callable[[], Awaitable[None]],
+    expected_destination: ArchiveVersion | None = None,
+) -> None:
+    from ..metadata_issues import load_archive_ownership
 
     # a file mangarr fetched itself is replaced outright; anything else (the
     # user's own files, a shared volume archive) stays where it is
@@ -1398,38 +1699,59 @@ async def _run_direct_download(session: AsyncSession, dl: Download) -> None:
     discard_replaced = bool(
         replaced and replaced != str(dest)
         and replaced_source in registry.DIRECT_SOURCES
-        and not any(
-            c.file_path == replaced for c in series.chapters if c.id != chapter.id
-        )
     )
-    chapter.downloaded = True
-    chapter.file_path = str(dest)
-    chapter.file_source = source_name
-    chapter.file_group = dl.release_group
-    dl.status = DownloadStatus.DONE
-    dl.progress = 1.0
-    dl.error = ""
-    session.add(HistoryEvent(
-        series_id=series.id, chapter_id=chapter.id, event="imported",
-        source_name=dl.source_name, detail=str(dest),
-    ))
-    if replaced:
-        session.add(HistoryEvent(
-            series_id=series.id, chapter_id=chapter.id, event="upgraded",
-            source_name=dl.source_name,
-            detail=(
-                f"from {replaced_source or 'an existing file'}; previous file "
-                f"{'removed' if discard_replaced else 'kept'}: {replaced}"
-            ),
-        ))
-    await session.commit()
+    replaced_version = None
     if discard_replaced:
+        # Match owners by inode, like every other ownership check: another
+        # chapter can reach this archive through a symlink or another path
+        # spelling, and a re-syncing series still claims its archives.
+        ownership = await load_archive_ownership(session)
+        replaced_version = ownership.versions.get(replaced)
+        discard_replaced = (
+            replaced_version is not None
+            and ownership.owners.get(replaced_version[:2]) == {chapter.id}
+        )
+    async with _publish_direct_archive(session, dl, staged, dest, expected_destination, check_still_wanted):
+        completion = {"status": DownloadStatus.DONE, "progress": 1.0, "error": ""}
+        # Keep the journal for replacements until recovery can verify that
+        # any backup left between the commit and cleanup has been removed.
+        if expected_destination is None:
+            completion["direct_install"] = None
+        claimed = await session.execute(
+            sa_update(Download)
+            .where(Download.id == dl.id, Download.status == DownloadStatus.DOWNLOADING)
+            .values(**completion)
+            .execution_options(synchronize_session="evaluate")
+        )
+        if claimed.rowcount != 1:
+            raise DownloadCancelled("download left the active queue before installation completed")
+        chapter.downloaded = True
+        chapter.file_path = str(dest)
+        chapter.file_source = dl.source_name
+        chapter.file_group = dl.release_group
+        session.add(HistoryEvent(
+            series_id=series.id, chapter_id=chapter.id, event="imported",
+            source_name=dl.source_name, detail=str(dest),
+        ))
+        if replaced:
+            session.add(HistoryEvent(
+                series_id=series.id, chapter_id=chapter.id, event="upgraded",
+                source_name=dl.source_name,
+                detail=(
+                    f"from {replaced_source or 'an existing file'}; previous file "
+                    f"{'removed' if discard_replaced else 'kept'}: {replaced}"
+                ),
+            ))
+        await session.commit()
+    if discard_replaced:
+        previous = Path(replaced)
         try:
-            Path(replaced).unlink(missing_ok=True)
+            if archive_version(previous.stat()) == replaced_version:
+                previous.unlink()
+        except FileNotFoundError:
+            pass
         except OSError as exc:
             log.warning("could not remove replaced file %s: %s", replaced, exc)
-    notifications.notify_import(values, series.id, f"Chapter {chapter.number:g}")
-    _notify_kavita(values, series)
 
 
 # --------------------------------------------------------------- qbt sync
@@ -1554,22 +1876,55 @@ async def sync_qbittorrent() -> None:
 
 def _place_torrent_files(content_path, series, chapters, *args, **kwargs):
     """Place files and resolve shared-archive ownership off the event loop."""
-    placed = import_torrent_payload(content_path, series, chapters, *args, **kwargs)
+    versions: dict[Path, ArchiveVersion] = {}
+    placed = import_torrent_payload(
+        content_path, series, chapters, *args, **kwargs, destination_versions=versions,
+    )
     # Unknown imports retain decorations from the series title. Re-parsing
     # those names could turn a title such as C3 into invented ownership.
     shared = [dest for dest, chapter, volume in placed if chapter is None
               and (volume is not None or parse_filename(dest.stem).is_range)]
     matches = match_files(
-        [media for dest in shared for media in find_media_files(dest)], chapters
+        [media for dest in shared for media in find_media_files(dest, include_pdfs=False)], chapters
     )
     coverage = {str(m.media.path): [c.id for c in m.covered_chapters] for m in matches.matched}
-    return placed, coverage
+    return placed, coverage, versions
+
+
+def _check_torrent_destinations(versions: dict[Path, ArchiveVersion]) -> None:
+    for path, version in versions.items():
+        if archive_version(path.stat()) != version:
+            raise FileNotFoundError(f"library archive changed while importing: {path}")
+
+
+def _torrent_payload_overlaps_library(
+    content_path: Path, library_paths: set[Path], files: list[Path] | None,
+) -> bool:
+    """Whether a torrent can read metadata from an existing library archive."""
+    try:
+        library_dirs = {path.resolve() for path in library_paths}
+        if files is not None:
+            return any(
+                path.is_relative_to(folder)
+                for path in (file.resolve() for file in files)
+                for folder in library_dirs
+            )
+        payload = content_path.resolve()
+        return any(
+            payload.is_relative_to(folder) or folder.is_relative_to(payload)
+            for folder in library_dirs
+        )
+    except (OSError, RuntimeError):
+        # Let the importer handle path errors with the usual retry policy.
+        return True
 
 
 async def _import_torrent(
     session: AsyncSession, dl: Download, content_path: Path, values: dict[str, str],
     files: list[Path] | None = None,
 ) -> None:
+    from ..metadata_issues import manual_archive_lock
+
     series = await _load_series(session, dl.series_id) if dl.series_id else None
     if series is None or not series.root_folder:
         dl.status = DownloadStatus.FAILED
@@ -1598,112 +1953,136 @@ async def _import_torrent(
             dl.error = f"content path not found: {content_path}"
         await session.commit()
         return
-    # copy mode, a cross-device hardlink fallback and image packing rewrite
-    # every byte (and the duplicate preflight reads every archive); for a
-    # multi-GB payload that would freeze the API, the queue and this sync, so
-    # it runs off the loop. ORM objects aren't thread-safe: the importer gets
-    # plain snapshots, and the chapters it matched are mapped back to this
-    # session's objects for the updates below.
-    candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
-    try:
+    # The caller holds the destination series lock throughout, but a legacy
+    # payload can also be repaired in another series' root or extra folder.
+    library_root = Path(series.root_folder.path)
+    library_paths = {Path(path) for path in await session.scalars(select(RootFolder.path))}
+    extra_folders = await session.execute(
+        select(RootFolder.path, SeriesFolder.path)
+        .select_from(SeriesFolder)
+        .join(Series, Series.id == SeriesFolder.series_id)
+        .join(RootFolder, RootFolder.id == Series.root_folder_id)
+    )
+    library_paths.update(Path(root) / folder for root, folder in extra_folders)
+    protects_inputs = await asyncio.to_thread(
+        _torrent_payload_overlaps_library, content_path, library_paths, files,
+    )
+    async with AsyncExitStack() as archive_guard:
+        if protects_inputs:
+            await archive_guard.enter_async_context(manual_archive_lock)
+
+        # copy mode, a cross-device hardlink fallback and image packing rewrite
+        # every byte (and the duplicate preflight reads every archive); for a
+        # multi-GB payload that would freeze the API, the queue and this sync, so
+        # it runs off the loop. ORM objects aren't thread-safe: the importer gets
+        # plain snapshots, and the chapters it matched are mapped back to this
+        # session's objects for the updates below.
+        candidates = {chapter.id: chapter for chapter in series.chapters if not chapter.excluded}
         try:
-            placed, coverage = await asyncio.to_thread(
-                _place_torrent_files,
-                content_path,
-                SimpleNamespace(title=series.title, folder_name=series.folder_name),
-                [
-                    SimpleNamespace(id=chapter.id, number=chapter.number,
-                                    volume=chapter.volume, title=chapter.title,
-                                    downloaded=chapter.downloaded, file_path=chapter.file_path)
-                    for chapter in candidates.values()
-                ],
-                Path(series.root_folder.path),
-                values["naming_template"], values["naming_template_no_volume"],
-                import_mode=values.get("import_mode", "hardlink"), files=files,
-            )
-        except Exception:
-            # the queue stays usable while the worker runs, so the user may
-            # have removed this download meanwhile (which also deletes the
-            # payload, failing the import): their removal stands
-            await _raise_if_download_removed(session, dl.id)
-            raise
-        await _raise_if_download_removed(session, dl.id)
-    except DownloadCancelled as cancelled:
-        # `dl` still holds the pre-import status; writing anything here would
-        # undo the removal. Files the import already placed stay in the
-        # library unrecorded, as after any import that stops partway; a
-        # rescan or a later grab of the chapter picks them up.
-        _import_path_missing_counts.pop(dl.id, None)
-        log.info("torrent import %d discarded: %s", dl.id, cancelled)
-        return
-    except FileNotFoundError as exc:
-        # qBittorrent may finish downloading and then atomically move the
-        # payload from its temporary directory to the category directory.
-        # A move between discovery and hardlink/copy is transient: let the
-        # next sync fetch the torrent's new content_path and retry.  Import is
-        # idempotent because already-created destinations are not overwritten.
-        misses = _import_path_missing_counts.get(dl.id, 0) + 1
-        _import_path_missing_counts[dl.id] = misses
-        if misses >= IMPORT_PATH_MISSING_LIMIT:
+            if protects_inputs:
+                await _raise_if_download_removed(session, dl.id)
+            try:
+                placed, coverage, versions = await run_file_work(
+                    _place_torrent_files,
+                    content_path,
+                    SimpleNamespace(title=series.title, folder_name=series.folder_name),
+                    [
+                        SimpleNamespace(id=chapter.id, number=chapter.number,
+                                        volume=chapter.volume, title=chapter.title,
+                                        downloaded=chapter.downloaded, file_path=chapter.file_path)
+                        for chapter in candidates.values()
+                    ],
+                    library_root,
+                    values["naming_template"], values["naming_template_no_volume"],
+                    import_mode=values.get("import_mode", "hardlink"), files=files,
+                )
+                # External copies run without the archive lock. Recheck the
+                # installed versions under it before publishing their mappings.
+                if not protects_inputs:
+                    await archive_guard.enter_async_context(manual_archive_lock)
+                await asyncio.to_thread(_check_torrent_destinations, versions)
+                await _raise_if_download_removed(session, dl.id)
+            except Exception:
+                # the queue stays usable while the worker runs, so the user may
+                # have removed this download meanwhile (which also deletes the
+                # payload, failing the import): their removal stands
+                await _raise_if_download_removed(session, dl.id)
+                raise
+        except DownloadCancelled as cancelled:
+            # `dl` still holds the pre-import status; writing anything here would
+            # undo the removal. Files the import already placed stay in the
+            # library unrecorded, as after any import that stops partway; a
+            # rescan or a later grab of the chapter picks them up.
             _import_path_missing_counts.pop(dl.id, None)
+            log.info("torrent import %d discarded: %s", dl.id, cancelled)
+            return
+        except FileNotFoundError as exc:
+            # qBittorrent may finish downloading and then atomically move the
+            # payload from its temporary directory to the category directory.
+            # A move between discovery and hardlink/copy is transient: let the
+            # next sync fetch the torrent's new content_path and retry.  Import is
+            # idempotent because already-created destinations are not overwritten.
+            misses = _import_path_missing_counts.get(dl.id, 0) + 1
+            _import_path_missing_counts[dl.id] = misses
+            if misses >= IMPORT_PATH_MISSING_LIMIT:
+                _import_path_missing_counts.pop(dl.id, None)
+                dl.status = DownloadStatus.FAILED
+                dl.error = (f"content kept disappearing during import: {exc} — "
+                            "check qBittorrent's temporary and category paths")[:500]
+                log.exception("torrent import %d repeatedly lost its content path", dl.id)
+            else:
+                dl.status = DownloadStatus.DOWNLOADING
+                dl.error = f"content moved during import; retrying: {exc}"[:500]
+                log.info("torrent import %d content moved; retrying on next sync", dl.id)
+            await session.commit()
+            return
+        except Exception as exc:
+            log.exception("torrent import %d failed", dl.id)
             dl.status = DownloadStatus.FAILED
-            dl.error = (f"content kept disappearing during import: {exc} — "
-                        "check qBittorrent's temporary and category paths")[:500]
-            log.exception("torrent import %d repeatedly lost its content path", dl.id)
-        else:
-            dl.status = DownloadStatus.DOWNLOADING
-            dl.error = f"content moved during import; retrying: {exc}"[:500]
-            log.info("torrent import %d content moved; retrying on next sync", dl.id)
+            dl.error = str(exc)[:500]
+            await session.commit()
+            return
+        _import_path_missing_counts.pop(dl.id, None)
+        imported = [
+            (dest, candidates[match.id] if match is not None else None, volume)
+            for dest, match, volume in placed
+        ]
+        for dest, chapter, _volume in imported:
+            if chapter is not None:
+                # Keep the origin of a file the import found already mapped.
+                if not chapter.downloaded or chapter.file_path != str(dest):
+                    chapter.file_path = str(dest)
+                    chapter.file_source = dl.source_name or "nyaa"
+                chapter.downloaded = True
+            else:
+                for chapter_id in coverage.get(str(dest), []):
+                    ch = candidates[chapter_id]
+                    if not ch.downloaded:
+                        ch.downloaded = True
+                        # Assign file_source after file_path resets provenance.
+                        ch.file_path = str(dest)
+                        ch.file_source = dl.source_name or "nyaa"
+        dl.status = DownloadStatus.DONE
+        dl.progress = 1.0
+        dl.error = ""
+        session.add(HistoryEvent(
+            series_id=series.id, event="imported", source_name=dl.source_name or "nyaa",
+            detail=f"{len(imported)} file(s) from {dl.title}",
+        ))
         await session.commit()
-        return
-    except Exception as exc:
-        log.exception("torrent import %d failed", dl.id)
-        dl.status = DownloadStatus.FAILED
-        dl.error = str(exc)[:500]
-        await session.commit()
-        return
-    _import_path_missing_counts.pop(dl.id, None)
-    imported = [
-        (dest, candidates[match.id] if match is not None else None, volume)
-        for dest, match, volume in placed
-    ]
-    for dest, chapter, volume in imported:
-        if chapter is not None:
-            # a destination that already was this chapter's file keeps its
-            # recorded origin — the import found it rather than placed it
-            if not chapter.downloaded or chapter.file_path != str(dest):
-                chapter.file_path = str(dest)
-                chapter.file_source = "nyaa"
-            chapter.downloaded = True
-        else:
-            for chapter_id in coverage.get(str(dest), []):
-                ch = candidates[chapter_id]
-                if not ch.downloaded:
-                    ch.downloaded = True
-                    # set after file_path: assigning it resets provenance
-                    ch.file_path = str(dest)
-                    ch.file_source = "nyaa"
-    dl.status = DownloadStatus.DONE
-    dl.progress = 1.0
-    dl.error = ""
-    session.add(HistoryEvent(
-        series_id=series.id, event="imported", source_name="nyaa",
-        detail=f"{len(imported)} file(s) from {dl.title}",
-    ))
-    await session.commit()
     notifications.notify_import(values, series.id, f"{len(imported)} file(s) from torrent")
     _notify_kavita(values, series)
 
 
 # ------------------------------------------------------------ monitor loop
 
-def failed_grab_blocks(now: datetime):
+def failed_grab_blocks(now: datetime, *, include_series: bool = False):
     """Filter for FAILED downloads that still keep the monitor from retrying
     their chapter on their source. The queue keeps these visible too, so a
     block never outlasts its entry in Activity."""
     return and_(
         Download.status == DownloadStatus.FAILED,
-        Download.chapter_id.isnot(None),
+        *([] if include_series else [Download.chapter_id.isnot(None)]),
         Download.error != REMOVED_BY_USER,
         # stopped before the source was asked: not the source's failure
         *(~Download.error.startswith(prefix) for prefix in NOT_SOURCE_FAILURES),
@@ -1715,12 +2094,83 @@ def failed_grab_blocks(now: datetime):
     )
 
 
+async def _queue_duplicate_fallback(
+    session: AsyncSession, series_id: int, download_id: int, error: str,
+) -> None:
+    # Share the monitor and refresh lock so automatic grabs cannot race the
+    # fallback. The rejection is already committed before any provider calls.
+    lock = await acquire_series_lock(series_id)
+    try:
+        failed = await session.get(Download, download_id, populate_existing=True)
+        if failed is None or failed.status != DownloadStatus.FAILED or failed.error != error:
+            return
+        series = await _load_series(session, series_id)
+        if series is not None:
+            values = await registry.apply_settings(session)
+            # The original attempt may have been explicitly requested.
+            await grab_missing_chapters(
+                session, series, values, only_monitored=False, fallback_from=failed,
+            )
+    except Exception:
+        await session.rollback()
+        log.exception("could not queue fallback for direct download %d", download_id)
+    finally:
+        lock.release()
+
+
+async def _claim_duplicate_fallback(
+    session: AsyncSession, failed: Download, series: Series, chapter: Chapter,
+    link: SeriesSourceLink,
+) -> bool:
+    # The API can change the queue, chapter, or source policy during reader
+    # verification. Keep SQLite's write lock from this recheck through commit.
+    still_failed = select(Download.id).where(
+        Download.id == failed.id,
+        Download.status == DownloadStatus.FAILED,
+        Download.error == failed.error,
+    ).exists()
+    active = select(Download.id).where(
+        Download.series_id == series.id,
+        or_(Download.chapter_id == chapter.id, Download.chapter_id.is_(None)),
+        Download.status.in_(ACTIVE_DOWNLOAD_STATUSES),
+    ).exists()
+    same_policy = select(Series.id).where(
+        Series.id == series.id,
+        Series.deletion_pending.is_(False),
+        Series.source_priority == series.source_priority,
+        Series.blocked_sources == series.blocked_sources,
+        Series.preferred_groups == series.preferred_groups,
+        Series.blocked_groups == series.blocked_groups,
+    ).exists()
+    same_link = select(SeriesSourceLink.id).where(
+        SeriesSourceLink.series_id == series.id,
+        SeriesSourceLink.source_name == link.source_name,
+        SeriesSourceLink.external_id == link.external_id,
+    ).exists()
+    result = await session.execute(
+        sa_update(Chapter)
+        .where(Chapter.id == chapter.id, Chapter.series_id == series.id,
+               ~Chapter.excluded, ~Chapter.downloaded,
+               still_failed, ~active, same_policy, same_link)
+        .values(excluded=Chapter.excluded)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 1:
+        enabled = await settings_service.get(session, f"source_{link.source_name}_enabled")
+        if enabled == "true":
+            return True
+    await session.rollback()
+    return False
+
+
 async def grab_missing_chapters(
     session: AsyncSession, series: Series, values: dict[str, str],
     only_monitored: bool = True,
     chapter_cache: ChapterListCache | None = None,
     exclude_numbers: set[float] | None = None,
     allowed_series_download_id: int | None = None,
+    *,
+    fallback_from: Download | None = None,
 ) -> int:
     """Queue missing monitored chapters from linked direct sources.
 
@@ -1728,6 +2178,7 @@ async def grab_missing_chapters(
     so a newly added series starts pulling available chapters as soon as its
     source links and chapter list have been created. `only_monitored=False`
     (explicit user-requested search) also grabs unmonitored missing chapters.
+    A duplicate fallback is limited to the failed download's chapter.
     """
     if series.root_folder is None:
         # e.g. its root folder was deleted: the worker could only fail every
@@ -1743,11 +2194,7 @@ async def grab_missing_chapters(
     result = await session.execute(
         select(Download.id, Download.chapter_id).where(
             Download.series_id == series.id,
-            Download.status.in_([
-                DownloadStatus.QUEUED,
-                DownloadStatus.DOWNLOADING,
-                DownloadStatus.IMPORTING,
-            ]),
+            Download.status.in_(ACTIVE_DOWNLOAD_STATUSES),
         )
     )
     active_rows = result.all()
@@ -1772,8 +2219,11 @@ async def grab_missing_chapters(
         and not c.downloaded
         and c.id not in active_chapters
         and c.number not in excluded
+        and (fallback_from is None or c.id == fallback_from.chapter_id)
     ]
     sources = registry.series_direct_sources(values, series)
+    if fallback_from is not None:
+        sources = [src for src in sources if src.name != fallback_from.source_name]
     source_order = [src.name for src in sources]
     upgrades = {
         number: chapter
@@ -1782,7 +2232,7 @@ async def grab_missing_chapters(
             skip_ids=active_chapters,
         ).items()
         if number not in excluded
-    }
+    } if fallback_from is None else {}
     if not wanted and not upgrades:
         return 0
 
@@ -1850,13 +2300,30 @@ async def grab_missing_chapters(
                     continue
                 if sc.number in remaining or is_upgrade(ch, src.name, source_order, blocked_groups):
                     candidates.append(sc.external_id)
-            verified = await src.verify_chapters(candidates)
+            if not candidates:
+                continue
+            try:
+                verified = await src.verify_chapters(candidates)
+            except Exception as exc:
+                if fallback_from is None:
+                    raise
+                _note_source_failure(src.name, exc)
+                log.warning("fallback: %s verification failed for %r: %s",
+                            src.name, series.title, type(exc).__name__)
+                continue
             source_chapters = [sc for sc in source_chapters if sc.external_id in verified]
+        # A long source lookup can outlive a deferred delete of this series.
+        if not await _series_accepts_downloads(session, series.id):
+            break
         for sc in source_chapters:
             ch = remaining.get(sc.number)
             if ch is not None:
                 if has_blocking_failure(ch, sc):
                     continue
+                if fallback_from is not None and not await _claim_duplicate_fallback(
+                    session, fallback_from, series, ch, link,
+                ):
+                    return 0
                 remaining.pop(sc.number, None)
                 await enqueue_direct(session, series, ch, src.name, sc.external_id, sc.url,
                                      commit=False, group=sc.group)
@@ -1887,6 +2354,20 @@ async def grab_missing_chapters(
     return queued
 
 
+def _merge_input_versions(
+    chapters: list[Chapter], ownership: "ArchiveOwnership",
+) -> dict[str, ArchiveVersion] | None:
+    """Require a distinct physical archive owned by each chapter."""
+    versions = {}
+    for chapter in chapters:
+        path = chapter.file_path
+        version = ownership.versions.get(path)
+        if version is None or ownership.owners.get(version[:2]) != {chapter.id}:
+            return None
+        versions[path] = version
+    return versions
+
+
 async def merge_complete_volumes(
     session: AsyncSession, series: Series, values: dict[str, str], force: bool = False,
 ) -> list[int]:
@@ -1909,60 +2390,129 @@ async def merge_complete_volumes(
             ]),
         )
     )).scalars().all())
+    from ..metadata_issues import detect_series_issues, load_archive_ownership, manual_archive_lock
+
     merged: list[int] = []
+    if not mergeable_volumes(series, series.chapters, busy):
+        return merged
+    # Another series can map the same chapter archive. Packing can take a
+    # long time, so it runs outside the global archive lock; ownership is
+    # checked again under the lock before the merge is published.
+    snapshot = await load_archive_ownership(session)
     for volume, members in mergeable_volumes(series, series.chapters, busy).items():
-        dest = folders[0] / volume_filename(series_folder(series.title), volume)
-        try:
-            await asyncio.to_thread(
-                merge_chapter_archives,
-                [(c.number, Path(c.file_path)) for c in members],
-                dest, series.title, volume,
-                series.description if volume == 1 else "",
-            )
-        except Exception as exc:
-            log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
+        originals = _merge_input_versions(members, snapshot)
+        if originals is None:
+            log.info("merge of %r volume %d skipped: a chapter file is shared or unavailable",
+                     series.title, volume)
             continue
-        old_paths = [c.file_path for c in members]
-        for chapter in members:
-            chapter.file_path = str(dest)
-            chapter.file_source = MERGED_FILE_SOURCE
-        session.add(HistoryEvent(
-            series_id=series.id, event="merged",
-            detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
-        ))
-        await session.commit()
-        for old in old_paths:
-            if old == str(dest):
-                continue
+        dest = folders[0] / volume_filename(series_folder(series.title), volume)
+        if dest.exists():
+            log.warning("merge of %r volume %d skipped: %s already exists", series.title, volume, dest)
+            continue
+        # Pack under a hidden, non-media name that scans never adopt, named for
+        # the volume so a retry replaces whatever an interrupted attempt left.
+        staged = dest.with_name(f".mangarr-merge-{series.id}-{volume}.staged")
+        localized_series = (
+            series.provider_title
+            if series.provider_title and series.title != series.provider_title
+            else None
+        )
+        try:
+            staged.unlink(missing_ok=True)
             try:
-                Path(old).unlink(missing_ok=True)
-            except OSError as exc:
-                log.warning("could not remove merged chapter file %s: %s", old, exc)
+                await run_file_work(
+                    merge_chapter_archives,
+                    [(c.number, Path(c.file_path)) for c in members],
+                    staged, series.title, volume,
+                    series.description if volume == 1 else "",
+                    localized_series=localized_series,
+                )
+            except Exception as exc:
+                log.warning("merge of %r volume %d skipped: %s", series.title, volume, exc)
+                continue
+            async with manual_archive_lock:
+                current = _merge_input_versions(members, await load_archive_ownership(session))
+                if current != originals:
+                    log.info("merge of %r volume %d discarded: an input archive changed",
+                             series.title, volume)
+                    continue
+                try:
+                    publish_new_file(staged, dest)
+                except FileExistsError:
+                    log.warning("merge of %r volume %d discarded: %s appeared meanwhile",
+                                series.title, volume, dest)
+                    continue
+                cancelled = None
+                try:
+                    for chapter in members:
+                        chapter.file_path = str(dest)
+                        chapter.file_source = MERGED_FILE_SOURCE
+                    session.add(HistoryEvent(
+                        series_id=series.id, event="merged",
+                        detail=f"Volume {volume}: {len(members)} chapter file(s) -> {dest.name}",
+                    ))
+                    # SQLite can finish a commit after the caller is cancelled.
+                    # Hold the lock until the commit outcome is known.
+                    commit = asyncio.create_task(session.commit())
+                    while not commit.done():
+                        try:
+                            await asyncio.shield(commit)
+                        except asyncio.CancelledError as exc:
+                            cancelled = exc
+                    commit.result()
+                except Exception:
+                    dest.unlink(missing_ok=True)
+                    if cancelled is not None:
+                        raise cancelled
+                    raise
+                for old, version in originals.items():
+                    path = Path(old)
+                    try:
+                        if archive_version(path.stat()) == version:
+                            path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        log.warning("could not remove merged chapter file %s: %s", old, exc)
+                if cancelled is not None:
+                    raise cancelled
+        finally:
+            staged.unlink(missing_ok=True)
         merged.append(volume)
     if merged:
         log.info("Merged volume(s) %s of %r", merged, series.title)
+        # The chapter archives are gone; drop their warnings now rather than
+        # listing repairs for missing files until the next scan.
+        async with manual_archive_lock:
+            await detect_series_issues(session, series)
+            await session.commit()
+    if merged:
         _notify_kavita(values, series)
     return merged
 
 
 async def recover_interrupted_downloads() -> None:
-    """Startup pass: direct downloads left mid-flight by a crash/restart go
-    back to queued (the worker only picks up QUEUED, so they would otherwise
-    sit in 'downloading' forever — and block re-grabs of their chapters)."""
-    async with session_scope() as session:
+    """Reconcile interrupted archive installs and put active downloads back in the queue."""
+    from ..metadata_issues import manual_archive_lock
+
+    async with manual_archive_lock, session_scope() as session:
         result = await session.execute(
             select(Download).where(
                 Download.kind == DownloadKind.DIRECT,
-                Download.status == DownloadStatus.DOWNLOADING,
+                or_(Download.status == DownloadStatus.DOWNLOADING, Download.direct_install.is_not(None)),
             )
         )
-        stuck = result.scalars().all()
-        for dl in stuck:
-            dl.status = DownloadStatus.QUEUED
-            dl.progress = 0.0
-        if stuck:
-            await session.commit()
-            log.info("Requeued %d direct download(s) interrupted by restart", len(stuck))
+        requeued = 0
+        for dl in result.scalars():
+            if dl.direct_install is not None:
+                await _recover_direct_install(session, dl)
+            if dl.status == DownloadStatus.DOWNLOADING:
+                dl.status = DownloadStatus.QUEUED
+                dl.progress = 0.0
+                requeued += 1
+        await session.commit()
+        if requeued:
+            log.info("Requeued %d direct download(s) interrupted by restart", requeued)
 
 
 def _checked_within(series: Series, days: int) -> bool:
@@ -1988,9 +2538,12 @@ def _finished_series_policy(values: dict[str, str]) -> tuple[str, int]:
 async def monitor_all() -> None:
     """Refresh monitored series and grab missing monitored chapters."""
     async with session_scope() as session:
-        result = await session.execute(select(Series.id).where(Series.monitored == True))  # noqa: E712
+        result = await session.execute(select(Series.id).where(
+            Series.monitored.is_(True), Series.deletion_pending.is_(False),
+        ))
         series_ids = [row[0] for row in result.all()]
 
+    scanned_ids = []
     for series_id in series_ids:
         lock = await try_acquire_series_lock(series_id)
         if lock is None:
@@ -2024,11 +2577,14 @@ async def monitor_all() -> None:
                     # adopt whatever is on disk before deciding what's missing, so
                     # files that appeared since the last pass aren't re-downloaded
                     try:
-                        await scan_series_folder(session, series)
+                        if await scan_series_folder(session, series, scan_issues=False):
+                            scanned_ids.append(series_id)
                     except Exception as exc:
                         log.warning("library scan failed for series %d: %s", series_id, exc)
                     await grab_missing_chapters(session, series, values,
                                                 chapter_cache=chapter_cache)
+                    if values.get("torrent_monitor_enabled") == "true":
+                        await auto_grab_best_torrent(session, series, values, only_monitored=True)
                     try:
                         await merge_complete_volumes(session, series, values)
                     except Exception as exc:
@@ -2055,3 +2611,4 @@ async def monitor_all() -> None:
                 log.exception("monitor pass failed for series %d", series_id)
         finally:
             lock.release()
+    await _scan_metadata_issues(scanned_ids)

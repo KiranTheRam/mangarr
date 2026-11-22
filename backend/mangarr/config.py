@@ -17,9 +17,10 @@ class AppConfig(BaseSettings):
     log_level: str = "INFO"
     # When unset, an API key is generated on first run and stored in data_dir/api_key
     api_key: str | None = None
-    # Opt-in browser HTTP Basic login. API clients continue using X-Api-Key.
+    # Browser login credentials. API clients continue using X-Api-Key.
     auth_username: str = ""
     auth_password: SecretStr = SecretStr("")
+    allow_unauthenticated_browser: bool = False
     # Additional exact DNS names (JSON array); IP literals and localhost work
     # without configuration. Never infer trusted hosts from forwarded headers.
     allowed_hosts: list[str] = []

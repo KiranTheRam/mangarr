@@ -11,6 +11,7 @@ import SeriesDetail from "./pages/SeriesDetail";
 import Activity from "./pages/Activity";
 import Wanted from "./pages/Wanted";
 import Settings from "./pages/Settings";
+import Issues from "./pages/Issues";
 
 export default function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -28,6 +29,7 @@ export default function App() {
           <Route path="/series/:id" element={<SeriesDetail />} />
           <Route path="/activity" element={<Activity />} />
           <Route path="/wanted" element={<Wanted />} />
+          <Route path="/issues" element={<Issues />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

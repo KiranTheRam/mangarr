@@ -52,6 +52,18 @@ class TestBuildComicinfo:
         assert root.find("Number") is None
         assert root.find("Volume") is None
         assert root.find("Summary") is None
+        assert root.find("LocalizedSeries") is None
+
+    def test_localized_series_included_when_provided(self):
+        root = fromstring(build_comicinfo("Attack on Titan", localized_series="Shingeki no Kyojin"))
+        assert root.findtext("Series") == "Attack on Titan"
+        assert root.findtext("LocalizedSeries") == "Shingeki no Kyojin"
+
+    def test_localized_series_omitted_when_none_or_empty(self):
+        root = fromstring(build_comicinfo("Attack on Titan", localized_series=None))
+        assert root.find("LocalizedSeries") is None
+        root2 = fromstring(build_comicinfo("Attack on Titan", localized_series=""))
+        assert root2.find("LocalizedSeries") is None
 
 
 class TestWriteCbz:

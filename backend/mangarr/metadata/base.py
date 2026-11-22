@@ -7,6 +7,7 @@ class SeriesMetadata:
     provider: str
     provider_id: str
     title: str
+    titles: dict[str, str] = field(default_factory=dict)
     alt_titles: list[str] = field(default_factory=list)
     description: str = ""
     status: str = "unknown"  # matches models.SeriesStatus values
