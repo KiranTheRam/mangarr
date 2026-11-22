@@ -235,6 +235,24 @@ cd backend && .venv/bin/python -m pytest
 `npm run build` writes the production bundle to `backend/static/`, which the
 FastAPI app serves when present.
 
+## Backend dependency lock
+
+`backend/requirements.txt` is the pinned dependency lock file for the backend, which also pins the build backend.
+The Docker image verifies hashes from this lock file and from
+`backend/requirements-pip.txt`, which pins the installer. Local development
+installs (`pip install -e '.[dev]'`) and CI resolve dependencies from the
+ranges in `pyproject.toml`.
+
+To refresh the lock file after changing `pyproject.toml` dependencies, run:
+
+```bash
+scripts/lock-backend.sh
+```
+
+This runs `pip-compile` inside the runtime Python container (requires Docker, or
+`CONTAINER=podman`). Commit the resulting `backend/requirements.txt` with your
+changes.
+
 ## App versions
 
 Docker Hub builds from `main` automatically increment the patch version for each
