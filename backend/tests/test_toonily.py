@@ -386,11 +386,11 @@ async def test_verified_reader_number_cannot_be_reused_for_another_download(tmp_
 
 @respx.mock(assert_all_called=False)
 @pytest.mark.parametrize("status", [503, 429])
-async def test_verification_distinguishes_chapter_errors_from_rate_limits(status):
+async def test_verification_distinguishes_chapter_errors_from_rate_limits(status, respx_mock):
     broken = CHAPTER.replace("chapter-1", "chapter-0")
-    broken_reader = respx.get(BASE_URL + broken).respond(status)
-    next_reader = respx.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE))
-    respx.get(IMAGE).respond(206, stream=PrefixOnlyImage())
+    broken_reader = respx_mock.get(BASE_URL + broken).respond(status)
+    next_reader = respx_mock.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE))
+    respx_mock.get(IMAGE).respond(206, stream=PrefixOnlyImage())
 
     async with httpx.AsyncClient() as client:
         source = ToonilySource(client)
