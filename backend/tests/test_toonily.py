@@ -328,7 +328,7 @@ async def test_reader_and_catalog_reject_unmapped_side_story_episodes():
     async with httpx.AsyncClient() as client:
         source = ToonilySource(client)
         assert [chapter.number for chapter in await source.list_chapters(TBATE)] == [175]
-        assert not await source.verify_chapters([final, old_part])
+        assert not await source.verify_chapters([(final, 175.8), (old_part, 174)])
         assert not await source.get_pages(final)
 
 
@@ -361,8 +361,45 @@ async def test_reader_rejects_content_for_a_different_chapter(reader_part):
     async with httpx.AsyncClient() as client:
         source = ToonilySource(client)
         assert await source.get_pages(CHAPTER) == []
-        assert await source.verify_chapters([CHAPTER]) == set()
+        assert await source.verify_chapters([(CHAPTER, 1)]) == set()
     assert len(respx.calls) == 2
+
+
+@respx.mock
+async def test_verified_reader_number_cannot_be_reused_for_another_download(tmp_path):
+    respx.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE, title="Chapter 1.5"))
+    image = respx.get(IMAGE).respond(206, stream=PrefixOnlyImage())
+    dest = tmp_path / "chapter.cbz"
+
+    async with httpx.AsyncClient() as client:
+        source = ToonilySource(client)
+        assert await source.verify_chapters([(CHAPTER, 1.5)]) == {(CHAPTER, 1.5)}
+        assert not await source.verify_chapters([(BASE_URL + CHAPTER, 1)], max_checks=0)
+        assert not await source.verify_chapters([(BASE_URL + CHAPTER, 1)])
+        with pytest.raises(RuntimeError, match="returned no pages for chapter 1"):
+            await download_chapter_to_cbz(
+                source, CHAPTER, Series(title="Solo Leveling"), Chapter(number=1), dest,
+            )
+    assert not dest.exists()
+    assert image.call_count == 1
+
+
+@respx.mock(assert_all_called=False)
+@pytest.mark.parametrize("status", [503, 429])
+async def test_verification_distinguishes_chapter_errors_from_rate_limits(status):
+    broken = CHAPTER.replace("chapter-1", "chapter-0")
+    broken_reader = respx.get(BASE_URL + broken).respond(status)
+    next_reader = respx.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE))
+    respx.get(IMAGE).respond(206, stream=PrefixOnlyImage())
+
+    async with httpx.AsyncClient() as client:
+        source = ToonilySource(client)
+        chapters = [(broken, 0), (CHAPTER, 1)]
+        expected = {(CHAPTER, 1)} if status == 503 else set()
+        assert await source.verify_chapters(chapters) == expected
+        assert await source.verify_chapters(chapters) == expected
+    assert broken_reader.call_count == 2
+    assert next_reader.call_count == (1 if status == 503 else 0)
 
 
 @respx.mock
@@ -392,17 +429,17 @@ async def test_verification_reads_a_prefix_and_caches_per_task_route(monkeypatch
 
         async def check(route):
             set_routes({"toonily": route})
-            return await source.verify_chapters([CHAPTER, BASE_URL + CHAPTER])
+            return await source.verify_chapters([(CHAPTER, 1), (BASE_URL + CHAPTER, 1)])
 
         assert await asyncio.gather(
             check(SourceRoute()),
             check(SourceRoute(content_enabled=True, content_url=proxy)),
             check(SourceRoute(content_enabled=True)),
-        ) == [{CHAPTER, BASE_URL + CHAPTER}, {CHAPTER, BASE_URL + CHAPTER}, set()]
+        ) == [{(CHAPTER, 1), (BASE_URL + CHAPTER, 1)}, {(CHAPTER, 1), (BASE_URL + CHAPTER, 1)}, set()]
         assert proxy_calls == [None, proxy]
-        assert await source.verify_chapters([CHAPTER], max_checks=0) == {CHAPTER}
+        assert await source.verify_chapters([(CHAPTER, 1)], max_checks=0) == {(CHAPTER, 1)}
         now += toonily.AVAILABLE_TTL
-        assert await source.verify_chapters([CHAPTER], max_checks=0) == set()
+        assert await source.verify_chapters([(CHAPTER, 1)], max_checks=0) == set()
     assert reader.call_count == img.call_count == 2
 
 
@@ -422,10 +459,10 @@ async def test_verification_checks_only_bounded_candidates_and_rejects_unsafe_re
     monkeypatch.setattr(toonily, "MAX_CHAPTER_CHECKS", 2)
     async with httpx.AsyncClient() as client:
         source = ToonilySource(client)
-        assert not await source.verify_chapters([CHAPTER, offsite, later], max_checks=None)
+        assert not await source.verify_chapters([(CHAPTER, 1), (offsite, 2), (later, 5)], max_checks=None)
         assert not unchecked.called
-        assert not await source.verify_chapters([redirected])
-        assert not await source.verify_chapters([too_large])
+        assert not await source.verify_chapters([(redirected, 3)])
+        assert not await source.verify_chapters([(too_large, 4)])
     assert len(respx.calls) == 5
 
 
@@ -440,19 +477,21 @@ async def test_verification_continues_after_an_oversized_reader():
 
     async with httpx.AsyncClient() as client:
         source = ToonilySource(client)
-        assert await source.verify_chapters([earlier, CHAPTER]) == {CHAPTER}
-        assert await source.verify_chapters([earlier, CHAPTER]) == {CHAPTER}
+        assert await source.verify_chapters([(earlier, 0), (CHAPTER, 1)]) == {(CHAPTER, 1)}
+        assert await source.verify_chapters([(earlier, 0), (CHAPTER, 1)]) == {(CHAPTER, 1)}
     assert oversized.call_count == image.call_count == 1
 
 
 @respx.mock
-async def test_release_workflows_fall_through_to_another_source(db_toonily, monkeypatch):
+@pytest.mark.parametrize("wrong_number", [False, True])
+async def test_release_workflows_fall_through_to_another_source(db_toonily, monkeypatch, wrong_number):
     session, series = db_toonily
     respx.get(SERIES_URL).respond(
         200, text=f'<li class="wp-manga-chapter"><a href="{CHAPTER}">Chapter 1</a></li>',
     )
-    reader = respx.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE))
-    image = respx.get(IMAGE).respond(200, stream=HtmlImage())
+    label = "Chapter 2" if wrong_number else "Chapter 1"
+    reader = respx.get(BASE_URL + CHAPTER).respond(200, text=reader_html(IMAGE, title=label))
+    image = None if wrong_number else respx.get(IMAGE).respond(200, stream=HtmlImage())
     async with httpx.AsyncClient() as client:
         source = ToonilySource(client)
 
@@ -503,7 +542,9 @@ async def test_release_workflows_fall_through_to_another_source(db_toonily, monk
             Download.status == DownloadStatus.QUEUED,
         ))).scalar_one()
         assert queued.source_name == "alternate"
-        assert reader.call_count == image.call_count == 1
+        assert reader.call_count == 1
+        if image is not None:
+            assert image.call_count == 1
 
 
 class HtmlImage(httpx.AsyncByteStream):

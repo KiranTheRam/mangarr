@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from ..download.cbz import guess_extension
 from ..titles import source_title_key, unique_titles
 from ..util import RateLimiter, rl_get_limited_bytes, rl_request
-from .base import DirectSource, SourceChapter, SourceSeries
+from .base import ChapterRef, DirectSource, SourceChapter, SourceSeries
 from .routing import validate_proxy_url
 
 BASE_URL = "https://toonily.com"
@@ -116,7 +116,7 @@ class ToonilySource(DirectSource):
             headers={"User-Agent": BROWSER_AGENT, "Referer": BASE_URL + "/"},
             timeout=60, trust_env=False,
         )
-        self._availability: OrderedDict[tuple[str, str | None], tuple[float, bool]] = OrderedDict()
+        self._availability: OrderedDict[tuple[str, float, str | None], tuple[float, bool]] = OrderedDict()
 
     async def _series_html(self, external_id: str, **kwargs) -> BeautifulSoup:
         if not _SLUG.fullmatch(external_id):
@@ -280,7 +280,9 @@ class ToonilySource(DirectSource):
             if not _SIDE_STORY.search(chapter.title)
         ]
 
-    async def _reader_pages(self, path: str, **kwargs) -> list[_PageURL]:
+    async def _reader_pages(
+        self, path: str, *, expected_number: float | None = None, **kwargs,
+    ) -> list[_PageURL]:
         reader_url = BASE_URL + path
         content = await rl_get_limited_bytes(
             self._client, reader_url, limit=MAX_READER_BYTES, limiter=_limiter,
@@ -302,6 +304,8 @@ class ToonilySource(DirectSource):
         # Older queued IDs may refer to one of several parts at this number.
         chapter_slug = path.strip("/").rsplit("/", 1)[-1]
         number = float(chapter[1])
+        if expected_number is not None and number != expected_number:
+            return []
         selected = False
         for option in soup.select(".chapter-option[data-value]"):
             slug = option["data-value"]
@@ -332,9 +336,11 @@ class ToonilySource(DirectSource):
             pages.setdefault(url, _PageURL(url, reader_url))
         return list(pages.values())
 
-    async def _probe_chapter(self, images: httpx.AsyncClient, path: str) -> bool:
+    async def _probe_chapter(
+        self, images: httpx.AsyncClient, path: str, number: float,
+    ) -> bool:
         try:
-            pages = await self._reader_pages(path, retries=0, timeout=8)
+            pages = await self._reader_pages(path, expected_number=number, retries=0, timeout=8)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (404, 410):
                 return False
@@ -362,8 +368,8 @@ class ToonilySource(DirectSource):
         return bool(guess_extension(prefix, fallback=""))
 
     async def verify_chapters(
-        self, external_ids: list[str], *, max_checks: int | None = MAX_CHAPTER_CHECKS,
-    ) -> set[str]:
+        self, chapters: list[ChapterRef], *, max_checks: int | None = MAX_CHAPTER_CHECKS,
+    ) -> set[ChapterRef]:
         proxy = self.content_proxy_url if self.content_proxy_enabled else None
         if proxy is not None:
             try:
@@ -372,22 +378,22 @@ class ToonilySource(DirectSource):
                 log.warning("Cannot verify Toonily chapters: invalid content proxy")
                 return set()
 
-        available: set[str] = set()
-        pending: dict[str, list[str]] = {}
+        available: set[ChapterRef] = set()
+        pending: dict[ChapterRef, list[ChapterRef]] = {}
         now = time.monotonic()
-        for external_id in dict.fromkeys(external_ids):
+        for external_id, number in dict.fromkeys(chapters):
             try:
                 path = _chapter_path(external_id)
             except ValueError:
                 continue
-            key = (path, proxy)
+            key = (path, number, proxy)
             cached = self._availability.get(key)
             if cached and cached[0] > now:
                 self._availability.move_to_end(key)
                 if cached[1]:
-                    available.add(external_id)
+                    available.add((external_id, number))
             else:
-                pending.setdefault(path, []).append(external_id)
+                pending.setdefault((path, number), []).append((external_id, number))
 
         limit = MAX_CHAPTER_CHECKS if max_checks is None else min(max_checks, MAX_CHAPTER_CHECKS)
         if not pending or limit <= 0:
@@ -396,10 +402,15 @@ class ToonilySource(DirectSource):
             async with asyncio.timeout(PROBE_BATCH_TIMEOUT), httpx.AsyncClient(
                 timeout=8, trust_env=False, proxy=proxy,
             ) as images:
-                for path in list(pending)[:limit]:
-                    key = (path, proxy)
+                for path, number in list(pending)[:limit]:
+                    key = (path, number, proxy)
                     try:
-                        result = await self._probe_chapter(images, path)
+                        result = await self._probe_chapter(images, path, number)
+                    except httpx.HTTPError as exc:
+                        log.warning("Toonily chapter probe failed (%s)", type(exc).__name__)
+                        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                            break
+                        continue
                     except (httpx.InvalidURL, ValueError):
                         # An oversized reader or invalid image URL affects this chapter.
                         result = False
@@ -409,7 +420,7 @@ class ToonilySource(DirectSource):
                     if len(self._availability) > AVAILABILITY_CACHE_SIZE:
                         self._availability.popitem(last=False)
                     if result:
-                        available.update(pending[path])
+                        available.update(pending[path, number])
         except (httpx.HTTPError, ValueError, TimeoutError) as exc:
             # Unverified releases stay hidden, and transport failures are not cached.
             log.warning("Toonily availability check stopped (%s)", type(exc).__name__)
@@ -417,6 +428,9 @@ class ToonilySource(DirectSource):
 
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         return list(await self._reader_pages(_chapter_path(chapter_external_id)))
+
+    async def get_pages_for_chapter(self, external_id: str, number: float) -> list[str]:
+        return list(await self._reader_pages(_chapter_path(external_id), expected_number=number))
 
     async def download_page(self, client: httpx.AsyncClient, url: str) -> bytes:
         if not isinstance(url, _PageURL):

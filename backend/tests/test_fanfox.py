@@ -164,8 +164,8 @@ async def test_verification_requires_a_readable_image_and_caches_conclusive_resu
     image = respx.get(f"{CDN}1.jpg?token=sample&ttl=123").respond(206, content=b"\xff\xd8\xff" + bytes(29))
     source = fanfox.FanFoxSource()
 
-    assert await source.verify_chapters([locked_id, CHAPTER]) == {CHAPTER}
-    assert await source.verify_chapters([locked_id, CHAPTER], max_checks=0) == {CHAPTER}
+    assert await source.verify_chapters([(locked_id, 72.5), (CHAPTER, 393.1)]) == {(CHAPTER, 393.1)}
+    assert await source.verify_chapters([(locked_id, 72.5), (CHAPTER, 393.1)], max_checks=0) == {(CHAPTER, 393.1)}
     assert locked.call_count == public.call_count == image.call_count == 1
     headers = image.calls.last.request.headers
     assert headers["range"] == "bytes=0-31"
@@ -181,8 +181,8 @@ async def test_verification_hides_a_bad_cdn_response_and_rechecks_it():
     ])
     source = fanfox.FanFoxSource()
 
-    assert await source.verify_chapters([CHAPTER]) == set()
-    assert await source.verify_chapters([CHAPTER]) == {CHAPTER}
+    assert await source.verify_chapters([(CHAPTER, 393.1)]) == set()
+    assert await source.verify_chapters([(CHAPTER, 393.1)]) == {(CHAPTER, 393.1)}
     assert image.call_count == 2
 
 
@@ -190,7 +190,7 @@ async def test_verification_hides_a_bad_cdn_response_and_rechecks_it():
 async def test_verification_hides_a_reader_without_a_complete_page_list():
     respx.get(f"{fanfox.BASE_URL}{READER_PATH}1.html").respond(200, text=reader(1, manifest=(1, 3)))
 
-    assert await fanfox.FanFoxSource().verify_chapters([CHAPTER]) == set()
+    assert await fanfox.FanFoxSource().verify_chapters([(CHAPTER, 393.1)]) == set()
 
 
 @respx.mock(assert_all_called=False)
@@ -199,5 +199,5 @@ async def test_verification_stops_the_batch_when_the_cdn_rate_limits(respx_mock)
     respx_mock.get(f"{CDN}1.jpg?token=sample&ttl=123").respond(429)
     next_chapter = respx_mock.get(f"{fanfox.BASE_URL}/manga/kingdom/v36/c393/1.html").respond(404)
 
-    assert await fanfox.FanFoxSource().verify_chapters([CHAPTER, "kingdom/v36/c393"]) == set()
+    assert await fanfox.FanFoxSource().verify_chapters([(CHAPTER, 393.1), ("kingdom/v36/c393", 393)]) == set()
     assert not next_chapter.called

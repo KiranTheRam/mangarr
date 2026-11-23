@@ -550,7 +550,7 @@ async def test_duplicate_release_queues_and_imports_one_verified_fallback(
     assert (fallback.chapter_id, fallback.payload, fallback.release_group) == (
         chapter.id, "preferred", "Preferred",
     )
-    assert checked == [(catalog.name, ["c12"]), (alternative.name, ["preferred"])]
+    assert checked == [(catalog.name, [("c12", 12)]), (alternative.name, [("preferred", 12)])]
     assert primary.list_calls == blocked.list_calls == unlinked.list_calls == later.list_calls == 0
     events = await queue.get_history(session=db_session)
     assert [(ev.event, ev.source_name) for ev in events] == [
@@ -752,7 +752,7 @@ async def test_catalog_only_source_does_not_claim_availability_or_queue_unverifi
 
     async def verify(ids):
         checked.extend(ids)
-        return {"c2"}
+        return {("c2", 2)}
 
     monkeypatch.setattr(source, "verify_chapters", verify)
     _use_source(monkeypatch, source)
@@ -762,6 +762,6 @@ async def test_catalog_only_source_does_not_claim_availability_or_queue_unverifi
     assert not checked
 
     assert await grab_missing_chapters(db_session, series, {}, chapter_cache=cache) == 1
-    assert set(checked) == {"c1", "c2"}
+    assert set(checked) == {("c1", 1), ("c2", 2)}
     queued = (await db_session.execute(select(Download))).scalar_one()
     assert queued.payload == "c2"

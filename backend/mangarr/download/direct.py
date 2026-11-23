@@ -128,7 +128,7 @@ async def download_chapter_to_cbz(
     if proxy_enabled:
         validate_proxy_url(proxy_url, f"{source.name} content proxy")
 
-    page_urls = await source.get_pages(chapter_external_id)
+    page_urls = await source.get_pages_for_chapter(chapter_external_id, chapter.number)
     if not page_urls:
         raise RuntimeError(f"{source.name} returned no pages for chapter {chapter.number}")
     if len(page_urls) > MAX_CHAPTER_PAGES:

@@ -145,10 +145,11 @@ async def remove_many_from_queue(
     return QueueRemoveOut(removed=await _remove_downloads(session, body.ids))
 
 
-async def _verify_direct_availability(source_name: str, external_id: str) -> None:
+async def _verify_direct_availability(source_name: str, external_id: str, number: float) -> None:
     source = registry.DIRECT_SOURCES.get(source_name)
     if getattr(source, "requires_chapter_verification", False):
-        if external_id not in await source.verify_chapters([external_id]):
+        chapter = (external_id, number)
+        if chapter not in await source.verify_chapters([chapter]):
             raise HTTPException(409, f"{source_name} could not verify that this chapter is available")
 
 
@@ -174,6 +175,7 @@ async def retry_failed_download(
     if dl.status != DownloadStatus.FAILED:
         raise HTTPException(409, "Only failed downloads can be retried")
     series = await _queue_series(session, dl.series_id)
+    chapter = None
     if dl.chapter_id is not None:
         chapter = await session.get(Chapter, dl.chapter_id)
         if chapter is None or chapter.excluded:
@@ -205,7 +207,9 @@ async def retry_failed_download(
         source = registry.DIRECT_SOURCES.get(dl.source_name)
         if getattr(source, "requires_chapter_verification", False):
             await registry.apply_settings(session)
-            await _verify_direct_availability(dl.source_name, dl.payload)
+            if chapter is None:
+                raise HTTPException(409, "This download has no chapter to verify")
+            await _verify_direct_availability(dl.source_name, dl.payload, chapter.number)
         await _queue_series(session, dl.series_id)
         dl.status = DownloadStatus.QUEUED
 
@@ -235,7 +239,7 @@ async def grab(body: GrabIn, session: AsyncSession = Depends(get_session)):
         if chapter is None or chapter.excluded:
             raise HTTPException(404, "Chapter not found")
         await _queue_series(session, chapter.series_id)
-        await _verify_direct_availability(body.source_name, body.external_id)
+        await _verify_direct_availability(body.source_name, body.external_id, chapter.number)
         series = await _queue_series(session, chapter.series_id)
         dl = await enqueue_direct(
             session, series, chapter, body.source_name, body.external_id, group=body.group
