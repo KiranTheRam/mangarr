@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from .. import USER_AGENT
 from ..download.cbz import guess_extension
 from ..util import RateLimiter, normalize_title, rl_request
-from .base import DirectSource, SourceChapter, SourceSeries
+from .base import ChapterRef, DirectSource, SourceChapter, SourceSeries
 from .routing import source_client, validate_proxy_url
 
 BASE_URL = "https://m.fanfox.net"
@@ -225,9 +225,9 @@ class FanFoxSource(DirectSource):
         return True if guess_extension(prefix, fallback="") else None
 
     async def verify_chapters(
-        self, external_ids: list[str], *, max_checks: int | None = 60,
-    ) -> set[str]:
-        if not external_ids:
+        self, chapters: list[ChapterRef], *, max_checks: int | None = 60,
+    ) -> set[ChapterRef]:
+        if not chapters:
             return set()
         proxy = None
         if self.content_proxy_enabled:
@@ -241,7 +241,7 @@ class FanFoxSource(DirectSource):
         available = set()
         pending = []
         now = time.monotonic()
-        for external_id in dict.fromkeys(external_ids):
+        for external_id in dict.fromkeys(external_id for external_id, _ in chapters):
             key = (external_id, proxy)
             cached = self._availability.get(key)
             if cached and cached[0] > now:
@@ -251,7 +251,7 @@ class FanFoxSource(DirectSource):
             elif CHAPTER_ID.fullmatch(external_id):
                 pending.append(key)
         if not pending:
-            return available
+            return {chapter for chapter in chapters if chapter[0] in available}
 
         async with self._client_context() as reader, httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT}, timeout=8, trust_env=False, proxy=proxy,
@@ -273,7 +273,7 @@ class FanFoxSource(DirectSource):
                     self._availability.popitem(last=False)
                 if result:
                     available.add(key[0])
-        return available
+        return {chapter for chapter in chapters if chapter[0] in available}
 
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         if not CHAPTER_ID.fullmatch(chapter_external_id):

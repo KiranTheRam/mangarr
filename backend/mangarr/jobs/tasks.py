@@ -2299,7 +2299,7 @@ async def grab_missing_chapters(
                 if ch is None or has_blocking_failure(ch, sc):
                     continue
                 if sc.number in remaining or is_upgrade(ch, src.name, source_order, blocked_groups):
-                    candidates.append(sc.external_id)
+                    candidates.append((sc.external_id, ch.number))
             if not candidates:
                 continue
             try:
@@ -2311,7 +2311,7 @@ async def grab_missing_chapters(
                 log.warning("fallback: %s verification failed for %r: %s",
                             src.name, series.title, type(exc).__name__)
                 continue
-            source_chapters = [sc for sc in source_chapters if sc.external_id in verified]
+            source_chapters = [sc for sc in source_chapters if (sc.external_id, sc.number) in verified]
         # A long source lookup can outlive a deferred delete of this series.
         if not await _series_accepts_downloads(session, series.id):
             break

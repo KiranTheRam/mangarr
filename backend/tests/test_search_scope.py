@@ -167,7 +167,7 @@ async def test_release_search_omits_unverified_chapters(
 
     async def verify(ids, *, max_checks):
         checked.extend(ids)
-        return {"c2"}
+        return {("c2", 2)}
 
     monkeypatch.setattr(fake_sources, "requires_chapter_verification", True, raising=False)
     monkeypatch.setattr(fake_sources, "verify_chapters", verify, raising=False)
@@ -176,5 +176,5 @@ async def test_release_search_omits_unverified_chapters(
         series_id=series.id, chapter_id=requested, session=db_session,
     )
 
-    assert checked == (["c2", "c3"] if scoped else ["c1", "c2", "c3"])
+    assert checked == ([("c2", 2), ("c3", 3)] if scoped else [("c1", 1), ("c2", 2), ("c3", 3)])
     assert _numbers(releases) == [2.0]

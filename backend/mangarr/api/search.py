@@ -235,14 +235,14 @@ async def search_releases(
             verified = None
             if getattr(src, "requires_chapter_verification", False):
                 verified = await src.verify_chapters(
-                    [sc.external_id for sc, _ in candidates],
+                    [(sc.external_id, local.number) for sc, local in candidates],
                     max_checks=60 if selected is None else None,
                 )
             added_for_source = 0
             for sc, local_chapter in candidates:
                 if (
                     (src.name, sc.external_id) in direct_seen
-                    or (verified is not None and sc.external_id not in verified)
+                    or (verified is not None and (sc.external_id, local_chapter.number) not in verified)
                 ):
                     continue
                 direct_seen.add((src.name, sc.external_id))

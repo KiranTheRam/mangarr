@@ -68,6 +68,9 @@ class TorrentRelease:
     info_hash: str = ""
 
 
+ChapterRef = tuple[str, float]  # source chapter ID and the expected chapter number
+
+
 class DirectSource(ABC):
     """A site we can search, list chapters on, and pull page images from."""
 
@@ -121,14 +124,18 @@ class DirectSource(ABC):
     requires_chapter_verification: bool = False
 
     async def verify_chapters(
-        self, external_ids: list[str], *, max_checks: int | None = 60,
-    ) -> set[str]:
-        """Return the chapter IDs that can be offered as direct releases."""
-        return set(external_ids)
+        self, chapters: list[ChapterRef], *, max_checks: int | None = 60,
+    ) -> set[ChapterRef]:
+        """Return the chapters that can be offered as direct releases."""
+        return set(chapters)
 
     @abstractmethod
     async def get_pages(self, chapter_external_id: str) -> list[str]:
         """Returns ordered page image URLs."""
+
+    async def get_pages_for_chapter(self, external_id: str, number: float) -> list[str]:
+        """Fetch pages for a known chapter, with identity checks where supported."""
+        return await self.get_pages(external_id)
 
     def image_headers(self) -> dict:
         """Extra headers image CDNs need (e.g. a Referer). Override per source."""

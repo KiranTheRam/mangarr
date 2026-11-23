@@ -199,7 +199,7 @@ async def test_unverified_direct_release_is_neither_grabbed_nor_retried(
     dl = await _failed_direct(db_session)
 
     async def verify(ids):
-        assert ids == [dl.payload]
+        assert ids == [(dl.payload, 1)]
         return set()
 
     monkeypatch.setitem(queue.registry.DIRECT_SOURCES, dl.source_name, SimpleNamespace(
